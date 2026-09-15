@@ -5275,3 +5275,82 @@ a contract-string helper whose output is unchanged for a model that is not toggl
 - D2's rationale protects the place, not the grasp pose; TR15's mechanism is the unsynced
   twin base (both carried over from earlier today).
 - The `_select_best_body` NaN-confidence bug, found by the recorder, is fixed.
+
+---
+
+## 2026-09-15 — Teleop overlay split into a piloting view and a diagnostic view
+
+The overlay built earlier today had grown to ~20 lines across two panels. An operator
+piloting with both hands up in front of the camera cannot read that. It is now two modes,
+toggled with **`o`**, **MINIMAL by default**, and the choice is remembered for the rest of
+the session (a variable, not a file: a restart is MINIMAL again).
+
+Nothing outside the drawing changed: the headless grasp run reproduces the previous event
+times exactly (lock 0.96 s, weld 9.49 s, release 12.72 s), and both scripted gates are
+unchanged.
+
+### MINIMAL — the default, at most four lines, large (scale 1.0), top-left
+
+| line | content |
+|---|---|
+| 1 | **grasp state as one line and one colour**: `HELD` (green), `READY - press g` (green), or one ACTION in amber |
+| 2 | `BASE LOCKED` (green), or `BASE FREE` + the single action that would lock it (amber) |
+| 3 | `BOX 0.33 m` — green inside the [0.28, 0.36] band, grey outside |
+| 4 | mode flags, only when non-default: `PRECISION`, `B-PRIME OFF` |
+
+- **Line 1 names one action, never three measurements**, chosen by a CAUSAL priority
+  rather than by violation size: near → straddle → opposition. Palms that are not at the
+  box make the other two meaningless — a wide stance a metre away reads as "hands apart"
+  when the real problem is distance.
+
+  | failing condition | line |
+  |---|---|
+  | palm-to-box, robot outside the grasp band | `STEP CLOSER` |
+  | palm-to-box, robot already in the band | `REACH TO BOX` |
+  | separation below `sep_min` | `HANDS APART` |
+  | separation above `sep_max` | `HANDS TOGETHER` |
+  | opposition above `opposed_dot` | `FACE PALMS IN` |
+
+- **Line 2's lock action** uses the same ordering over the predicate's terms: standoff
+  (`STEP CLOSER` / `STEP BACK`), lateral (`STEP LEFT` / `STEP RIGHT`), heading
+  (`TURN LEFT` / `TURN RIGHT`), stillness (`STAND STILL`), then `LOCKING...` while the
+  debounce runs. It appears only within 1.0 m of the box, so it is silent while walking in.
+- **A tracking fault REPLACES line 1** with `TRACKING LOST` in red rather than adding a
+  fifth line: grasp advice is meaningless when the arms are not following the operator.
+- In MINIMAL the camera panel carries no text at all — no status line, no locomotion
+  diagnostics. The skeleton overlay stays.
+
+### FULL — key `o`, the diagnostic and reporting view
+
+Everything the overlay had before: locomotion source, travelled, live velocity command,
+lock state with every predicate term, standoff against the band, all four weld gate
+conditions with numbers and pass/fail markers, the BLOCKING line, wrist deviation with
+the WEDGE flag, heading, uncommanded-motion banner, locomotion diagnostics on the camera
+panel, and the key hints.
+
+### Key hints
+
+No longer permanent. They show for the first **8 s** of a run and whenever FULL is on.
+They also needed splitting into two lines: one line overflowed the 760 px panel at a
+readable scale.
+
+### Validation
+
+- **Rendered offline and inspected**, since a window cannot be opened in this session:
+  - MINIMAL in eight states: walking in far away, in-band but still moving, locked with
+    the hands away, locked with hands too close, locked with palms turned the wrong way,
+    READY, HELD with both flags, and tracking lost. 3–4 lines in every state.
+  - FULL in two states (blocked and welded). Fits the panel with no overlap after the
+    hint split.
+- **Entry point still runs headless** with `synthetic_source`: `keyboard 0 --synthetic
+  grasp --headless --start-standoff 0.32` gives the same lock 0.96 s / weld 9.49 s /
+  release 12.72 s as before this change.
+- **Scripted gates:** **12/12 and 40/40, byte-identical to the committed results.** Both JSON files were
+rewritten this run (15:33 and 15:41) and `git diff` on them is empty. Expected: this
+change touches drawing only.
+
+### Not validated
+
+The windowed path still has not been opened in this session, so the `o` toggle, like `u`,
+`b` and `g`, is exercised only through the code path the headless run and the offline
+renders cover. The first live session should check the `o` toggle early.

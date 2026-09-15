@@ -48,6 +48,9 @@ demonstrator rather than inventing a second mechanism:
                    geometric conditions hold - the overlay shows which one fails.
   b                B-prime hand<->pickup-platform contact exclusion on/off
                    (default ON; g1_teleop/contact_contract.py).
+  o                overlay: MINIMAL (default, 4 lines, for piloting) <-> FULL
+                   (every number, for debugging and reports). Remembered for the
+                   session.
   pads             held at ZERO; the command goes to GraspWeld.update only (TR17).
 
 Test fixtures, no camera:
@@ -193,6 +196,8 @@ FRAME_STEPS = 17         # headless synthetic: one frame per 17 steps = 29.4 Hz
 ABORT_MARGIN_FWD = 0.05  # m past the predicate's standoff band   } how far the robot must
 ABORT_MARGIN_LAT = 0.05  # m past its lateral limit                } leave the lock geometry
 ABORT_MARGIN_HEAD = 10.0 # deg past its heading limit              } before an abort expires
+NEAR_BOX_M = 1.0         # minimal overlay: show a "how to lock" action inside this range
+HINT_SECONDS = 8.0       # how long the key hints stay up before the FULL view owns them
 
 
 def chips(img, x, y, items, scale=0.5):
@@ -243,6 +248,86 @@ def wrist_deviation(data, wrist_ids, pitch_only=False):
         if e > best:
             best, name = e, n
     return best, name
+
+
+def grasp_action(diag, g, weld_on, standoff, band):
+    """(line, colour) for the ONE grasp line of the minimal overlay.
+
+    An ACTION, not a measurement, and only the single most-blocking condition.
+    Priority is CAUSAL rather than by violation size: palms that are not at the
+    box make the other two conditions meaningless - a wide stance a metre away
+    reads as "hands apart" when the real problem is that nothing is near the box.
+    So: near -> straddle -> opposition.
+    """
+    if weld_on:
+        return "HELD", GREEN
+    if not diag:
+        return "NO HANDS TRACKED", AMBER
+    near = diag["d_left"] <= g.palm_radius and diag["d_right"] <= g.palm_radius
+    straddle = g.sep_min <= diag["sep"] <= g.sep_max
+    opposite = diag["opposed"] <= g.opposed_dot
+    if near and straddle and opposite:
+        return "READY - press g", GREEN
+    if not near:
+        # Distinguish the two ways the palms can be far from the box: the robot
+        # is not there yet, or it is and the arms are not out.
+        return ("STEP CLOSER" if standoff > band.grasp_max else "REACH TO BOX"), AMBER
+    if not straddle:
+        return ("HANDS TOGETHER" if diag["sep"] > g.sep_max else "HANDS APART"), AMBER
+    return "FACE PALMS IN", AMBER
+
+
+def lock_action(t, c):
+    """The one thing that would lock the base, or None. Same causal ordering:
+    stand in the right place, face the box, then hold still."""
+    if not t:
+        return None
+    if t["fwd"] > c.fwd_hi:
+        return "STEP CLOSER"
+    if t["fwd"] < c.fwd_lo:
+        return "STEP BACK"
+    if abs(t["lat"]) > c.lat_max:
+        return "STEP LEFT" if t["lat"] > 0 else "STEP RIGHT"     # lat > 0: box is to the left
+    if abs(t["head"]) > c.head_max_deg:
+        return "TURN LEFT" if t["head"] > 0 else "TURN RIGHT"
+    if t["disp"] > c.disp_max:
+        return "STAND STILL"
+    return "LOCKING..."                                          # debouncing
+
+
+def draw_minimal_panel(img, st):
+    """The piloting view: at most FOUR lines, large, top-left. Nothing else.
+
+    A live operator has both hands up in front of the camera and cannot read a
+    wall of text. Every line answers a question they have in the moment, and the
+    numbers behind them live in the FULL view (key o).
+    """
+    x, y, dy, sc = 16, 46, 46, 1.0
+    if not st["tracking"]:
+        # Grasp advice is meaningless when the arms are not following the
+        # operator, so the fault replaces the grasp line rather than adding one.
+        text(img, "TRACKING LOST", (x, y), sc, RED)
+    else:
+        line, col = grasp_action(st["diag"], st["weld"], st["weld_on"], st["standoff"], st["gcfg"])
+        text(img, line, (x, y), sc, col)
+    y += dy
+    if st["locked"]:
+        text(img, "BASE LOCKED", (x, y), sc, GREEN)
+    else:
+        act = lock_action(st["terms"], st["lcfg"]) if st["standoff"] < NEAR_BOX_M else None
+        text(img, "BASE FREE" + ("   " + act if act else ""), (x, y), sc, AMBER)
+    y += dy
+    lo, hi = st["gcfg"].grasp_min, st["gcfg"].grasp_max
+    text(img, "BOX %.2f m" % st["standoff"], (x, y), sc,
+         GREEN if lo <= st["standoff"] <= hi else GREY)
+    y += dy
+    flags = []
+    if st["precision"]:
+        flags.append("PRECISION")
+    if not st["bprime"]:
+        flags.append("B-PRIME OFF")
+    if flags:
+        text(img, "   ".join(flags), (x, y), 0.8, AMBER)
 
 
 def draw_operator_panel(img, x, y, st):
@@ -531,6 +616,11 @@ def main():
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW, ZED_PANEL_W + MJ_PANEL_W, PANEL_H)
     events = []                        # (sim s, what) - printed at exit
+    # Overlay mode. MINIMAL is the default because it is the piloting view; FULL
+    # is for debugging and for reports. The choice is remembered for the rest of
+    # the session (it is not written to disk, so a restart is MINIMAL again).
+    overlay_full = False
+    tracking_ok = False
 
     def abort_lock(source):
         """Manual ABORT of the base lock - the only operator input that touches
@@ -689,6 +779,7 @@ def main():
                 frame = new_frame
                 if frame.keypoints_3d:
                     outcome = controller.step(frame)
+                    tracking_ok = bool(outcome.applied)
                     status_text = ("IK OK" if outcome.applied
                                    else f"HOLD: {outcome.reason.value}")
                     status_color = (0, 255, 0) if outcome.applied else (0, 100, 255)
@@ -700,6 +791,7 @@ def main():
                         cmd[:] = loco(frame.keypoints_3d)
                         loco_diag = getattr(loco, "diag", {})
                 else:
+                    tracking_ok = False
                     status_text, status_color = "no body detected", (0, 100, 255)
 
             # KeyboardCommand ignores keypoints, so it updates every control
@@ -727,14 +819,15 @@ def main():
 
             # ── Left panel: camera ──────────────────────────────────────────
             left = fit_to_box(frame.image, ZED_PANEL_W, PANEL_H)
-            text(left, f"Status: {status_text}", (10, 28), 0.6, status_color)
-            y = 56
-            for k, v in loco_diag.items():
-                if k == "strategy":
-                    continue
-                s = f"{k} = {v:+.4f}" if isinstance(v, float) else f"{k} = {v}"
-                text(left, s, (10, y), 0.5, (200, 220, 255))
-                y += 24
+            if overlay_full:
+                text(left, f"Status: {status_text}", (10, 28), 0.6, status_color)
+                y = 56
+                for k, v in loco_diag.items():
+                    if k == "strategy":
+                        continue
+                    s = f"{k} = {v:+.4f}" if isinstance(v, float) else f"{k} = {v}"
+                    text(left, s, (10, y), 0.5, (200, 220, 255))
+                    y += 24
 
             # ── Right panel: simulation ─────────────────────────────────────
             renderer.update_scene(data, camera=cam, scene_option=scene_option)
@@ -742,38 +835,49 @@ def main():
                                MJ_PANEL_W, PANEL_H)
 
             travelled = float(np.linalg.norm(data.qpos[ix.base_xy_qpos] - start_xy))
-            text(right, loco_name, (10, 24), 0.55, CYAN)
-            text(right, f"TRAVELLED {travelled:.2f} m   LOCO cmd fwd {cmd[0]:+.2f}  turn {cmd[2]:+.2f}",
-                 (10, 46), 0.5)
             wd, wj = wrist_deviation(data, wrist_ids)
-            draw_operator_panel(right, 10, 76, dict(
+            st = dict(
                 locked=base_lock.locked(data), inhibit=relock_inhibit, n_lock=pred.n_lock,
                 n_release=pred.n_release, n_abort=n_abort, terms=lock_terms, lcfg=pred.cfg,
                 standoff=float(np.linalg.norm(data.xpos[box_body_id][:2] - data.qpos[ix.base_xy_qpos])),
                 gcfg=cfg.grasp, weld=weld.cfg, diag=weld_diag, weld_on=weld_on, grasp_cmd=grasp_cmd,
                 wrist=wd, wrist_joint=wj, pitch=wrist_deviation(data, wrist_ids, pitch_only=True)[0],
-                bprime=CC.hand_pickup_exclusion_active(model)))
-
-            if isinstance(loco, KeyboardCommand) and loco.precision:
-                text(right, "PRECISION", (MJ_PANEL_W - 130, 24), 0.55, (255, 200, 0))
-            yaw_now_disp = yaw_from_quat(data.qpos[ix.base_quat_qpos])
-            hd = np.degrees((hold_yaw - yaw_now_disp + np.pi)
-                            % (2 * np.pi) - np.pi)
-            text(right, f"HEADING  now {np.degrees(yaw_now_disp):+6.1f}"
-                        f"   target {np.degrees(hold_yaw):+6.1f}   err {hd:+5.1f}",
-                 (10, PANEL_H - 60), 0.45, GREY)
+                bprime=CC.hand_pickup_exclusion_active(model), tracking=tracking_ok,
+                precision=bool(isinstance(loco, KeyboardCommand) and loco.precision))
 
             # Flag motion that the demonstrator did not ask for.
             moving = last_disp is not None and abs(travelled - last_disp) > 0.004
             commanded = np.linalg.norm(cmd) > IDLE_THRESHOLD
-            if moving and not commanded:
-                text(right, "UNCOMMANDED MOTION", (10, PANEL_H - 36), 0.6, (0, 80, 255))
             last_disp = travelled
 
-            hint = "g grasp  u unlock  b B-prime  |  a/d rot  w/s tilt  +/- zoom  r reset  space stop  q quit"
-            if isinstance(loco, KeyboardCommand):
-                hint = ("arrows = walk/turn (hold)   p = precision   |   " + hint)
-            text(right, hint, (10, PANEL_H - 14), 0.45, (200, 200, 200))
+            if not overlay_full:
+                draw_minimal_panel(right, st)
+            else:
+                text(right, loco_name, (10, 24), 0.55, CYAN)
+                text(right, f"TRAVELLED {travelled:.2f} m   LOCO cmd fwd {cmd[0]:+.2f}"
+                            f"  turn {cmd[2]:+.2f}", (10, 46), 0.5)
+                draw_operator_panel(right, 10, 76, st)
+                if st["precision"]:
+                    text(right, "PRECISION", (MJ_PANEL_W - 130, 24), 0.55, (255, 200, 0))
+                yaw_now_disp = yaw_from_quat(data.qpos[ix.base_quat_qpos])
+                hd = np.degrees((hold_yaw - yaw_now_disp + np.pi)
+                                % (2 * np.pi) - np.pi)
+                text(right, f"HEADING  now {np.degrees(yaw_now_disp):+6.1f}"
+                            f"   target {np.degrees(hold_yaw):+6.1f}   err {hd:+5.1f}",
+                     (10, PANEL_H - 76), 0.45, GREY)
+                if moving and not commanded:
+                    text(right, "UNCOMMANDED MOTION", (10, PANEL_H - 52), 0.6, (0, 80, 255))
+
+            # The hints do not earn permanent screen space while piloting: they
+            # show for the first HINT_SECONDS and then live in the FULL view.
+            if overlay_full or counter * SIM_DT < HINT_SECONDS:
+                # Two lines: one does not fit the panel width at a readable scale.
+                hints = ["g grasp   u unlock   b B-prime   o overlay (minimal/full)",
+                         "a/d rot  w/s tilt  +/- zoom  r reset  space stop  q quit"]
+                if isinstance(loco, KeyboardCommand):
+                    hints[0] = "arrows walk/turn (hold)   p precision   " + hints[0]
+                for k_, h_ in enumerate(hints):
+                    text(right, h_, (10, PANEL_H - 30 + 16 * k_), 0.45, (200, 200, 200))
 
             cv2.imshow(WINDOW, np.hstack([left, right]))
 
@@ -847,6 +951,9 @@ def main():
                 print("grasp command -> %.0f%s" % (
                     grasp_cmd, "" if weld_on or grasp_cmd == 0 else
                     "  (gated: hands not in a grasp configuration)"))
+            elif key == ord("o"):
+                overlay_full = not overlay_full
+                print("overlay -> %s" % ("FULL" if overlay_full else "MINIMAL"))
             elif key == ord("u"):
                 abort_lock("key u")
             elif key == ord("b"):
