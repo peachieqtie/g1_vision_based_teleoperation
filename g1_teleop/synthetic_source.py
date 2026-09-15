@@ -33,7 +33,9 @@ look like a person.
 """
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Sequence
+import json
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -119,14 +121,39 @@ class SyntheticSource:
 
     `frames` is any sequence of BODY_38 keypoint lists; a list containing NaN
     arm keypoints exercises the controller's coast path exactly as a real
-    tracking dropout does. `grab()` returns None past the end, which is how
-    `ZEDSource` reports a failed grab.
+    tracking dropout does, and an EMPTY list is what `ZEDSource.grab` returns
+    when it has no usable body. `grab()` returns None past the end, which is
+    how `ZEDSource` reports a failed grab.
+
+    `confidences`, if given, is one 38-list per frame and is returned verbatim;
+    otherwise every keypoint reports 1.0 (the authored generators have no
+    confidence). `SyntheticSource.from_recording` replays a real ZED take.
     """
 
-    def __init__(self, frames: Sequence[List[np.ndarray]], image_hw=(8, 8)):
+    def __init__(self, frames: Sequence[List[np.ndarray]], image_hw=(8, 8),
+                 confidences: Optional[Sequence[List[float]]] = None):
         self.frames = list(frames)
+        self.confidences = None if confidences is None else list(confidences)
+        if self.confidences is not None:
+            assert len(self.confidences) == len(self.frames)
         self.i = 0
         self._image = np.zeros((image_hw[0], image_hw[1], 3), dtype=np.uint8)
+
+    @classmethod
+    def from_recording(cls, path_or_rec, mode: str = "zed") -> "SyntheticSource":
+        """Replay a raw keypoint recording (tools/record_keypoints.py).
+
+        mode="zed": exactly the frame sequence `ZEDSource.grab` would have handed
+                    the controller live - rejected / no-body / stale frames become
+                    EMPTY keypoint lists, failed grabs are skipped (the grabber
+                    never passes a None on). Use this to test the pipeline.
+        mode="raw": every recorded row, including the raw keypoints of a body the
+                    selector REJECTED (NaN arm keypoints preserved) and all-NaN rows
+                    where no body existed. Use this to test alternative selection.
+        """
+        rec = path_or_rec if isinstance(path_or_rec, Recording) else load_recording(path_or_rec)
+        kp, conf = rec.frames(mode)
+        return cls(kp, confidences=conf)
 
     def __len__(self) -> int:
         return len(self.frames)
@@ -136,9 +163,11 @@ class SyntheticSource:
             return None
         kp = self.frames[self.i]
         self.i += 1
+        conf = ([1.0] * N_KEYPOINTS if self.confidences is None
+                else self.confidences[self.i - 1])
         return BodyFrame(keypoints_3d=kp,
                          keypoints_2d=[None] * N_KEYPOINTS,
-                         confidences=[1.0] * N_KEYPOINTS,
+                         confidences=conf,
                          image=self._image)
 
     def close(self) -> None:
@@ -196,3 +225,115 @@ def with_dropout(frames: List[List[np.ndarray]],
         for k in range(start, min(start + length, len(out))):
             out[k] = _nan_keypoints()
     return out
+
+
+# ─── recorded real motion: the on-disk form of the `frames` sequence ─────────
+# The replay format above is a sequence of BODY_38 keypoint lists in the CAMERA
+# frame. A recording is that same sequence stored as arrays - no second format:
+# `Recording.frames()` rebuilds exactly the list-of-38-arrays `SyntheticSource`
+# takes. One `.npz` per take, written by tools/record_keypoints.py.
+#
+#   keypoints     (N, 38, 3) float64  camera frame, metres, as the SDK reported
+#                                     them - NaN preserved, nothing filtered
+#   confidence    (N, 38)    float64  SDK keypoint_confidence (0-100, NaN kept)
+#   status        (N,)       int8     STATUS_* below: why ZEDSource would or would
+#                                     not have used this frame
+#   n_bodies      (N,)       int16    bodies in the SDK list this frame
+#   body_id       (N,)       int32    tracker id of the stored body, -1 if none
+#   frame_index   (N,)       int64    grab-loop index, 0-based, includes failures
+#   ts_image_ns   (N,)       int64    SDK image timestamp (0 when the grab failed)
+#   ts_host_ns    (N,)       int64    host monotonic clock after the grab
+#   dropped_total (N,)       int64    SDK get_frame_dropped_count() after the grab
+#   meta          ()         str      JSON: session + take metadata
+#
+# STATUS mirrors the control flow of ZEDSource.grab exactly:
+STATUS_OK = 0            # body selected; ZEDSource returns its keypoints
+STATUS_GRAB_FAILED = 1   # camera.grab() != SUCCESS; ZEDSource returns None
+STATUS_NOT_NEW = 2       # bodies.is_new False; ZEDSource returns an EMPTY frame
+STATUS_NO_BODY = 3       # body_list empty; EMPTY frame
+STATUS_ARM_NAN = 4       # bodies present, _select_best_body rejected every one
+                         # for a NaN arm KEYPOINT; EMPTY frame. The stored
+                         # keypoints are the best REJECTED body, so which arm
+                         # point went NaN stays visible.
+STATUS_ARM_CONF_NAN = 5  # a body's arm keypoints are all finite but one of its
+                         # arm CONFIDENCES is NaN: _select_best_body's mean score
+                         # is NaN, `NaN > best_score` is False, and the body is
+                         # silently never selected; EMPTY frame. Found on the
+                         # first real take (2026-09-15): with body fitting on,
+                         # SDK 5.4 fills occluded keypoints and reports NaN
+                         # confidence for them. Stored body = best such body.
+STATUS_NAMES = {STATUS_OK: "ok", STATUS_GRAB_FAILED: "grab_failed",
+                STATUS_NOT_NEW: "not_new", STATUS_NO_BODY: "no_body",
+                STATUS_ARM_NAN: "arm_nan", STATUS_ARM_CONF_NAN: "arm_conf_nan"}
+RECORDING_VERSION = "g1-kp-rec-2"
+_REC_ARRAYS = ("keypoints", "confidence", "status", "n_bodies", "body_id",
+               "frame_index", "ts_image_ns", "ts_host_ns", "dropped_total")
+
+
+@dataclass
+class Recording:
+    keypoints: np.ndarray
+    confidence: np.ndarray
+    status: np.ndarray
+    n_bodies: np.ndarray
+    body_id: np.ndarray
+    frame_index: np.ndarray
+    ts_image_ns: np.ndarray
+    ts_host_ns: np.ndarray
+    dropped_total: np.ndarray
+    meta: Dict = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        return int(self.keypoints.shape[0])
+
+    def delivered(self) -> np.ndarray:
+        """Rows ZEDSource.grab returns a BodyFrame for (all but grab failures)."""
+        return self.status != STATUS_GRAB_FAILED
+
+    def frames(self, mode: str = "zed"):
+        """(keypoint lists, confidence lists) in the SyntheticSource shape."""
+        if mode not in ("zed", "raw"):
+            raise ValueError(mode)
+        kps, confs = [], []
+        for i in range(len(self)):
+            st = int(self.status[i])
+            if mode == "zed":
+                if st == STATUS_GRAB_FAILED:
+                    continue
+                if st != STATUS_OK:       # ZEDSource: BodyFrame([], [None]*38, [0.0]*38)
+                    kps.append([])
+                    confs.append([0.0] * N_KEYPOINTS)
+                    continue
+            kps.append([self.keypoints[i, k].copy() for k in range(N_KEYPOINTS)])
+            confs.append([float(c) for c in self.confidence[i]])
+        return kps, confs
+
+
+def save_recording(path: str, rec: Recording) -> None:
+    n = len(rec)
+    assert rec.keypoints.shape == (n, N_KEYPOINTS, 3), rec.keypoints.shape
+    assert rec.confidence.shape == (n, N_KEYPOINTS), rec.confidence.shape
+    for name in _REC_ARRAYS[2:]:
+        assert getattr(rec, name).shape == (n,), name
+    meta = dict(rec.meta, recording_version=RECORDING_VERSION)
+    np.savez_compressed(
+        path,
+        keypoints=np.asarray(rec.keypoints, np.float64),
+        confidence=np.asarray(rec.confidence, np.float64),
+        status=np.asarray(rec.status, np.int8),
+        n_bodies=np.asarray(rec.n_bodies, np.int16),
+        body_id=np.asarray(rec.body_id, np.int32),
+        frame_index=np.asarray(rec.frame_index, np.int64),
+        ts_image_ns=np.asarray(rec.ts_image_ns, np.int64),
+        ts_host_ns=np.asarray(rec.ts_host_ns, np.int64),
+        dropped_total=np.asarray(rec.dropped_total, np.int64),
+        meta=np.array(json.dumps(meta)))
+
+
+def load_recording(path: str) -> Recording:
+    with np.load(path, allow_pickle=False) as z:
+        meta = json.loads(str(z["meta"]))
+        if meta.get("recording_version") != RECORDING_VERSION:
+            raise ValueError("%s: recording version %r, this loader reads %r"
+                             % (path, meta.get("recording_version"), RECORDING_VERSION))
+        return Recording(**{k: z[k].copy() for k in _REC_ARRAYS}, meta=meta)
