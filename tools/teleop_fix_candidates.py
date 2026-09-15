@@ -4,9 +4,17 @@
     python tools/teleop_fix_candidates.py gates   base|A|B|Bns  N  lock|pred
     python tools/teleop_fix_candidates.py corridor base|A       # close-in reach probe
 
-MEASUREMENT ONLY - neither candidate is adopted by running this.
+MEASUREMENT ONLY - running this adopts nothing.
 
-  base  : adopted configuration, both flags off
+2026-09-15: B-prime was ADOPTED as a <contact><exclude> pair set in scene.xml
+(g1_teleop/contact_contract.py). Every tag below except `adopted`/`adoptedns`
+therefore loads the model with that exclusion STRIPPED
+(cfg.contact.hand_pickup_exclusion = False), so the candidate numbers stay
+reproducible against the pre-adoption baseline.
+
+  adopted  : the default configuration - pair exclusion on
+  adoptedns: adopted with the staged raise switched OFF
+  base  : pre-adoption configuration, exclusion stripped, both flags off
   A     : IKConfig.free_wrists = True    (IK drives 7 joints/arm, palm-site task)
   B     : DemoConfig.hand_platform_filter (no hand<->platform contact)
   Bns   : B with the staged raise switched OFF - is the mitigation still needed?
@@ -51,6 +59,8 @@ OUT = os.path.join(ROOT, "docs", "measurements")
 
 def cfg_for(tag):
     cfg = TeleopConfig()
+    if tag not in ("adopted", "adoptedns"):
+        cfg = dataclasses.replace(cfg, contact=C.ContactConfig(hand_pickup_exclusion=False))
     if tag == "A":
         cfg = dataclasses.replace(cfg, ik=dataclasses.replace(cfg.ik, free_wrists=True))
     return cfg
@@ -64,7 +74,7 @@ def demo_for(tag, lock):
         kw["hand_platform_filter"] = True
     if tag in ("Bp", "Bpns"):
         kw["hand_platform_filter"] = "pickup"
-    if tag in ("Bns", "Bpns"):
+    if tag in ("Bns", "Bpns", "adoptedns"):
         kw["staged_reach"] = False
     return SD.DemoConfig(**kw)
 
@@ -209,7 +219,8 @@ def run_corridor(tag):
     cfg = cfg_for(tag)
     demo = SD.DemoConfig(walk_place=True, start_xy=(0.60, 0.00), settle_s=14.0)
     book = SD.PoseBook(cfg, demo)
-    m = mujoco.MjModel.from_xml_path(cfg.model_path)
+    from g1_teleop.contact_contract import load_model
+    m = load_model(cfg)
     m.opt.timestep = cfg.loco.sim_dt
     d = mujoco.MjData(m)
     ix = ModelIndex.resolve(m)
