@@ -23,7 +23,11 @@
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
 
     <body name="platform_pickup" pos="1.5 0 0.73">
-      <geom name="platform_pickup_geom" type="box" size="0.18 0.18 0.02" rgba="0.55 0.2 0.75 1"/>
+      <!-- Q6: enlarged for box-position randomisation. x half-extent is 0.19, NOT larger:
+           the pelvis cannot pass under the 0.75 m top, so the base stops at x=1.255 and
+           GRASP_MAX caps reachable box x at 1.595. Growing half_x moves the far sample
+           edge out of reach without buying span. y has no such cap. See CLAUDE.md O13. -->
+      <geom name="platform_pickup_geom" type="box" size="0.19 0.32 0.02" rgba="0.55 0.2 0.75 1"/>
     </body>
 
     <body name="platform_goal" pos="1.5 -1.5 0.73">
@@ -40,4 +44,28 @@
       <geom name="box1_geom" type="box" size="0.09 0.09 0.09" rgba="1 0 0 1" friction="1.5 0.05 0.001" solref="0.004 1" solimp="0.9 0.95 0.001"/>
     </body>
   </worldbody>
+
+  <!-- Grasp weld (D11). Friction grasping was characterised as infeasible under
+       our constraints: 1 of 9 standoffs holds, and holding couples to unrelated
+       foot-floor contacts. See CLAUDE.md O2 / section 7 D11 and NOTES.md.
+       Attaches the box to the LEFT hand only - two welds would over-constrain,
+       and the hand (not the pad) is chosen because the pad slides on its joint.
+       relpose is written at engage time from the live relative transform, so
+       engagement produces no jump. Inactive until the trigger fires. -->
+  <equality>
+    <weld name="box_grasp" body1="left_wrist_yaw_link" body2="box1"
+          active="false" solref="0.004 1" solimp="0.95 0.99 0.001"/>
+
+    <!-- Base support during manipulation (D12). O17/TR16: the standing robot's
+         equilibrium standoff never coincides with the standoff its arms can
+         serve, and every free-base lever is swept and closed. This weld pins
+         the pelvis to the world while the arms work, and is released for
+         locomotion. relpose is written live at lock time (g1_teleop/base_lock.py)
+         so the constraint is already satisfied when it turns on and the base
+         does not jump. Stiffer than the grasp weld: this one carries the whole
+         robot's reaction, and any compliance here shows up directly as standoff
+         drift, which is the thing it exists to remove. Inactive by default. -->
+    <weld name="base_lock" body1="world" body2="pelvis"
+          active="false" solref="0.002 1" solimp="0.99 0.999 0.001"/>
+  </equality>
 </mujoco>

@@ -72,6 +72,12 @@ class PelvisVelocity:
         self._above_since = None
         self.diag = {}
 
+    def reset(self):
+        """Clear the velocity window and trigger latch between episodes."""
+        self._hist.clear()
+        self._above_since = None
+        self.diag = {}
+
     def __call__(self, keypoints):
         now = time.time()
         pelvis = np.asarray(keypoints[PELVIS], dtype=float)
@@ -149,6 +155,14 @@ class LeanJoystick:
         self._gesture_since = None
         self._toggle_latch = False
         self._neutral = None                  # shoulder midpoint at activation
+        self.diag = {}
+
+    def reset(self):
+        """Deactivate and clear the gesture latch and neutral pose."""
+        self.active = False
+        self._gesture_since = None
+        self._toggle_latch = False
+        self._neutral = None
         self.diag = {}
 
     @staticmethod
@@ -250,6 +264,19 @@ class KeyboardCommand:
         self.cmd = np.zeros(3, dtype=np.float32)
         self._pressed = {}          # direction -> timestamp of last press
         self.diag = {"strategy": "keyboard", "precision": False}
+
+    def reset(self, keep_precision: bool = True):
+        """Clear the command and key latches between episodes.
+
+        `precision` is an operator preference, not episode state, so it
+        persists by default — pass keep_precision=False for a fully
+        deterministic reset (the evaluation harness should).
+        """
+        self.cmd[:] = 0.0
+        self._pressed.clear()
+        if not keep_precision:
+            self.precision = False
+        self.diag = {"strategy": "keyboard", "precision": self.precision}
 
     def toggle_precision(self):
         self.precision = not self.precision

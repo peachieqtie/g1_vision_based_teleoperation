@@ -34,6 +34,8 @@ import mujoco
 import mujoco.viewer
 import torch
 
+from g1_teleop.indices import ModelIndex
+
 # ── Paths (EDIT THESE) ────────────────────────────────────────────────────────
 POLICY_PATH = r"D:\Charles_Aninon\Thesis Project\unitree_rl_gym\deploy\pre_train\g1\motion.pt"
 SCENE_PATH = r"D:\Charles_Aninon\Thesis Project\scene.xml"
@@ -69,14 +71,12 @@ HOLD_MAX = 0.25         # cap on corrective speed (keep well under MAX_FORWARD)
 HOLD_DEADBAND = 0.02    # ignore errors under 2 cm to avoid twitchy corrections
 
 # ── Layout of YOUR scene's qpos/qvel/ctrl ─────────────────────────────────────
-# qpos: base[0:7] + 29 joints[7:36] + box freejoint[36:43]
-# The 12 leg joints are the first 12 of the 29, i.e. qpos[7:19], qvel[6:18].
-# ctrl: 29 actuators; legs (motor/torque) are ctrl[0:12], waist+arms
-# (position) are ctrl[12:29].
-LEG_QPOS = slice(7, 19)
-LEG_QVEL = slice(6, 18)
-LEG_CTRL = slice(0, 12)
-ARM_CTRL = slice(12, 29)         # waist(3) + arms(14)
+# Resolved by joint/actuator NAME at model load — see g1_teleop/indices.py.
+# These offsets used to be literals (legs qpos[7:19], waist+arms ctrl[12:29]
+# and so on). They must not be: the palm-pad gripper adds a slide joint inside
+# each wrist_yaw_link, which shifts right-arm indices while leaving leg indices
+# alone, so a literal slice would stay correct for the legs and silently
+# address the wrong joints for the arms.
 
 # Fixed pose for waist+arms while testing walking. Matches the keyframe ctrl
 # block so the arms do not jolt at startup (a jolt shoves the torso and can
@@ -120,11 +120,13 @@ def main():
     model.opt.timestep = SIM_DT
     mujoco.mj_resetDataKeyframe(model, data, 0)
 
+    ix = ModelIndex.resolve(model)
+
     # The policy expects the legs to START at DEFAULT_ANGLES (a slight knee-bent
     # crouch), not the teleop keyframe's straight-leg pose. Starting elsewhere
     # puts the policy in a state it never trained on and it cannot recover.
-    data.qpos[LEG_QPOS] = DEFAULT_ANGLES
-    data.qvel[LEG_QVEL] = 0.0
+    data.qpos[ix.leg_qpos] = DEFAULT_ANGLES
+    data.qvel[ix.leg_qvel] = 0.0
     mujoco.mj_forward(model, data)
 
     policy = torch.jit.load(POLICY_PATH)
@@ -133,7 +135,7 @@ def main():
     target_leg_pos = DEFAULT_ANGLES.copy()
     obs = np.zeros(NUM_OBS, dtype=np.float32)
     cmd = np.array([0.0, 0.0, 0.0], dtype=np.float32)   # operator command
-    hold_target = np.array(data.qpos[0:2], dtype=np.float64)  # world XY to hold
+    hold_target = np.array(data.qpos[ix.base_xy_qpos], dtype=np.float64)  # world XY
     counter = 0
 
     def key_callback(keycode):
@@ -148,10 +150,10 @@ def main():
             cmd[2] -= 0.1
         elif keycode == 32:     # space — stop and hold here
             cmd[:] = 0.0
-            hold_target[:] = data.qpos[0:2]
+            hold_target[:] = data.qpos[ix.base_xy_qpos]
             print(f"holding at x={hold_target[0]:+.3f} y={hold_target[1]:+.3f}")
         elif keycode == ord('H'):   # re-anchor hold target
-            hold_target[:] = data.qpos[0:2]
+            hold_target[:] = data.qpos[ix.base_xy_qpos]
             print(f"hold re-anchored at x={hold_target[0]:+.3f} y={hold_target[1]:+.3f}")
         cmd[0] = np.clip(cmd[0], -MAX_FORWARD, MAX_FORWARD)
         cmd[1] = np.clip(cmd[1], -MAX_LATERAL, MAX_LATERAL)
@@ -168,21 +170,22 @@ def main():
             step_start = time.time()
 
             # PD torque control on the LEG actuators (motor type).
-            leg_q = data.qpos[LEG_QPOS]
-            leg_dq = data.qvel[LEG_QVEL]
+            leg_q = data.qpos[ix.leg_qpos]
+            leg_dq = data.qvel[ix.leg_qvel]
             tau = (target_leg_pos - leg_q) * KPS + (0.0 - leg_dq) * KDS
-            data.ctrl[LEG_CTRL] = tau
+            data.ctrl[ix.leg_ctrl] = tau
 
             # Hold waist+arms at a fixed pose (position actuators).
-            data.ctrl[ARM_CTRL] = ARM_HOLD_TARGETS
+            data.ctrl[ix.upper_ctrl] = ARM_HOLD_TARGETS
 
             mujoco.mj_step(model, data)
             counter += 1
 
             if counter % 500 == 0:   # ~1 Hz drift readout
-                err = np.linalg.norm(hold_target - data.qpos[0:2])
-                print(f"base xyz = {data.qpos[0]:+.3f} {data.qpos[1]:+.3f} "
-                      f"{data.qpos[2]:.3f}   hold_err = {err:.3f} m")
+                err = np.linalg.norm(hold_target - data.qpos[ix.base_xy_qpos])
+                bx, by, bz = data.qpos[ix.base_qpos][:3]
+                print(f"base xyz = {bx:+.3f} {by:+.3f} "
+                      f"{bz:.3f}   hold_err = {err:.3f} m")
 
             if counter % CONTROL_DECIMATION == 0:
                 # ── Choose the command the policy actually receives ─────────
@@ -191,23 +194,23 @@ def main():
                 # the hold target following the robot so releasing the keys
                 # holds wherever it ended up.
                 if np.linalg.norm(cmd) < IDLE_THRESHOLD:
-                    err_world = hold_target - data.qpos[0:2]
+                    err_world = hold_target - data.qpos[ix.base_xy_qpos]
                     if np.linalg.norm(err_world) < HOLD_DEADBAND:
                         active_cmd = np.zeros(3, dtype=np.float32)
                     else:
-                        yaw = yaw_from_quat(data.qpos[3:7])
+                        yaw = yaw_from_quat(data.qpos[ix.base_quat_qpos])
                         err_body = world_to_body(err_world, yaw)
                         active_cmd = np.zeros(3, dtype=np.float32)
                         active_cmd[0:2] = np.clip(HOLD_KP * err_body,
                                                   -HOLD_MAX, HOLD_MAX)
                 else:
                     active_cmd = cmd.astype(np.float32)
-                    hold_target[:] = data.qpos[0:2]
+                    hold_target[:] = data.qpos[ix.base_xy_qpos]
 
-                qj = (data.qpos[LEG_QPOS] - DEFAULT_ANGLES) * DOF_POS_SCALE
-                dqj = data.qvel[LEG_QVEL] * DOF_VEL_SCALE
-                omega = data.qvel[3:6] * ANG_VEL_SCALE
-                grav = get_gravity_orientation(data.qpos[3:7])
+                qj = (data.qpos[ix.leg_qpos] - DEFAULT_ANGLES) * DOF_POS_SCALE
+                dqj = data.qvel[ix.leg_qvel] * DOF_VEL_SCALE
+                omega = data.qvel[ix.base_angvel_qvel] * ANG_VEL_SCALE
+                grav = get_gravity_orientation(data.qpos[ix.base_quat_qpos])
 
                 t = counter * SIM_DT
                 phase = (t % GAIT_PERIOD) / GAIT_PERIOD

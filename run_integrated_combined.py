@@ -42,6 +42,9 @@ from g1_teleop.teleop import TeleopController
 from g1_teleop.zed_source import ZEDSource
 from g1_teleop.overlay import draw_skeleton
 from g1_teleop import config as C
+from g1_teleop.indices import ModelIndex
+from g1_teleop.box_reset import reset_box
+from g1_teleop.grasp import GraspWeld
 from locomotion_input import PelvisVelocity, LeanJoystick, KeyboardCommand
 
 # ── Paths (EDIT THESE) ────────────────────────────────────────────────────────
@@ -74,11 +77,11 @@ NUM_ACTIONS, NUM_OBS = 12, 47
 IDLE_THRESHOLD, HOLD_KP, HOLD_MAX, HOLD_DEADBAND = 0.05, 0.8, 0.25, 0.02
 
 # ── Grasp range ───────────────────────────────────────────────────────────────
-# Measured arm reach is upper 0.200 + forearm 0.184 = 0.384 m from the shoulder,
-# and the box sits about 0.20 m below shoulder height. That leaves roughly
-# 0.33 m of horizontal reach, so the base has to stop within this band of the
-# box or the arms cannot get to it.
-GRASP_MIN, GRASP_MAX = 0.20, 0.34
+# Moved into g1_teleop/config.py (GraspConfig). As module-level literals here
+# they were invisible to every assertion, so nothing could check the spawn
+# region against them — the same failure class as O3. `assert_reach_fits` now
+# does, at model load.
+GRASP_MIN, GRASP_MAX = TeleopConfig().grasp.grasp_min, TeleopConfig().grasp.grasp_max
 
 # ── Heading hold ──────────────────────────────────────────────────────────────
 # The position-hold loop corrects x and y but nothing corrected yaw, so while
@@ -111,18 +114,11 @@ HOLD_YAW_DEADBAND = 0.03  # ignore errors under ~1.7 degrees
 # not follow the commanded clock. Stepping rate is fixed inside the network.
 GAIT_PERIOD = 0.8
 
-LEG_QPOS, LEG_QVEL = slice(7, 19), slice(6, 18)
-LEG_CTRL, ARM_CTRL = slice(0, 12), slice(12, 29)
-
-UPPER_BODY_JOINTS = [
-    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
-    "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
-    "left_shoulder_yaw_joint", "left_elbow_joint",
-    "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
-    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
-    "right_shoulder_yaw_joint", "right_elbow_joint",
-    "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
-]
+# qpos/qvel/ctrl offsets are resolved by joint and actuator NAME at model load
+# (g1_teleop/indices.py), never hardcoded — the palm-pad gripper inserts a slide
+# joint inside each wrist_yaw_link, shifting right-arm indices while leaving the
+# legs alone, so a stale literal would break silently on one half of the robot.
+# The upper-body joint list lives in config.UPPER_BODY_JOINTS.
 
 
 def get_gravity_orientation(quat):
@@ -201,6 +197,10 @@ class FrameGrabber(threading.Thread):
 
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "pelvis"
+    # Episode seed for box placement (O4). Same seed -> same box pose, so a
+    # demonstration can be re-run; different seeds -> different poses, which is
+    # what Objectives 3 and 4 need and what the keyframe pose never gave.
+    episode_seed = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     if which.startswith("p"):
         loco, loco_name = PelvisVelocity(), "PELVIS VELOCITY (thesis 3.3.4)"
     elif which.startswith("l"):
@@ -208,28 +208,54 @@ def main():
     else:
         loco, loco_name = KeyboardCommand(), "KEYBOARD (decoupled)"
 
+    cfg_box_for_reset = TeleopConfig().box
     model = mujoco.MjModel.from_xml_path(SCENE_PATH)
     data = mujoco.MjData(model)
     model.opt.timestep = SIM_DT
     mujoco.mj_resetDataKeyframe(model, data, 0)
-    data.qpos[LEG_QPOS] = DEFAULT_ANGLES
-    data.qvel[LEG_QVEL] = 0.0
+    ix = ModelIndex.resolve(model)
+    # Weld grasp (D11). `grasp_cmd` is the gripper action dimension: 0 released,
+    # 1 engaged. Engagement is gated on the geometric preconditions in
+    # g1_teleop/grasp.py, so pressing the key with the hands away from the box
+    # does nothing — exactly what the policy will have to learn.
+    weld = GraspWeld(model)
+    grasp_cmd = 0.0
+    data.qpos[ix.leg_qpos] = DEFAULT_ANGLES
+    data.qvel[ix.leg_qvel] = 0.0
+    # Randomise the box on the STEPPED model, not just the kinematic twin (O4).
+    box_xy = reset_box(model, data, ix, cfg_box_for_reset, seed=episode_seed)
     mujoco.mj_forward(model, data)
-    start_xy = np.array(data.qpos[0:2], dtype=np.float64)
+    print(f"episode seed {episode_seed}: box at "
+          f"({box_xy[0]:.3f}, {box_xy[1]:.3f}, {box_xy[2]:.3f})")
+    start_xy = np.array(data.qpos[ix.base_xy_qpos], dtype=np.float64)
 
     cfg = TeleopConfig()
     twin = G1Robot(cfg)
+    # Keep the twin's box on the same seed as the physics model. Nothing reads
+    # the twin's box today, but letting the two models hold different box poses
+    # is exactly the divergence that produced O4 in the first place.
+    twin.reset_box(seed=episode_seed)
     controller = TeleopController(twin, cfg)
-    zed = ZEDSource(cfg.zed)
+    # O25 (2026-09-11): `--synthetic` swaps the camera for a fabricated
+    # BODY_38 stream so this path can run with no hardware. It changes NOTHING
+    # below the source - the same TeleopController, the same twin, the same
+    # copy into ctrl. It is a flag and not a default because a synthetic source
+    # is a test fixture, not a collection mode.
+    if "--synthetic" in sys.argv:
+        from g1_teleop.synthetic_source import SyntheticSource, hand_path_frames
+        print("[O25] SYNTHETIC keypoint source - no camera, reach-out motion")
+        zed = SyntheticSource(hand_path_frames(
+            lambda t: np.array([0.10 + 0.22 * t, +0.10, -0.10]),
+            lambda t: np.array([0.10 + 0.22 * t, -0.10, -0.10]), 300))
+    else:
+        zed = ZEDSource(cfg.zed)
     grabber = FrameGrabber(zed)
     grabber.start()
 
-    twin_upper_qpos = []
-    for name in UPPER_BODY_JOINTS:
-        jid = mujoco.mj_name2id(twin.model, mujoco.mjtObj.mjOBJ_JOINT, name)
-        if jid < 0:
-            raise ValueError(f"joint not found on twin: {name}")
-        twin_upper_qpos.append(twin.model.jnt_qposadr[jid])
+    # The twin is a separate MjModel; resolve its indices independently rather
+    # than assuming the two models number their joints identically.
+    twin_ix = ModelIndex.resolve(twin.model)
+    twin_upper_qpos = twin_ix.upper_qpos
 
     policy = torch.jit.load(POLICY_PATH)
     box_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "box1")
@@ -255,9 +281,9 @@ def main():
     target_leg_pos = DEFAULT_ANGLES.copy()
     obs = np.zeros(NUM_OBS, dtype=np.float32)
     cmd = np.zeros(3, dtype=np.float32)
-    hold_target = np.array(data.qpos[0:2], dtype=np.float64)
-    hold_yaw = yaw_from_quat(data.qpos[3:7])
-    arm_targets = np.array(data.ctrl[ARM_CTRL], dtype=np.float32)
+    hold_target = np.array(data.qpos[ix.base_xy_qpos], dtype=np.float64)
+    hold_yaw = yaw_from_quat(data.qpos[ix.base_quat_qpos])
+    arm_targets = np.array(data.ctrl[ix.upper_ctrl], dtype=np.float32)
     counter = 0
     status_text, status_color = "waiting for ZED", (0, 100, 255)
     loco_diag = {}
@@ -275,10 +301,12 @@ def main():
 
     try:
         while True:
-            leg_q, leg_dq = data.qpos[LEG_QPOS], data.qvel[LEG_QVEL]
-            data.ctrl[LEG_CTRL] = ((target_leg_pos - leg_q) * KPS
-                                   + (0.0 - leg_dq) * KDS)
-            data.ctrl[ARM_CTRL] = arm_targets
+            leg_q, leg_dq = data.qpos[ix.leg_qpos], data.qvel[ix.leg_qvel]
+            data.ctrl[ix.leg_ctrl] = ((target_leg_pos - leg_q) * KPS
+                                      + (0.0 - leg_dq) * KDS)
+            data.ctrl[ix.upper_ctrl] = arm_targets
+            data.ctrl[ix.pad_ctrl] = grasp_cmd
+            weld_on, weld_diag = weld.update(model, data, grasp_cmd)
             mujoco.mj_step(model, data)
             counter += 1
 
@@ -296,10 +324,10 @@ def main():
             # ── Velocity command: hold station when nothing is commanded ────
             if np.linalg.norm(cmd) < IDLE_THRESHOLD:
                 active_cmd = np.zeros(3, dtype=np.float32)
-                yaw_now = yaw_from_quat(data.qpos[3:7])
+                yaw_now = yaw_from_quat(data.qpos[ix.base_quat_qpos])
 
                 # Position hold.
-                err_world = hold_target - data.qpos[0:2]
+                err_world = hold_target - data.qpos[ix.base_xy_qpos]
                 if np.linalg.norm(err_world) >= HOLD_DEADBAND:
                     err_body = world_to_body(err_world, yaw_now)
                     active_cmd[0:2] = np.clip(HOLD_KP * err_body,
@@ -312,16 +340,16 @@ def main():
                                                   -HOLD_YAW_MAX, HOLD_YAW_MAX))
             else:
                 active_cmd = cmd.astype(np.float32)
-                hold_target[:] = data.qpos[0:2]
-                hold_yaw = yaw_from_quat(data.qpos[3:7])
+                hold_target[:] = data.qpos[ix.base_xy_qpos]
+                hold_yaw = yaw_from_quat(data.qpos[ix.base_quat_qpos])
 
-            qj = (data.qpos[LEG_QPOS] - DEFAULT_ANGLES) * DOF_POS_SCALE
-            dqj = data.qvel[LEG_QVEL] * DOF_VEL_SCALE
+            qj = (data.qpos[ix.leg_qpos] - DEFAULT_ANGLES) * DOF_POS_SCALE
+            dqj = data.qvel[ix.leg_qvel] * DOF_VEL_SCALE
             t = counter * SIM_DT
             phase = (t % GAIT_PERIOD) / GAIT_PERIOD
 
-            obs[:3] = data.qvel[3:6] * ANG_VEL_SCALE
-            obs[3:6] = get_gravity_orientation(data.qpos[3:7])
+            obs[:3] = data.qvel[ix.base_angvel_qvel] * ANG_VEL_SCALE
+            obs[3:6] = get_gravity_orientation(data.qpos[ix.base_quat_qpos])
             obs[6:9] = active_cmd * CMD_SCALE
             obs[9:9 + NUM_ACTIONS] = qj
             obs[9 + NUM_ACTIONS:9 + 2 * NUM_ACTIONS] = dqj
@@ -344,9 +372,8 @@ def main():
                     status_text = ("IK OK" if outcome.applied
                                    else f"HOLD: {outcome.reason.value}")
                     status_color = (0, 255, 0) if outcome.applied else (0, 100, 255)
-                    arm_targets = np.array(
-                        [twin.data.qpos[a] for a in twin_upper_qpos],
-                        dtype=np.float32)
+                    arm_targets = np.array(twin.data.qpos[twin_upper_qpos],
+                                           dtype=np.float32)
                     draw_skeleton(frame.image, frame.keypoints_2d,
                                   frame.confidences, C.REQUIRED_KEYPOINTS)
                     if not isinstance(loco, KeyboardCommand):
@@ -381,7 +408,7 @@ def main():
             right = fit_to_box(cv2.cvtColor(renderer.render(), cv2.COLOR_RGB2BGR),
                                MJ_PANEL_W, PANEL_H)
 
-            travelled = float(np.linalg.norm(data.qpos[0:2] - start_xy))
+            travelled = float(np.linalg.norm(data.qpos[ix.base_xy_qpos] - start_xy))
             text(right, loco_name, (10, 28), 0.6, (255, 255, 0))
             text(right, f"TRAVELLED  {travelled:.2f} m", (10, 56), 0.7,
                  (0, 255, 255))
@@ -394,11 +421,15 @@ def main():
             # only reach about ARM_REACH, so this is the difference between a
             # graspable stop and one that is 10 cm short.
             box_xy = data.xpos[box_body_id][:2]
-            base_xy = data.qpos[0:2]
+            base_xy = data.qpos[ix.base_xy_qpos]
             gap = float(np.linalg.norm(box_xy - base_xy))
             in_range = GRASP_MIN <= gap <= GRASP_MAX
             colour = (0, 255, 0) if in_range else (0, 200, 255)
             text(right, f"BOX DISTANCE  {gap:.2f} m", (10, 118), 0.7, colour)
+            gcol = (0, 255, 0) if weld_on else ((0, 200, 255) if grasp_cmd > 0.5 else (200, 200, 200))
+            text(right, f"GRASP  cmd {grasp_cmd:.0f}  " +
+                 ("WELDED" if weld_on else ("gated" if grasp_cmd > 0.5 else "open")),
+                 (10, 246), 0.6, gcol)
             if in_range:
                 text(right, "IN GRASP RANGE", (10, 150), 0.7, (0, 255, 0))
             elif gap > GRASP_MAX:
@@ -409,9 +440,10 @@ def main():
 
             if isinstance(loco, KeyboardCommand) and loco.precision:
                 text(right, "PRECISION", (10, 182), 0.6, (255, 200, 0))
-            hd = np.degrees((hold_yaw - yaw_from_quat(data.qpos[3:7]) + np.pi)
+            yaw_now_disp = yaw_from_quat(data.qpos[ix.base_quat_qpos])
+            hd = np.degrees((hold_yaw - yaw_now_disp + np.pi)
                             % (2 * np.pi) - np.pi)
-            text(right, f"HEADING  now {np.degrees(yaw_from_quat(data.qpos[3:7])):+6.1f}"
+            text(right, f"HEADING  now {np.degrees(yaw_now_disp):+6.1f}"
                         f"   target {np.degrees(hold_yaw):+6.1f}   err {hd:+5.1f}",
                  (10, 210), 0.5, (255, 255, 255))
 
@@ -494,12 +526,17 @@ def main():
                 cam.lookat[:] = CAM_LOOKAT
                 cam.distance, cam.azimuth, cam.elevation = (
                     CAM_DISTANCE, CAM_AZIMUTH, CAM_ELEVATION)
+            elif key == ord("g"):
+                grasp_cmd = 0.0 if grasp_cmd > 0.5 else 1.0
+                print("grasp command -> %.0f%s" % (
+                    grasp_cmd, "" if weld_on or grasp_cmd == 0 else
+                    "  (gated: hands not in a grasp configuration)"))
             elif key == ord("p") and isinstance(loco, KeyboardCommand):
                 loco.toggle_precision()
             elif key == 32:
                 cmd[:] = 0.0
-                hold_target[:] = data.qpos[0:2]
-                hold_yaw = yaw_from_quat(data.qpos[3:7])
+                hold_target[:] = data.qpos[ix.base_xy_qpos]
+                hold_yaw = yaw_from_quat(data.qpos[ix.base_quat_qpos])
                 if isinstance(loco, KeyboardCommand):
                     loco.cmd[:] = 0.0
                 print("stopped and anchored")

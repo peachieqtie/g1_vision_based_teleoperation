@@ -20,7 +20,10 @@ def solve_arm_ik(
     joint_limits: Sequence[np.ndarray],
     neutral_q: np.ndarray,
     cfg: IKConfig,
+    task_site_id=None,
 ) -> np.ndarray:
+    """`task_site_id`, when given, replaces the wrist BODY as the second task
+    point with that SITE (Candidate A: the palm). Default None is unchanged."""
     jacp_el = np.zeros((3, model.nv))
     jacp_wr = np.zeros((3, model.nv))
     jacr = np.zeros((3, model.nv))
@@ -30,7 +33,8 @@ def solve_arm_ik(
     for _ in range(cfg.max_iter):
         mujoco.mj_forward(model, data)
         el_pos = data.xpos[elbow_body_id].copy()
-        wr_pos = data.xpos[wrist_body_id].copy()
+        wr_pos = (data.site_xpos[task_site_id].copy() if task_site_id is not None
+                  else data.xpos[wrist_body_id].copy())
 
         err_el = elbow_target - el_pos
         err_wr = wrist_target - wr_pos
@@ -38,7 +42,10 @@ def solve_arm_ik(
             break
 
         mujoco.mj_jac(model, data, jacp_el, jacr, el_pos, elbow_body_id)
-        mujoco.mj_jac(model, data, jacp_wr, jacr, wr_pos, wrist_body_id)
+        if task_site_id is not None:
+            mujoco.mj_jacSite(model, data, jacp_wr, jacr, task_site_id)
+        else:
+            mujoco.mj_jac(model, data, jacp_wr, jacr, wr_pos, wrist_body_id)
 
         jac = np.vstack([jacp_el[:, dof_ids], jacp_wr[:, dof_ids]])
         err = np.concatenate([err_el, err_wr])

@@ -230,6 +230,32 @@
                           <geom class="visual" mesh="left_wrist_yaw_link"/>
                           <geom class="collision" mesh="left_wrist_yaw_link"/>
                           <geom pos="0.0415 0.003 0" quat="1 0 0 0" class="visual" mesh="left_rubber_hand"/>
+                          <site name="left_palm_site" pos="0.106000 -0.004000 0.003000"/>
+                          <!-- Palm-pad gripper (Q1 / D7). The slide axis is the
+                               MEAN BOX FACE NORMAL over the grasp workspace, not
+                               the palm-plane normal: normal force must act along
+                               the face normal, and any tangential component
+                               drags the box along its own face instead of
+                               squeezing it. Measured 7.1 deg rms / 11.9 deg max
+                               deviation across the reach grid (NOTES.md).
+                               The body quat puts pad-local +x on that axis, so
+                               the joint slides along "1 0 0" and the geom is thin
+                               along its own x. Body pos = palm centre pulled
+                               0.035 m back along the press axis, so qpos=0 is
+                               clear of the box and the 0.1 m stroke covers the
+                               26-54 mm IK palm error. -->
+                          <body name="left_pad" pos="0.102125 0.027712 -0.011295"
+                                quat="-0.404432 0.625930 -0.361883 0.560078">
+                            <joint name="left_pad_slide_joint" type="slide"
+                                   axis="1 0 0" range="0 0.1"
+                                   damping="5" armature="0.01" frictionloss="0"/>
+                            <geom name="left_pad_geom" type="box"
+                                  size="0.005 0.035 0.035"
+                                  friction="2.0 0.05 0.001" condim="4" priority="2"
+                                  solref="0.008 1" solimp="0.85 0.92 0.004"
+                                  rgba="0.15 0.15 0.18 1"/>
+                          </body>
+
                         </body>
                       </body>
                     </body>
@@ -286,6 +312,32 @@
                           <geom class="visual" mesh="right_wrist_yaw_link"/>
                           <geom class="collision" mesh="right_wrist_yaw_link"/>
                           <geom pos="0.0415 -0.003 0" quat="1 0 0 0" class="visual" mesh="right_rubber_hand"/>
+                          <site name="right_palm_site" pos="0.106000 0.004000 0.003000"/>
+                          <!-- Palm-pad gripper (Q1 / D7). The slide axis is the
+                               MEAN BOX FACE NORMAL over the grasp workspace, not
+                               the palm-plane normal: normal force must act along
+                               the face normal, and any tangential component
+                               drags the box along its own face instead of
+                               squeezing it. Measured 7.1 deg rms / 11.9 deg max
+                               deviation across the reach grid (NOTES.md).
+                               The body quat puts pad-local +x on that axis, so
+                               the joint slides along "1 0 0" and the geom is thin
+                               along its own x. Body pos = palm centre pulled
+                               0.035 m back along the press axis, so qpos=0 is
+                               clear of the box and the 0.1 m stroke covers the
+                               26-54 mm IK palm error. -->
+                          <body name="right_pad" pos="0.102125 -0.027712 -0.011295"
+                                quat="0.404432 0.625930 0.361883 0.560078">
+                            <joint name="right_pad_slide_joint" type="slide"
+                                   axis="1 0 0" range="0 0.1"
+                                   damping="5" armature="0.01" frictionloss="0"/>
+                            <geom name="right_pad_geom" type="box"
+                                  size="0.005 0.035 0.035"
+                                  friction="2.0 0.05 0.001" condim="4" priority="2"
+                                  solref="0.008 1" solimp="0.85 0.92 0.004"
+                                  rgba="0.15 0.15 0.18 1"/>
+                          </body>
+
                         </body>
                       </body>
                     </body>
@@ -333,6 +385,23 @@
     <position class="g1" name="right_wrist_roll_joint" joint="right_wrist_roll_joint"/>
     <position class="g1" name="right_wrist_pitch_joint" joint="right_wrist_pitch_joint"/>
     <position class="g1" name="right_wrist_yaw_joint" joint="right_wrist_yaw_joint"/>
+    <!-- Pad servos. ctrlrange is 0-1 (0 = retracted, 1 = pressing) with
+         gear = 1/stroke, so CLAUDE.md section 6's action contract lives in the
+         XML rather than in the recorder. NOTE on kp: for a position actuator the
+         effective joint stiffness is gear^2 * kp, so kp=15 with gear=10 gives
+         1500 N/m -> 7.5 N at 5 mm compression, comfortably over the ~3.9 N
+         needed to hold 0.4 kg under 2g of walking acceleration. Writing kp=1500
+         here would give 150 kN/m and launch the box.
+         forcerange is what actually SETS grip force: commanded full closure
+         leaves ~70 mm of servo error, so the servo would demand ~105 N and the
+         cap is what it settles at. +-2 (x gear 10 = 20 N at the joint) gives
+         2 * mu * 20 = 80 N of friction capacity against a 3.92 N box -- ample
+         margin without crushing it. Raise this before touching kp if the box
+         slips (O2 escalation order). -->
+    <position name="left_pad_slide_joint" joint="left_pad_slide_joint"
+              gear="10" ctrlrange="0 1" kp="15" kv="0.3" forcerange="-2 2"/>
+    <position name="right_pad_slide_joint" joint="right_pad_slide_joint"
+              gear="10" ctrlrange="0 1" kp="15" kv="0.3" forcerange="-2 2"/>
   </actuator>
 
   <sensor>
@@ -351,7 +420,9 @@
       0 0 0 0 0 0
       0 0 0
       0.2 0.2 0 1.28 0 0 0
+      0
       0.2 -0.2 0 1.28 0 0 0
+      0
       1.5 0 0.84 1 0 0 0
       "
       ctrl="
@@ -360,6 +431,7 @@
       0 0 0
       0.2 0.2 0 1.28 0 0 0
       0.2 -0.2 0 1.28 0 0 0
+      0 0
       "/>
   </keyframe>
 </mujoco>

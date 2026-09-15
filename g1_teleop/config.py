@@ -60,6 +60,26 @@ DEPTH_SCALE: float = 0.6
 
 
 # ─── Joint names ──────────────────────────────────────────────────────────────
+# These lists are the single source of truth for model indexing. Nothing may
+# hardcode a qpos/qvel/ctrl offset: adding joints anywhere in the body tree
+# shifts every index downstream of the insertion, and MuJoCo gives no warning
+# when a stale slice silently addresses the wrong joint. Resolve through
+# g1_teleop.indices.ModelIndex instead.
+FLOATING_BASE_JOINT: str = "floating_base_joint"
+
+# Model order — the pre-trained locomotion policy's 12 actions, its qj/dqj
+# observation block, and the KPS/KDS/DEFAULT_ANGLES gain vectors are all in
+# THIS order. Do not reorder.
+LEG_JOINTS: List[str] = [
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+]
+WAIST_JOINTS: List[str] = [
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+]
+
 LEFT_ARM_JOINTS: List[str] = [
     "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
     "left_shoulder_yaw_joint", "left_elbow_joint",
@@ -70,6 +90,18 @@ RIGHT_ARM_JOINTS: List[str] = [
     "right_shoulder_yaw_joint", "right_elbow_joint",
     "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
 ]
+# The 17 position-actuated upper-body joints, in model order. This is the order
+# of the 17 joint-target dims of the 22-D action vector, and of walk_test's
+# ARM_HOLD_TARGETS.
+UPPER_BODY_JOINTS: List[str] = WAIST_JOINTS + LEFT_ARM_JOINTS + RIGHT_ARM_JOINTS
+
+# Palm-pad gripper (decided 2026-08-23 Q1, not yet in g1.xml). Named here so the
+# resolver can pick them up the moment they exist; ModelIndex treats them as
+# optional and leaves the fields None until then.
+LEFT_PAD_JOINT: str = "left_pad_slide_joint"
+RIGHT_PAD_JOINT: str = "right_pad_slide_joint"
+PAD_JOINTS: List[str] = [LEFT_PAD_JOINT, RIGHT_PAD_JOINT]
+
 # IK drives shoulder(3) + elbow(1); wrists are held at a natural pose.
 N_IK_JOINTS: int = 4
 WAIST_YAW_JOINT: str = "waist_yaw_joint"
@@ -134,6 +166,16 @@ class IKConfig:
     damping: float = 0.12          # more damping = smoother, less churn
     neutral_weight: float = 0.03   # (legacy, unused by nullspace solver)
     nullspace_weight: float = 0.5  # pull toward seed pose in the nullspace (elbow-out)
+    # CANDIDATE A (2026-09-15, measurement only, default OFF). D2 pins the
+    # wrists because wrist twist made the FRICTION grasp pose unusable; the
+    # friction grasp is gone (D11), so that justification may no longer hold.
+    # When True the IK drives all 7 arm joints and its second task point is the
+    # PALM SITE rather than the wrist body. Driving the wrists with the old
+    # task would be a no-op: measured, wrist yaw moves the wrist-body origin by
+    # 0.000 m/rad and wrist roll by 0.009, so they would sit in the nullspace;
+    # on the palm site they move it 0.106 and 0.152 m/rad. Adopting this is a
+    # SPEC_VERSION bump - action dims 6 and 13 leave the constant mask.
+    free_wrists: bool = False
     target_deadzone: float = 0.008  # (legacy, unused by stillness lock)
     still_enter: float = 0.020     # per-frame motion below 20mm counts as "still"
     still_break: float = 0.040     # exceed 40mm to unlock (One-Euro lowers source noise)
@@ -180,11 +222,115 @@ class GatingConfig:
 
 @dataclass(frozen=True)
 class BoxConfig:
-    """Box spawn parameters. Must match scene.xml platform_pickup position."""
-    pickup_center: tuple = (1.5, 0.0)   # platform_pickup x, y (directly ahead of the robot)
-    pickup_half: float = 0.13           # uniform sampling half-range on platform
-    spawn_z: float = 0.84               # platform top (0.75) + box half-height (0.09)
+    """Box spawn region and the Objective 4 held-out patch (Q6, closed 2026-09-08).
+
+    `pickup_half` is PER-AXIS. The x and y bounds are not symmetric and never
+    were: `max_safe_half` has always returned an array, and a single float
+    silently took the min. x is capped near 0.08 by the pelvis/platform standoff
+    (O13), while y is free.
+
+        pickup_half[i] + box_half + edge_margin <= platform_half[i]
+        x: 0.08 + 0.09 + 0.02 = 0.19    y: 0.21 + 0.09 + 0.02 = 0.32
+
+    Held-out region for Objective 4 is a 2-D INTERIOR PATCH, not a band on one
+    axis. Both marginals stay in distribution — every held-out x appears in
+    training at some other y, and vice versa — so only the *combination* is
+    unseen. That makes it compositional generalization strictly inside the
+    convex hull of the training data. A y-only band would risk being solved by
+    squaring up to the box, ceilinging all three policies and destroying
+    discrimination just as surely as extrapolation would floor them.
+    """
+    pickup_center: tuple = (1.5, 0.0)      # platform_pickup x, y
+    # x trimmed 0.08 -> 0.06 for O22. The walk-in drives the base to
+    # box_x - standoff, so the far sample edge must leave the base clear of
+    # max_base_x (1.255) with margin, not merely under it. Measured cliff:
+    # target base x <= 1.250 converges (14.6 mm position error, heading -0.01
+    # deg, palm 35 mm); 1.260 jams (46 mm, +5.5 deg) and the grasp fails. At
+    # 1.250 one of three y values still jammed, so 1.240 is the last edge clean
+    # at every y tried -> far box edge 1.56 at the nominal 0.32 standoff.
+    # Trimming the region keeps the standoff band uniform across demonstrations,
+    # which widening the standoff for far spawns would not.
+    pickup_half: tuple = (0.06, 0.21)      # per-axis uniform sampling half-range
+    edge_margin: float = 0.02              # footprint corner to platform edge
+    spawn_z: float = 0.84                  # platform top 0.75 + box half-height 0.09
     body_name: str = "box1"
+    box_geom: str = "box1_geom"
+    platform_geom: str = "platform_pickup_geom"
+
+    # Objective 4 held-out patch, world XY. Training draws from the sample
+    # region MINUS this patch; evaluation draws only from inside it.
+    heldout_x: tuple = (1.47, 1.53)
+    heldout_y: tuple = (0.04, 0.16)
+
+
+@dataclass(frozen=True)
+class LocomotionConfig:
+    """Pre-trained walking policy constants (unitree_rl_gym deploy/configs/g1.yaml).
+
+    These were duplicated verbatim in `walk_test.py` and
+    `run_integrated_combined.py`, and episode reset needs them too — a third
+    copy is how the twin and the physics model drifted apart in O4. Verified
+    byte-identical across both entry points before consolidating here.
+
+    None of these are free parameters. `default_angles` is the crouch the policy
+    was trained from (D5, TR5); `gait_period` is baked into the network (TR4);
+    `sim_dt` and `control_decimation` set the 500/50 Hz split (D4).
+    """
+    sim_dt: float = 0.002
+    control_decimation: int = 10        # policy at 50 Hz
+    num_actions: int = 12
+    num_obs: int = 47
+    gait_period: float = 0.8            # NOT tunable — see TR4
+    action_scale: float = 0.25
+    ang_vel_scale: float = 0.25
+    dof_pos_scale: float = 1.0
+    dof_vel_scale: float = 0.05
+    default_angles: tuple = (-0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
+                             -0.1, 0.0, 0.0, 0.3, -0.2, 0.0)
+    kps: tuple = (100, 100, 100, 150, 40, 40, 100, 100, 100, 150, 40, 40)
+    kds: tuple = (2, 2, 2, 4, 2, 2, 2, 2, 2, 4, 2, 2)
+    cmd_scale: tuple = (2.0, 2.0, 0.25)
+    # Station keeping at zero command.
+    idle_threshold: float = 0.05
+    hold_kp: float = 0.8
+    hold_max: float = 0.25
+    hold_deadband: float = 0.02
+
+
+@dataclass(frozen=True)
+class GraspConfig:
+    """Where the base must stop to grasp, and how far forward it may legally go.
+
+    These were module-level constants in `run_integrated_combined.py`, invisible
+    to every assertion — the same failure class as O3. They live here so
+    `box_reset.assert_reach_fits` can check that the far edge of the spawn
+    region is actually reachable.
+
+    `max_base_x` is MEASURED, not derived: the pelvis cannot pass under the
+    0.75 m platform top, and the limit is 1.255 essentially regardless of
+    platform half-extent (the pelvis meets the slab from beneath once the base
+    is inside the footprint). Re-measure if the platform height, the slab
+    thickness, or `DEFAULT_ANGLES` changes — none of those are derivable here.
+    """
+    grasp_min: float = 0.28     # MEASURED (O14), not the old optimistic 0.20
+    grasp_max: float = 0.36     # measured usable far end
+    max_base_x: float = 1.255   # measured 2026-09-08; see CLAUDE.md O13
+
+    def assert_standoff(self, gap: float, who: str = "caller") -> None:
+        """Refuse a standoff outside the measured usable band (O14).
+
+        `grasp_min` was 0.20 on an arm-reach estimate. Measured on rig v5 with a
+        45 mm palm guard, the 4-DOF IK (D2) CANNOT put the palms on the box below
+        0.28 m: palm error runs 69/63/56/49 mm at 0.20/0.22/0.24/0.26. Those are
+        not weak grasps, they are arm poses that never reach the box. A
+        demonstrator or evaluation harness allowed to stop there would record
+        episodes that could not succeed for reasons nothing downstream can see.
+        """
+        if not (self.grasp_min <= gap <= self.grasp_max):
+            raise AssertionError(
+                f"{who} requested standoff {gap:.3f} m, outside the measured "
+                f"usable band [{self.grasp_min}, {self.grasp_max}] (O14). Below "
+                f"{self.grasp_min} the 4-DOF IK cannot place the palms on the box.")
 
 
 @dataclass(frozen=True)
@@ -208,4 +354,6 @@ class TeleopConfig:
     torso_yaw: TorsoYawConfig = field(default_factory=TorsoYawConfig)
     gating: GatingConfig = field(default_factory=GatingConfig)
     box: BoxConfig = field(default_factory=BoxConfig)
+    grasp: GraspConfig = field(default_factory=GraspConfig)
+    loco: LocomotionConfig = field(default_factory=LocomotionConfig)
     zed: ZEDConfig = field(default_factory=ZEDConfig)

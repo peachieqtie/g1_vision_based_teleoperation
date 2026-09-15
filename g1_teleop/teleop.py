@@ -44,6 +44,33 @@ class TeleopController:
             freq=sm.euro_freq, min_cutoff=sm.euro_min_cutoff, beta=sm.euro_beta,
         ) if sm.euro_enabled else None
 
+    def reset(self) -> None:
+        """Clear every piece of per-episode state this controller carries.
+
+        Enumerated deliberately — none of these raise if forgotten, they just
+        leak the previous episode into the next one:
+          prev_left/right   last smoothed joint outputs (the arm_alpha filter)
+          _coast_count      frames currently coasted through a tracking dropout
+          _have_good_pose   whether a good pose was ever applied
+          _depth_state      per-side previous depth for the depth_alpha filter
+          _still_state      per-side stillness-lock anchors, locked flag, counter
+          _shoulder_snapshot per-frame shoulder positions
+          _kp_filter        One-Euro history per keypoint
+          _counts/_frame_i  logging counters (cosmetic, reset for tidiness)
+        """
+        self.prev_left = self.robot.neutral_left.copy()
+        self.prev_right = self.robot.neutral_right.copy()
+        self._coast_count = 0
+        self._have_good_pose = False
+        self._depth_state = {}
+        self._still_state = {}
+        self._shoulder_snapshot = {}
+        if self._kp_filter is not None:
+            self._kp_filter.reset()
+        self._counts = {"applied": 0, "frozen": 0}
+        self._last_reason = None
+        self._frame_i = 0
+
     def _arms_have_nan(self, kp) -> bool:
         """Only guard we keep: never feed a NaN arm keypoint into IK, since
         that produces a broken pose. Everything else (confidence, yaw, segment
@@ -84,6 +111,20 @@ class TeleopController:
         el_target, wr_target = self._smooth_depth(side, el_target, wr_target)
         el_target, wr_target = self._apply_deadzone(side, el_target, wr_target)
 
+        if getattr(self.cfg.ik, "free_wrists", False):
+            # Candidate A: the second task point is the PALM. The six keypoints
+            # this reads carry no hand-orientation signal, so the palm target
+            # continues the forearm direction by the hand length - roughly the
+            # palm a pinned wrist would have given - and the wrist joints are
+            # left to the IK and its nullspace.
+            sid = r.palm_site_left if side == "left" else r.palm_site_right
+            hand = r.hand_len_left if side == "left" else r.hand_len_right
+            u = wr_target - el_target
+            nu_ = float(np.linalg.norm(u))
+            palm_target = wr_target + (u / nu_ if nu_ > 1e-9 else u) * hand
+            return solve_arm_ik(r.model, r.data, el_body, wr_body,
+                                el_target, palm_target, qpos, dof, lim,
+                                neutral, self.cfg.ik, task_site_id=sid)
         return solve_arm_ik(r.model, r.data, el_body, wr_body,
                             el_target, wr_target, qpos, dof, lim,
                             neutral, self.cfg.ik)

@@ -1,0 +1,122 @@
+[
+ {
+  "motion": "reach_out_boxh",
+  "approach": "direct",
+  "plat": 14416,
+  "depth": -6.077792407978146,
+  "torso": 448,
+  "pitch_max": 0.9149285747697266,
+  "pitch_end": 0.009344199032445655,
+  "verdict": "transient",
+  "sat": 124,
+  "tgt_p50": 170.45102286113044
+ },
+ {
+  "motion": "hands_in_boxh",
+  "approach": "direct",
+  "plat": 13206,
+  "depth": -9.885820699046082,
+  "torso": 0,
+  "pitch_max": 1.1502358542152238,
+  "pitch_end": 0.6623478175738088,
+  "verdict": "transient",
+  "sat": 220,
+  "tgt_p50": 191.55616614800545
+ },
+ {
+  "motion": "hands_in_chest",
+  "approach": "direct",
+  "plat": 9690,
+  "depth": -11.96476568150057,
+  "torso": 1645,
+  "pitch_max": 2.2111721552616883,
+  "pitch_end": 0.3479207381015087,
+  "verdict": "transient",
+  "sat": 230,
+  "tgt_p50": 296.0988971171922
+ },
+ {
+  "motion": "lateral_sweep",
+  "approach": "direct",
+  "plat": 2414,
+  "depth": -11.52274830388939,
+  "torso": 1728,
+  "pitch_max": 1.7074910749533498,
+  "pitch_end": 0.0008590918826991249,
+  "verdict": "transient",
+  "sat": 61,
+  "tgt_p50": 125.95690306673629
+ },
+ {
+  "motion": "dropout_3_5_8",
+  "approach": "direct",
+  "plat": 22333,
+  "depth": -16.090719110579556,
+  "torso": 0,
+  "pitch_max": 1.9328449839743047,
+  "pitch_end": 1.1202357307561377,
+  "verdict": "WEDGE",
+  "sat": 223,
+  "tgt_p50": 214.41473726555625
+ },
+ {
+  "motion": "reach_out_boxh",
+  "approach": "raised",
+  "plat": 11336,
+  "depth": -11.534426996364118,
+  "torso": 1157,
+  "pitch_max": 2.0359146977678435,
+  "pitch_end": 0.41777446989067535,
+  "verdict": "transient",
+  "sat": 227,
+  "tgt_p50": 198.54367096692314
+ },
+ {
+  "motion": "hands_in_boxh",
+  "approach": "raised",
+  "plat": 14149,
+  "depth": -18.771964035093134,
+  "torso": 542,
+  "pitch_max": 1.7273915976965788,
+  "pitch_end": 0.7074918684506817,
+  "verdict": "transient",
+  "sat": 230,
+  "tgt_p50": 220.7614149338275
+ },
+ {
+  "motion": "hands_in_chest",
+  "approach": "raised",
+  "plat": 9712,
+  "depth": -18.771964035093134,
+  "torso": 2156,
+  "pitch_max": 2.1834014300645257,
+  "pitch_end": 2.1567128468260917,
+  "verdict": "WEDGE",
+  "sat": 230,
+  "tgt_p50": 305.5297091832613
+ },
+ {
+  "motion": "lateral_sweep",
+  "approach": "raised",
+  "plat": 1722,
+  "depth": -13.514835164426506,
+  "torso": 1939,
+  "pitch_max": 1.8504149580523905,
+  "pitch_end": 0.0008587256224526826,
+  "verdict": "transient",
+  "sat": 79,
+  "tgt_p50": 133.56435768153335
+ },
+ {
+  "motion": "dropout_3_5_8",
+  "approach": "raised",
+  "plat": 22754,
+  "depth": -14.05034439894953,
+  "torso": 512,
+  "pitch_max": 2.108506030757098,
+  "pitch_end": 1.5773889773304008,
+  "verdict": "WEDGE",
+  "sat": 227,
+  "tgt_p50": 248.19556206151958
+ }
+]

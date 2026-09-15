@@ -1,0 +1,26 @@
+Figure 3.x — Box spawn regions on the pickup platform (world XY).
+
+The platform footprint (0.38 x 0.64 m) is read from
+the model geom `platform_pickup_geom`; the box footprint
+(0.18 x 0.18 m) from `box1_geom`. Box position is
+the ONLY randomised quantity — both platforms are fixed (Q6), so Objective 4
+measures generalization over manipulation targets and never over navigation
+targets. The sample region spans x [1.44, 1.56] m
+and y [-0.21, 0.21] m. Its x extent is set by the
+ROBOT, not by the platform: the walk-in drives the base to (box_x - standoff),
+so the far sample edge must leave the base clear of max_base_x = 1.255 m,
+which trims x to +/-0.06 m (O22) and leaves 0.04 m of platform unused on
+each side. The dotted line at x = 1.615 m is the separate, looser ARM-reach
+bound (1.255 + 0.36); the standoff constraint binds first.
+The y extent is limited only by the platform edge, with the box footprint at a
+corner spawn clearing it by 20 mm. 2000 draws through the real sampler
+are overlaid, 285 of them (14.2%) inside the held-out patch,
+against 14.3% predicted by area.
+
+The held-out patch is a 2-D INTERIOR patch, and that is the point. Every
+held-out x value also occurs in training at some other y, and every held-out y
+also occurs in training at some other x — both marginals remain
+in-distribution, so only the COMBINATION is unseen. Objective 4 therefore
+measures compositional generalization strictly inside the convex hull of the
+training data, not extrapolation beyond it. A far-half or edge-band split would
+have measured the opposite thing.

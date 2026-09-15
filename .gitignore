@@ -15,3 +15,7 @@ demonstrations/
 *.hdf5
 test_locomotion_input.py
 summarise_locomotion_eval.py
+# Agent memory: CLAUDE.md is the single source of truth (see its section 14).
+# AGENTS.md was a stale byte-drifted copy; do not recreate it.
+AGENTS.md
+MUJOCO_LOG.TXT

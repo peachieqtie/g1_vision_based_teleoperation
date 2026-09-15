@@ -1,0 +1,23 @@
+[
+ {
+  "seed": 0,
+  "ok": false,
+  "fail": "PLACE(xy)",
+  "engaged": true,
+  "palm": 26.776951271060124,
+  "place": 0.1310502776408668,
+  "tilt": 89.99677351425386,
+  "resting": true,
+  "fell": false,
+  "pitch": 8.618118030157413,
+  "n": 1278,
+  "wedged": false,
+  "wristP": 0.37696174778017083,
+  "hits": 183,
+  "depth": -3.930731377799028,
+  "twist_angle": 37.478635399532,
+  "twist_joint": 0.13787286196979825,
+  "box_below_mm": -0.3706241723269166,
+  "palm_below_top_mm": 0.0
+ }
+]

@@ -26,6 +26,13 @@ class OneEuroFilter:
         self._dx = _LowPass()
         self._x_prev = None
 
+    def reset(self):
+        """Forget all history. Episode reset must call this, or the first frame
+        of a new episode is blended with the last frame of the previous one."""
+        self._x = _LowPass()
+        self._dx = _LowPass()
+        self._x_prev = None
+
     @staticmethod
     def _alpha(cutoff, freq):
         tau = 1.0 / (2 * np.pi * cutoff)
@@ -60,3 +67,12 @@ class KeypointFilter:
                 continue
             out[idx] = np.array([filts[i](p[i]) for i in range(3)])
         return out
+
+    def reset(self):
+        """Reset every per-keypoint filter (see OneEuroFilter.reset).
+
+        `_filters` maps keypoint index -> a list of THREE filters, one per axis.
+        """
+        for filts in self._filters.values():
+            for f in filts:
+                f.reset()
