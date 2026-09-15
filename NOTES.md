@@ -4793,3 +4793,248 @@ lock):**
 Throwaway diagnostics: scratchpad `bpns_diag.py`. Results: `docs/measurements/`
 `teleop_{A,B,Bp}.json`, `gates_{base,A,B,Bp,Bpns}_pred_40.json`,
 `gates_{A,B,Bp,Bpns}_lock_12.json`, `corridor_{base,A}.json`.
+
+---
+
+## 2026-09-15 — B-prime ADOPTION attempted as a pair exclusion: validated, then REVERTED on the strict regression rule
+
+**Outcome.** B-prime was implemented as `<contact><exclude>` body pairs with a contract
+that makes a recording/evaluation mismatch raise. Both gates pass: **12-seed phase lock
+12/12**, **40-seed predicate 40/40**. All three outstanding checks were run.
+
+The instruction was "if either gate regresses on ANY measure, REVERT". Four measures
+moved past the baseline envelope, all by very small amounts, so **the adoption is
+reverted and nothing was fixed.**
+
+Git history on branch `adopt-bprime`:
+
+| commit | what |
+|---|---|
+| `3e89408` | checkpoint before starting |
+| `827d8bf` | the full attempt: code, tests, validation tools, JSON results |
+| `0144e0a` | revert of `827d8bf` |
+
+The working tree now matches the checkpoint exactly: `git diff 3e89408` is empty and the
+spec tests pass 43/43. `git revert 0144e0a` re-applies the adoption as-is.
+
+This section follows the "2026-09-15 — TELEOP HAZARD" candidate section above. The brief
+called it the 2026-09-14 section, but it is dated 2026-09-15.
+
+**The most important finding is not the revert.** Check (b) shows that B-prime's
+"clean" teleop result hid a new failure mode. With the slab no longer stopping the hands,
+they reach the box through it:
+
+- it moves in **14 of 14** teleop motions (median ~100 mm);
+- it is **knocked clean off the platform in 3 of 14**, all on the trained "raised" approach.
+
+The earlier candidate report never measured box motion under teleop, so its "clean"
+verdict was incomplete. This belongs in the adoption decision whatever is done about the
+tiny regressions.
+
+### The regressions that triggered the revert
+
+Comparisons are strict, with criteria fixed in `tools/bprime_compare.py` (in `827d8bf`)
+before the adopted results were read. The baseline is the same instrumented harness with
+the exclusion stripped, which reproduces the checkpoint exactly: seed 0 gives palm
+34.5481 mm, place 0.0393 m, 196 hits and wrist 0.4642 rad, identical to the adopted state.
+
+| gate | measure | baseline | adopted | size |
+|---|---|---|---|---|
+| 12-seed | max base pitch | 10.6541° (seed 4) | 10.7697° (seed 4) | +0.116°, one seed |
+| 12-seed | min box-corner gap, any phase | −12.2075 mm | −12.2101 mm | 0.003 mm deeper |
+| 40-seed | max carry drift | 2.7765 mm (seed 7) | 2.7785 mm (seed 7) | +0.002 mm |
+| 40-seed | min box-corner gap, box unwelded | −9.5822 mm (seed 8) | −9.6465 mm (seed 28) | 0.064 mm deeper |
+
+- The 12-seed box-gap figure is the **welded** box pressed into the goal slab during
+  LOWER. Baseline does the same by up to 15.3 mm; it is not resting sink.
+- The 40-seed unwelded case is resting sink. Seed 28 alone went 0.24 mm deeper than its
+  own baseline.
+- All four moved in seeds whose baseline episode had hand-slab contact (seed 4: 97
+  contact-steps). Removing that contact changes those trajectories; nothing else moved.
+- **Not regressions:**
+  - pass counts, falls, wedges, lock fallbacks;
+  - placement and palm-error envelopes (identical);
+  - resting 12/12 and 40/40;
+  - max box tilt (identical, 10.89°);
+  - episode length (max identical; mean 757.05 → 756.77);
+  - pre-grasp box displacement (identical).
+
+**Whether a 0.1° / 0.06 mm envelope move should count is Charles's decision, not this
+session's.** Strict was the literal instruction. A tolerance policy would have passed.
+
+### 1. Implementation (all in `827d8bf`, all reverted)
+
+- **`scene.xml`**: six excludes against `platform_pickup`: `{left,right}_wrist_pitch_link`,
+  `_wrist_yaw_link` and `_pad`.
+- **Deviation from the brief, measured.** The brief named `wrist_yaw_link` and the pads.
+  That set was run on the teleop motion set first. It left **wrist_pitch_link ↔ slab
+  contact in 10/10 motions** (4–2,414 contact-steps), though no wedges. The pitch link
+  was therefore added. `wrist_roll_link` was not: it touched the slab in no run under any
+  set (none / yaw+pad / all wrist bodies), so excluding it would lose fidelity for nothing.
+  The earlier bitmask B-prime had excluded the roll link too.
+- **`TeleopConfig.contact = ContactConfig(hand_pickup_exclusion=True)`**, default on. With
+  False, `contact_contract.load_model` strips the excludes through `MjSpec` before
+  compiling. The stripped model differs from the default only in name-table bookkeeping.
+- **`g1_teleop/contact_contract.py`** — `contract_of(model)` is read from the
+  **compiled** model:
+  - it decodes `exclude_signature`. The layout `(min_body_id << 16) + max_body_id` was
+    measured on this build, not assumed;
+  - it adds a bitmask tag, so a contype/conaffinity filter layered on top is also caught.
+- **Loaders switched** to `load_model(cfg)`: `scripted_demo.run_episode`,
+  `run_integrated_combined.py`, `tools/teleop_physics_check.Rig`, and the corridor probe.
+- **`tools/teleop_fix_candidates.py`**: every candidate tag loads with the exclusion
+  stripped, so the candidate numbers stay reproducible.
+- **Tests** in `g1_data/test_contact_contract.py`: **13/13**. Spec tests stayed 43/43.
+
+### 2. Where the setting lives and how a mismatch is caught (requirement 3)
+
+1. **The setting is `TeleopConfig.contact`.** That is the config the demonstrator, the
+   teleop entry point, `reset_episode`, and the future recorder and evaluator all take.
+   The pairs themselves are in `scene.xml`, so any loader gets the default.
+2. **`reset_episode` raises** (`ContactContractMismatch`) if the compiled model's exclude
+   table or bitmasks do not match `cfg.contact`. It is the one place every recording and
+   evaluation episode starts. **Live**, and tested in both directions: an excluded model
+   with an off config raises, and an unexcluded model with an on config raises.
+3. **`EpisodeStart.contact_contract` carries the contract string**, and
+   `assert_recorded_contract(recorded, model)` raises when a dataset's value differs from
+   the evaluation model's, including a missing value. **This half is a hook only.** The
+   recorder and evaluator do not exist yet, and nothing forces them to call it. Tested to
+   raise, not enforced.
+
+### 3. The three checks
+
+**(a) Hands crossing.** New `hands_cross` motion (hands sweep across the midline into each
+other above the box), base locked.
+
+| config | hand↔hand contact-steps (direct / raised) | max force |
+|---|---|---|
+| adopted (pair exclude) | **1,999 / 2,171** | 109 / 91 N |
+| old bitmask B-prime | **0 / 0** | — |
+| baseline | 0 / 0 | — (the hands never meet: the arm wedges on the slab first, target error 269 mm) |
+
+- Hand↔hand contact also occurred incidentally in `hands_in_chest` direct (47 steps) and
+  `rise_under_box` raised (245 steps).
+- Every Bp run reads 0. **Hand↔hand contact survives the pair exclusion, and the check can
+  fail:** it fails on the old bitmask, which is what that approach silently disabled.
+- Static proof, independent of IK: the right hand's root body was shifted onto the left
+  hand. Contacts are present under the exclusion and absent under the bitmask. The same
+  method shows hand↔goal platform and hand↔box contacts present, wrist_roll↔pickup
+  present, and hand↔pickup absent when on and present when off.
+- **In the gates:** hand↔goal-platform contact occurs in every seed, 299+ steps and up to
+  117.6 N, as at baseline. Hand↔hand contact is 0 in all 52 demonstrator episodes, in
+  both baseline and adopted.
+
+**(b) Box displacement under teleop, before any grasp.** This is the finding that matters.
+Base locked, 14 motions, including the new `rise_under_box` (hands forward under the slab,
+beneath the box footprint, then straight up).
+
+| motion | approach | adopted: max disp mm / tilt° / off platform | baseline (exclusion stripped) |
+|---|---|---|---|
+| reach_out_boxh | direct | 99 / 6 / no | 0.1 / 0 / no |
+| hands_in_boxh | direct | 136 / 34 / no | 0.1 / 0 / no |
+| hands_in_chest | direct | 65 / 23 / no | 24 / 11 / no |
+| lateral_sweep | direct | 159 / 57 / no | **1147 / 177 / YES** |
+| hands_cross | direct | 11 / 1 / no | 127 / 41 / no |
+| rise_under_box | direct | 184 / 12 / no | 0.1 / 0 / no |
+| dropout_3_5_8 | direct | 101 / 24 / no | 82 / 17 / no |
+| reach_out_boxh | raised | 80 / 20 / no | 0.1 / 0 / no |
+| hands_in_boxh | raised | **876 / 179 / YES** | 0.1 / 0 / no |
+| hands_in_chest | raised | **876 / 179 / YES** | 27 / 12 / no |
+| lateral_sweep | raised | **875 / 179 / YES** | 117 / 66 / no |
+| hands_cross | raised | 10 / 2 / no | 124 / 38 / no |
+| rise_under_box | raised | 197 / 24 / no | 0.1 / 0 / no |
+| dropout_3_5_8 | raised | 96 / 22 / no | 0.1 / 0 / no |
+
+- **Adopted:** the box moves more than 1 mm in **14/14** motions, 10–197 mm when it stays
+  on, and is **knocked off entirely in 3/14**. It ends displaced 6–190 mm and tilted up to
+  21° when it stays on.
+- **Baseline:** the box moves in 7/14 and is knocked off in 1/14. The slab stops the hand,
+  which is also what jams the wrist.
+- **All three knock-offs are on the "raised" approach**, the path an operator would be
+  trained to use. TR18 checked: the identical 876.4 mm on two motions is not an artifact.
+  The raised motions share their home→up→out prefix (every motion's first point is at the
+  same box-face y), and the box leaves the platform during that shared prefix, before the
+  motions differ.
+- **Worst case, `rise_under_box`:** 184–197 mm, stays on the platform.
+- **So yes, an operator can ruin an episode.** B-prime trades a permanent wrist jam for a
+  pushed or knocked-off box. That is recoverable by reset but equally episode-ending, and
+  **far more frequent**: 14/14 motions disturb the box, against 6/14 wedging at baseline.
+- **Unmeasured:** whether a nudged-but-recovered box contaminates demonstrations that go on
+  to succeed.
+
+**(c) Pass-through depth, replacing the withdrawn site-height proxy.**
+
+Definitions (`tools/contact_measures.py`, in `827d8bf`):
+- **Primary:** a shadow copy of the scene without the exclusion is posed at the live qpos
+  (`mj_kinematics` + `mj_collision` only). MuJoCo's own narrow phase reports the suppressed
+  hand↔slab contacts. **Depth = −contact.dist**, the minimum translation that would
+  separate the hand geom's collision hull from the slab. A hand *under* the slab reads 0,
+  which is exactly what the old proxy could not do. Duration comes from probes every
+  10 ms, as a total and as the longest continuous run.
+- **Cross-check:** hand mesh vertices (box corners for pads) are tested inside the slab
+  box. This depth saturates at the slab half-thickness, 20 mm, by construction.
+
+Validation:
+- **Shadow depth equals live contact depth to 0.000 mm** on every probe where the contact
+  is live: 10,655 probes over the stripped teleop runs, 162 in the stripped gates.
+- In the stripped teleop runs it reproduces O25's contact depths, −7.6 to −19.1 mm.
+- The vertex check reads 19.7–20.0 mm whenever the shadow reads 60+ mm. That confirms
+  *inside*, not under.
+- One claim is withdrawn: I expected "vertex inside but no shadow contact" to be
+  impossible. It is not: 10 of 12,082 adopted teleop probes. The magnitude was not
+  recorded; presumably grazing contacts.
+
+| where | max depth | how long | where in the episode |
+|---|---|---|---|
+| teleop, adopted, 14 motions | **60.4–69.6 mm** | 0.05–7.29 s total per ~8.6 s stream, longest continuous **5.59 s** | pads ≤69.6 mm, wrist_yaw_link ≤55.6 mm, wrist_pitch_link ≤42.2 mm |
+| demonstrator, adopted, 12-seed | ≤65.7 mm, 12/12 seeds | ≤0.26 s per episode, longest 0.13 s | REACH only |
+| demonstrator, adopted, 40-seed | ≤65.5 mm, 20/40 seeds | ≤0.26 s, longest 0.25 s | REACH only |
+
+- For comparison, baseline live penetration is ≤19.1 mm in teleop and ≤16.3 mm in the
+  demonstrator.
+- **Disclosure sentence:** with the exclusion, a hand can sit up to **70 mm** inside the
+  pickup slab (it would have to move 70 mm to clear it), for up to **5.6 s continuously**
+  under teleop. The scripted demonstrator does so briefly during REACH (≤0.26 s, ≤66 mm).
+
+### 4. Validation
+
+**Gates, adopted vs stripped baseline.**
+- Palm error, placement, tilt and episode-length envelopes are identical. The four
+  exceptions are in the regression table above.
+- Per-seed changes occur only in seeds with baseline hand-slab contact: placement within
+  ±5.9 mm, pitch within ±0.66°. The other seeds are identical.
+- Hand↔pickup contact is 0 in every adopted seed. The pickup platform's only remaining
+  robot contact is the **pelvis** against the slab edge: 582 steps adopted vs 578 baseline
+  at 12 seeds, 1,381 vs 1,380 at 40.
+
+**Box behaviour.**
+- Rests 12/12 and 40/40.
+- Tilt identical (max 10.89°, seed 20, both).
+- Pre-grasp box displacement in the demonstrator identical (max 1.87 mm).
+- Sinking: see the regression table. Resting-box corner gaps are −3.9 to −9.6 mm, against
+  baseline −3.9 to −9.6 mm.
+- An earlier version of the sink measure counted box corners outside the platform
+  footprint and read −12 mm in baseline. It was fixed before any comparison was made.
+
+**Staged raise still required: adopted without it, 34/40** (predicate). Seeds 3, 18, 21,
+23, 25 and 37 fail:
+- seed 3 on PLACE(xy), 0.102 m;
+- the other five on GRASP, with the box displaced **887–1,011 mm before the grasp** and
+  hands inside the slab during REACH.
+
+This is the same failure set as the bitmask candidate (Bpns 34/40): hands rising through
+the slab knock the box off. The 12-seed phase-lock gate alone would have said "not needed".
+
+### For the closeout (not written here, per instruction)
+
+- **The adoption decision is open again.** Decide whether the strict any-measure rule
+  should carry a tolerance. If re-adopted, `git revert 0144e0a`. Weigh check (b) either way.
+- **If adopted, it needs:**
+  - a new deviation row: a simulation-only relaxation, applying to collection **and**
+    evaluation;
+  - a limitation: hands ≤70 mm inside the pickup slab for ≤5.6 s continuously, and box
+    disturbance by the operator in 14/14 teleop motions.
+- **D2's rationale is stale:** the pinned wrists protect the PLACE, not the grasp pose.
+- **TR15's mechanism is stale:** the loop cannot form because the twin's base is never
+  synced, not because the target follows the robot.
+- **The recorded-contract check is a hook only** until the recorder and evaluator call it.
