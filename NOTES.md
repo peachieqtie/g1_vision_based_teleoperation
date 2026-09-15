@@ -5514,3 +5514,106 @@ recorder must log the **sim-to-wall ratio per episode** (and ideally per tick) i
 metadata so the variation is visible in the dataset rather than silent. Above 100% the
 pacing sleep absorbs the difference, so the ratio should sit at 1.0 and any episode that
 drops below it is the one to look at.
+
+---
+
+## 2026-09-15 — PHASE 2 CLOSEOUT: the live session, the dataset design, and what moved into CLAUDE.md
+
+Phase 2 is closed. This section records the material that existed only in chat sessions
+and in this closeout brief, so CLAUDE.md can carry a pointer instead of the detail.
+
+### 1. The live operator session — Objective 1 demonstrated end to end
+
+**A live operator completed the full task through `run_integrated_combined.py` with the
+ZED, under stepped physics: walked in, grasped, transported, placed.** That is Objective 1
+demonstrated end to end, and it closes the "never executed" assumption that CLAUDE.md §13
+had carried since 2026-09-08.
+
+**Difficulties the operator reported, and what was done about each:**
+
+| reported | response |
+|---|---|
+| piloting into the lock window is hard | the overlay was rewritten to give ACTIONS, not measurements (`STEP CLOSER`, `TURN LEFT`, `STAND STILL`), MINIMAL by default — see the overlay section above |
+| walking and turning felt slow | `KeyboardCommand` runs well under the validated envelope (forward 0.35 m/s, turn 0.25 rad/s); the speeds are a deliberate choice for precise approach, not a limit of the policy |
+| the sim ran below real time with tracking active | measured at 37.4% of real time and fixed — see the throughput section above; now 128.2% |
+
+**THE GRASP WORKED WITHOUT THE BASE LOCK.** The operator completed the task free-based:
+the box welded, lifted and stayed held, and the place succeeded.
+
+- **Why O17 did not stop it.** The attractor standoff (0.47–0.59 m) was measured with the
+  SCRIPTED station-keeper, whose corrective velocity is capped (`hold_max`). A human
+  holding the forward key at full command pushes against the recession in a way the
+  scripted controller never does.
+- **Consequence, and it is a large one: D12 — the most consequential deviation in the
+  project — may be needed only by the SCRIPTED demonstrator, not by collection or
+  deployment.**
+- **Not yet measured**, and both are needed before this can be acted on:
+  1. the standoff spread at grasp without the lock, over seeds;
+  2. whether a learned policy can fight the attractor the way a human does — a policy
+     emitting velocity commands through the same channel may or may not sustain the push.
+- **Why it is worth resolving before collection:** dropping D12 would remove a major
+  limitation from every downstream result AND give Objective 4 natural standoff variation
+  that the locked base cannot produce.
+
+### 2. Dataset and evaluation design (decided in chat, recorded here)
+
+**Collection.** 150 episodes. One `.npz` per episode. Seed streams **pre-partitioned before
+collection** so that held-out leakage is provable by construction rather than audited
+afterwards.
+
+**Per-episode file contents:**
+
+    states, actions, phase_labels, gait_phase, seed, box_spawn_xy, standoff_cmd,
+    lateral_cmd, heldout, four per-phase success flags, placement_error, tilt,
+    weld engage/release ticks, lock engage/release ticks, wrist_dev_rad,
+    SIM-TO-WALL RATIO, reset_fingerprint, SPEC_VERSION, git commit, mujoco version
+
+Total ~50 MB.
+
+**Splits and normalization.** Train/val 80/20, stratified by binned spawn position.
+Normalization statistics from the TRAINING SPLIT ONLY; masked dims pinned to mean 0 /
+std 1 so a constant channel cannot be z-scored into unit-variance noise.
+
+**Experiments.** Experiment 1: 100 FRESH in-region seeds. Experiment 2: 100 held-out-patch
+seeds. Evaluation seeds are FIXED across all three policies. Data-scaling curve on NESTED
+subsets 25 ⊂ 50 ⊂ 100 ⊂ 150.
+
+**Collect 25 FIRST and train BC on them before collecting the rest.** If BC saturates at
+25 episodes the task does not discriminate between the conditions, and the comparison
+cannot answer RQ2/RQ3 no matter how much more data is collected. That is a cheap check
+against an expensive mistake.
+
+**Statistical limit, to state up front rather than discover in Chapter 4:** 100 evaluation
+episodes give a standard error of ~5% on a rate near 50%, so two policies are separable at
+roughly **15 percentage points**. Smaller differences are not measurable with this design.
+
+### 3. The four schema-freeze decisions
+
+Recorded because the reasoning, not just the outcome, is what a later session needs:
+
+1. **Box position is stored in the WORLD frame**, with base-relative coordinates derived in
+   the loader. One canonical frame in the file; derived views are the loader's business.
+2. **Gait phase is EXCLUDED from the state vector** and logged as per-timestep metadata.
+   It is a clock. Giving every policy a clock hands BC the temporal capability that
+   ACT-LSTM is supposed to supply, which collapses the very gap RQ2/RQ3 exist to measure.
+3. **The base lock is neither a state dim nor an action dim.** It is episode metadata plus
+   an observable predicate (`g1_data/phases.py`), so nothing in the vectors encodes a
+   mechanism the policy cannot cause.
+4. **The episode cap comes from the measured distribution** (O10), not from the schedule.
+
+### 4. What moved into CLAUDE.md in this closeout
+
+§2 rewritten (Phase 2 closed, no blocker); §4 gains spec.py, the demonstrator settings, the
+teleop parity work, the recorder and the IK performance and convergence facts; §7 gains
+**D13–D18** and an amended **D2**; §8 gains the dated entries for the schema freeze, the
+phase vocabulary, WALK_IN, the dataset design, the constant-dim mask, the lock predicate,
+the O26 mitigation, the live session, the free-based grasp and the IK throughput fix; §9
+gains **TR19–TR26**; §10 resolves O10, updates O25/O26/O19 and adds **O27–O30** plus the
+Phase 1 exit-gate hole; §13 moves the entry-point and ZED-model assumptions to verified.
+
+**The Phase 1 exit gate was incomplete**, and that belongs in the record rather than only
+in the fix: it scored grasp, placement, resting, tilt and falls, and never scored
+CLEARANCE. So the box scraped the pickup platform (−1.4 mm at the shipping `lift_h`) and
+the hand penetrated it, in every episode, invisibly. "Phase 1 closed 12/12" is true on the
+criteria as written, and the criteria had a hole. Under free lock timing the honest
+reliability figure was **24/40 before the mitigation, 40/40 after**.
