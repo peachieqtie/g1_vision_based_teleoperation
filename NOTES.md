@@ -5617,3 +5617,207 @@ CLEARANCE. So the box scraped the pickup platform (−1.4 mm at the shipping `li
 the hand penetrated it, in every episode, invisibly. "Phase 1 closed 12/12" is true on the
 criteria as written, and the criteria had a hole. Under free lock timing the honest
 reliability figure was **24/40 before the mitigation, 40/40 after**.
+
+---
+
+## 2026-09-16 — PHASE 3, first chunk: the recorder, the ledger, and what the replay test actually proves
+
+**Built:** `g1_data/recorder.py` (episode recorder, observation only), `g1_data/ledger.py`
+(crash-safe episode ledger), `tools/record_episodes.py` (operator controls + verdict),
+`tools/replay_check.py` (the open-loop replay test with two negative controls and one
+positive control).
+
+**Not built, deliberately:** the phase labeller, success criteria beyond the rejection
+checks, the dataset loader, normalization, chunking. Those are the next chunk and they
+depend on this one being right.
+
+**Headline.** The recorder logs the quantity that actually drove the robot — proven four
+ways below. **Open-loop replay reproduces the MANIPULATION and does not reproduce the
+WALK, and no recording rate can fix that.** That is a property of the action design (3 of
+the 22 dims are a closed-loop station-keeper's corrective velocity), not a recorder fault,
+and it changes what the Phase 3 exit criterion can honestly assert.
+
+### 1. The recorder is observation only, measured
+
+It attaches by wrapping `mujoco.mj_step` and reading `run_episode`'s frame locals — the
+2026-09-10 audit's method — plus a wrapper on `reset_episode` that captures the post-reset
+fingerprint. `scripted_demo.py` is not modified.
+
+    tools/record_episodes.py --invariance 0
+    compared 65 result fields; 0 differ
+    OBSERVATION ONLY: CONFIRMED
+
+Seed 0 run with and without the recorder agrees on **all 65** fields of the demonstrator's
+result dict. That covers the `mj_kinematics` call inside `SpecLayout.build(sync=True)`,
+which spec.py argues cannot perturb the simulation: it cannot, and now that is measured
+rather than argued. The gates below are the second, independent proof.
+
+### 2. What an episode file holds
+
+706–846 ticks at 25 Hz, **~325 KB compressed** each; ~49 MB projected across 150 episodes.
+
+| array | shape | note |
+|---|---|---|
+| `states` | (T, 47) f32 | via `SpecLayout.build`, never hand-assembled |
+| `actions` | (T, 22) f32 | `data.ctrl` through the permutation; dims 19–21 zeroed while locked (D17) |
+| `phase_labels` | (T,) i8 | the demonstrator's own `Phase`, not a labeller |
+| `gait_phase` | (T, 2) f32 | metadata, never a policy input |
+| `qpos`, `qvel` | (T, 45), (T, 43) f32 | **insurance** — see below |
+| `step_index` | (T,) i64 | the demonstrator step each tick was taken at |
+
+Metadata carries seed, spawn, held-out flag, standoff/lateral commands, the demonstrator's
+outcome numbers, weld/lock engage+release ticks, wrist deviation, **sim-to-wall ratio**,
+pre-grasp box disturbance, hand/platform penetration, `reset_fingerprint`, SPEC_VERSION,
+git commit, mujoco version, and **`contact_contract`** read back from the compiled model.
+
+**On raw `qpos`/`qvel`:** they are insurance, not a policy input. Almost anything one later
+wishes were in the 47-D state is derivable from raw state plus an observation window
+(velocity is a finite difference) — but LEG JOINT ANGLES are not, proposal 3.4 excludes
+them, and once collected without them they are gone. Measured cost is ~110 KB of the
+325 KB. That makes the state design the one dataset decision that cannot be regretted.
+
+**One bug worth recording**, caught by the verdict printout on the first real episode: the
+pre-grasp box-disturbance metric read **1411.6 mm** on a healthy episode. It was
+accumulating whenever the weld was not engaged, which includes every tick AFTER the
+release at the goal, where the box is legitimately 1.4 m from its spawn. Now bounded by
+the first engage. A check that fires on a healthy episode is worse than no check.
+
+### 3. The operator controls and the ledger
+
+Each episode ends with the verdict printed, with numbers, before any decision:
+
+    check                        result measurement
+    weld fired                   PASS   engaged=True
+    box not dropped              PASS   resting=True tilt=0.0 deg
+    placement <= 0.10 m          PASS   0.0419 m
+    no fall                      PASS   max pitch 7.3 deg
+    wrist dev <= 0.8 rad         PASS   0.563 rad (left_wrist_pitch_joint)
+    box undisturbed pre-grasp    PASS   0.1 mm
+    hand/platform penetration    PASS   0.0 mm (0.0 = never touched, TR19)
+    RECOMMEND: ACCEPT
+
+Thresholds and their provenance: placement 0.10 m (Q4); wrist 0.8 rad on the pitch pair
+post-REACH (TR23); pre-grasp disturbance 10 mm (measured demonstrator range 0.1–1.9 mm,
+against 65–197 mm in teleop); hand/platform penetration −35 mm (measured demonstrator
+range 0.0 to −28.3 mm — set at the edge of the MEASURED envelope, not at zero, because O26
+is mitigated but not closed and a check that fails 40/40 healthy episodes tells the
+operator nothing). Under D18 the demonstrator now reads 0.0 mm: no hand-platform contacts
+exist at all.
+
+**Ledger** (`recordings/episodes/ledger.jsonl`): append-only JSON Lines, flushed and
+`fsync`ed per line, state rebuilt by replay. There is no in-place update for a crash to
+corrupt, and a torn final line is skipped rather than poisoning the file. It records
+session / issue / accept / discard / error with the seed, the checks, the held-out flag and
+the path — so session three knows what sessions one and two consumed and the held-out leak
+check is provable afterwards rather than asserted.
+
+### 4. The open-loop replay test — the diagnosis
+
+Five episodes, seeds 0–4. The test resets with the same seed, asserts the reset
+fingerprint, restores the episode's own initial state (the base placement lives in
+`run_episode`, not in `reset_episode`), then feeds the recorded actions back: 17 joint
+targets through `spec.upper_ctrl_from_action`, 2 gripper dims to `GraspWeld.update`, 3
+velocity dims to the locomotion policy. Nothing is driven from live state.
+
+| episode | box while welded | arms while welded | weld tick Δ | lock tick Δ | base div, walk-in | base div, after release |
+|---|---|---|---|---|---|---|
+| seed 0 | 6.1 mm | 0.53 rad | 1 | 0 | 26 mm | **2.006 m** |
+| seed 1 | 10.1 mm | 0.41 rad | 1 | 8 | 23 mm | 0.099 m |
+| seed 2 | 4.9 mm | 0.51 rad | 1 | 1 | 24 mm | 0.409 m |
+| seed 3 | 9.8 mm | 0.51 rad | 1 | 1 | 25 mm | **1.612 m** |
+| seed 4 | 14.5 mm | 0.54 rad | 1 | 2 | 21 mm | 0.595 m |
+
+- **Reset fingerprint: 5/5 match.** So the divergence is not (b), an unreset episode.
+- **Manipulation reproduced: 5/5.** The weld fires within ONE tick of the recorded tick
+  every time, and the box tracks within 14.5 mm through the entire welded window.
+- **Whole task reproduced: 1/5** (seed 1, placement 0.099 m). The other four miss the
+  placement by 0.4–2.0 m, all of it accumulated after the base lock releases and the robot
+  walks 1.5 m to the goal.
+
+**Which of (a), (b), (c) is it? None of them.** Evidence for each, in the order the brief
+asks:
+
+1. **(a) wrong quantity — ruled out by alignment.** Every recorded velocity command was
+   compared against the demonstrator's own `act` at that exact step: **0 of 706 recorded
+   ticks disagree**. The recorder logs the right quantity at the right instant.
+2. **(b) something not reset — ruled out by the fingerprint**, 5/5.
+3. **(c) routing/permutation — ruled out by a POSITIVE control.** Routing `action[0:17]`
+   straight into `ctrl[upper_ctrl]` (the exact mistake spec.py exists to prevent) is
+   unmistakably different: arm divergence **1.73 rad** instead of 0.53, the weld **never
+   fires**, the base lock **never fires**, and the walk-in diverges 0.54 m immediately
+   instead of 26 mm. The test can see a routing error; the current routing is not one.
+4. **The real cause: an open-loop walk is not reproducible, at any recording rate.**
+   Feeding the demonstrator's OWN 50 Hz velocity series instead of the 25 Hz recording
+   makes it **worse, not better** (base divergence 3.435 m vs 2.006 m). The 25 Hz sampling
+   does lose something real — the missed intermediate command averages 2–4% of command
+   magnitude, with maxima of 0.77 rad/s at correction moments — but supplying it does not
+   help, which is the point. Base divergence after release grows **exponentially**:
+   15 mm at 1 s, 47 mm at 2.4 s, 692 mm at 4.8 s, 2006 mm at the end — a doubling time of
+   roughly 0.7 s. That is the signature of an unstable open-loop process, not of a constant
+   offset or a wrong signal.
+
+**Why this is structural, not a bug.** Three of the 22 action dims are the output of a
+closed-loop station-keeper that reads base position every control tick and corrects. Replay
+by construction has no feedback path, so a corrective command recorded at one state is
+applied at a slightly different state, and a bipedal walk amplifies the difference. The
+manipulation window is reproducible precisely because the base is welded there (D12): the
+locomotion channel is inert, D17 zeroes it, and the 17 joint targets are an open-loop
+command in the demonstrator too.
+
+**What the Phase 3 exit criterion can therefore assert**, and what it cannot:
+
+- CAN: the reset is deterministic; the recorded 17 joint targets + gripper command
+  reproduce the grasp to within a tick and the box to within 15 mm; the routing and the
+  permutation are right; the negative controls fail.
+- CANNOT: that replaying an episode open loop walks the robot back to the goal. PLAN.md
+  Phase 3's criterion ("replayed open-loop, reproducing the original trajectory within a
+  stated tolerance") is met for the manipulation channel and is **not achievable** for the
+  locomotion channel by any recorder.
+
+**This is not a blocker for training, and it is a warning about metrics.** A trained policy
+closes the loop — it sees state at 25 Hz and re-issues velocity commands — so it is not
+replaying open loop. But it means an open-loop metric (action MSE, or "replay divergence")
+will look far better than task success for the walking segments, and Chapter 4 must not
+quote one as evidence for the other.
+
+### 5. The negative controls, and what the second one exposed
+
+**Control A — box displaced 235–250 mm, beyond the 0.16 m weld gate:** task fails 5/5, weld
+refused 4/5. **Control B — actions replayed against another seed's spawn** (the brief's
+literal wording): task fails 5/5, weld still fired 4/5.
+
+The weld firing is not the test failing, and the trace says why. Seed 4 under control A:
+the arm **shoved the displaced box 185 mm** before the gate conditions were met (L 0.123 m,
+R 0.109 m, opposition exactly −0.50, separation 0.201 m), and the episode then wrecked —
+the box ended **3.36 m** from where it was placed. Under control B the shifts are often
+small (36 and 39 mm on two pairs) and the gate tolerance is 160 mm, so a weld is the
+CORRECT outcome there.
+
+So "the weld must not fire" is an unsound criterion for a free body the arm can reach; the
+brief's own criterion — the task must fail — is the sound one, and both controls satisfy it
+5/5. Recorded because the same trap will appear in the success detector next chunk: the
+weld gate does not imply the right box.
+
+**One more thing control A shows:** the demonstrator's recorded hand trajectory tolerates a
+±40 mm spawn shift and still grasps. That is the 0.16 m gate doing its job, and it is worth
+knowing before Objective 4 reads spatial generalization off a 60 mm held-out patch offset.
+
+### 6. Validation
+
+- **Scripted gates:** **12/12 and 40/40, byte-identical.** Both result files were rewritten this run (05:57
+  and 06:03) and `git diff` on them is empty. The recorder does not touch
+  `scripted_demo.py`, and this is the independent check that recording changed nothing.
+- Spec tests 43/43; contact-contract tests 14/14.
+- Replay on **5 episodes across 5 seeds**, both negative controls, plus the positive
+  control.
+- `--invariance`: 65/65 result fields identical with and without the recorder.
+
+### For the closeout
+
+- PLAN.md Phase 3's exit criterion needs the qualification in section 4 above: open-loop
+  replay validates the manipulation channel; the locomotion channel cannot be validated
+  that way.
+- The next chunk (phase labeller, success criteria, loader) should read the four per-phase
+  flags off the quantities already in each file — nothing further needs recording.
+- `docs/measurements` is not where episodes go: `recordings/episodes/` is gitignored
+  (`*.npz`), so the dataset needs the off-machine backup PLAN.md Phase 6 already calls for.

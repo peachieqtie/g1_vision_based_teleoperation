@@ -19,3 +19,7 @@ summarise_locomotion_eval.py
 # AGENTS.md was a stale byte-drifted copy; do not recreate it.
 AGENTS.md
 MUJOCO_LOG.TXT
+
+# Recorded demonstrations and the episode ledger: data, not source. Back these up
+# off-machine (PLAN.md Phase 6) - they are irreplaceable human-generated episodes.
+recordings/
