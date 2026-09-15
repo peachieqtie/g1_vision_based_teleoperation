@@ -69,9 +69,10 @@ def classify(grab_ok: bool, is_new: bool, body_list):
     body = ZEDSource._select_best_body(body_list)
     if body is not None:
         return SS.STATUS_OK, body
-    # The DECISION above is ZEDSource's. Below only explains it: a body with all
-    # six arm keypoints finite can only have been skipped because its mean arm
-    # confidence was NaN (NaN > best_score is False).
+    # The DECISION above is ZEDSource's. Below only explains it. Since the
+    # 2026-09-15 nanmean fix a body with six finite arm keypoints is always
+    # selected, so this branch is unreachable with the current selector; the
+    # assert turns a future regression into an error instead of a mislabel.
     finite = [b for b in body_list
               if not any(np.any(np.isnan(np.asarray(b.keypoint, float)[i])) for i in ARM_IDS)]
     if finite:
@@ -196,6 +197,9 @@ def session_meta(zed: ZEDSource, args) -> dict:
                      skeleton_smoothing=float(zed._runtime.skeleton_smoothing)),
         zed_config=dataclasses.asdict(zed.cfg),
         max_coast_frames_at_record=C.SmoothingConfig().max_coast_frames,
+        # which ZEDSource._select_best_body produced `status`; absent = the
+        # original mean() scorer that silently rejected NaN-confidence bodies
+        selector="nanmean-2026-09-15",
         preview=not args.headless, still_s=float(args.still_s),
     )
     try:

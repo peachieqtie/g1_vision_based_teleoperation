@@ -147,6 +147,27 @@ def test_hand_pickup_excluded_when_on_collides_when_off():
         assert (n > 0) == want, "exclusion=%s: %d hand<->pickup contacts" % (on, n)
 
 
+def test_runtime_toggle_switches_the_physics_and_the_contract():
+    m, d = _fresh(True)
+    _move_static(m, d, "platform_pickup", "left_wrist_yaw_link")
+    hand, plat = _geoms(m, HAND_L), _geoms(m, ("platform_pickup",))
+    seen = []
+    for on in (True, False, True, False, True):
+        CC.set_hand_pickup_exclusion(m, on)
+        mujoco.mj_forward(m, d)
+        n = _count(m, d, hand, plat)
+        seen.append(n)
+        assert (n == 0) == on, "toggle %s: %d hand<->pickup contacts" % (on, n)
+        assert CC.hand_pickup_exclusion_active(m) == on
+        assert CC.contract_of(m) == CC.expected_contract(ContactConfig(on))
+    m_off, _ = _fresh(False)
+    try:
+        CC.set_hand_pickup_exclusion(m_off, True)
+    except ValueError:
+        return
+    raise AssertionError("a model compiled without the exclusion accepted a runtime ON")
+
+
 def test_wrist_roll_link_still_collides_with_pickup():
     m, d = _fresh(True)
     _move_static(m, d, "platform_pickup", "left_wrist_roll_link")

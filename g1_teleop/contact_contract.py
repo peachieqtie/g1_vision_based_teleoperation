@@ -90,11 +90,56 @@ def excluded_pairs(model) -> Tuple[Tuple[str, str], ...]:
     """
     out = []
     for sig in model.exclude_signature[:model.nexclude]:
+        if int(sig) == _EXCLUDE_OFF:
+            continue                    # slot switched off at runtime, see below
         b1, b2 = int(sig) >> 16, int(sig) & 0xFFFF
         n1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b1) or "#%d" % b1
         n2 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b2) or "#%d" % b2
         out.append(tuple(sorted((n1, n2))))
     return tuple(sorted(out))
+
+
+# ─── runtime toggle (run_integrated_combined.py, key 'b') ─────────────────────
+# `nexclude` is fixed at compile time, but `exclude_signature` is a live array
+# the collision filter reads every step. Switching B-prime OFF overwrites every
+# slot with signature 0 = (world << 16) + world: a pair of static geoms, which
+# never collide anyway, so the slot excludes nothing. ON writes the six real
+# signatures back, sorted as the compiler stores them. Measured 2026-09-15: a
+# hand posed inside the pickup slab gives 0 contacts ON, 2 OFF, 0 ON again.
+# `contract_of` skips switched-off slots, so a model toggled OFF reports exactly
+# the contract of a model compiled without the exclusion - a recording made
+# after a toggle carries the physics it was actually recorded under.
+_EXCLUDE_OFF = 0
+
+
+def _pair_signatures(model):
+    pb = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, PICKUP_BODY)
+    sigs = []
+    for name in HAND_BODIES:
+        hb = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if hb < 0 or pb < 0:
+            raise ValueError("body not found for the exclusion: %s / %s" % (name, PICKUP_BODY))
+        lo, hi = min(hb, pb), max(hb, pb)
+        sigs.append((lo << 16) + hi)
+    return sorted(sigs)
+
+
+def hand_pickup_exclusion_active(model) -> bool:
+    return excluded_pairs(model) == expected_pairs(True)
+
+
+def set_hand_pickup_exclusion(model, on: bool) -> None:
+    """Switch B-prime on or off in place. The model must have been COMPILED with
+    it (`load_model` with the default config): slots cannot be added at runtime."""
+    sigs = _pair_signatures(model)
+    if model.nexclude != len(sigs):
+        raise ValueError("model has %d exclude slots, need %d: load it with "
+                         "hand_pickup_exclusion=True to toggle at runtime"
+                         % (model.nexclude, len(sigs)))
+    if on:
+        model.exclude_signature[:] = sigs
+    else:
+        model.exclude_signature[:] = _EXCLUDE_OFF
 
 
 def _bitmask_tag(model) -> str:

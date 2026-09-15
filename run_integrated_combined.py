@@ -26,7 +26,34 @@ Camera (click the window first):
   a/d rotate   w/s tilt   +/- zoom   r reset
   space  emergency stop and re-anchor
   q      quit
+
+TELEOPERATED GRASP (2026-09-15) - what makes it physically possible
+-------------------------------------------------------------------
+A live camera test confirmed O17: free-standing, the base settles at 0.47-0.59 m
+from the box while the arms serve 0.28-0.36 m, so the palms never reach the box
+and GraspWeld (correctly) refuses. Four changes, matching the scripted
+demonstrator rather than inventing a second mechanism:
+
+  BASE LOCK (D12)  g1_data.phases.LockPredicate on the 47-D state at 25 Hz, the
+                   same predicate and thresholds the demonstrator uses. Walk the
+                   robot to the box and stand still: it LOCKS when settled at a
+                   0.26-0.40 m standoff, head-on. While locked the locomotion
+                   policy is NOT queried and the legs are PD-held at
+                   DEFAULT_ANGLES; walking keys do nothing. It RELEASES itself
+                   once the welded box is lifted 55 mm (carry), or once the box
+                   is placed at the goal and the hands withdrawn.
+  u                manual ABORT of the lock, logged. Re-locking is inhibited until
+                   the robot leaves the standoff/lateral/heading band (walk or turn).
+  g                grasp command. The weld still engages only when all three
+                   geometric conditions hold - the overlay shows which one fails.
+  b                B-prime hand<->pickup-platform contact exclusion on/off
+                   (default ON; g1_teleop/contact_contract.py).
+  pads             held at ZERO; the command goes to GraspWeld.update only (TR17).
+
+Test fixtures, no camera:
+  python run_integrated_combined.py keyboard 0 --synthetic grasp --headless --start-standoff 0.32
 """
+import argparse
 import sys
 import threading
 import time
@@ -45,6 +72,10 @@ from g1_teleop import config as C
 from g1_teleop.indices import ModelIndex
 from g1_teleop.box_reset import reset_box
 from g1_teleop.grasp import GraspWeld
+from g1_teleop.base_lock import BaseLock
+from g1_teleop import contact_contract as CC
+from g1_data import spec
+from g1_data.phases import LockConfig, LockPredicate, PlatformGeometry
 from locomotion_input import PelvisVelocity, LeanJoystick, KeyboardCommand
 
 # ── Paths (EDIT THESE) ────────────────────────────────────────────────────────
@@ -154,11 +185,157 @@ def text(img, s, org, scale=0.55, color=(255, 255, 255)):
 
 
 
+GREEN, RED, AMBER, GREY, CYAN = (0, 220, 0), (0, 0, 255), (0, 170, 255), (200, 200, 200), (255, 255, 0)
+WRIST_JOINTS = ("left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+                "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint")
+WEDGE_RAD = 0.8          # TR23: wrist-pitch deviation from command that means a jam
+FRAME_STEPS = 17         # headless synthetic: one frame per 17 steps = 29.4 Hz
+ABORT_MARGIN_FWD = 0.05  # m past the predicate's standoff band   } how far the robot must
+ABORT_MARGIN_LAT = 0.05  # m past its lateral limit                } leave the lock geometry
+ABORT_MARGIN_HEAD = 10.0 # deg past its heading limit              } before an abort expires
+
+
+def chips(img, x, y, items, scale=0.5):
+    """Draw [(text, colour), ...] left to right on one line."""
+    for s_, col in items:
+        text(img, s_, (x, y), scale, col)
+        x += cv2.getTextSize(s_, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0] + 12
+    return x
+
+
+def mark(ok):
+    return ("[OK]" if ok else "[X] "), (GREEN if ok else RED)
+
+
 # Display refresh rate. Rendering and key polling are decoupled from both the
 # physics rate and the camera rate so neither can stall the other.
 # Must be a multiple of CONTROL_DECIMATION, because the render check is only
 # reached on control ticks. 20 steps x 0.002 s = 40 ms => 25 Hz display.
 RENDER_DECIMATION = 20
+
+
+def lock_geometry_ok(t, c):
+    """The lock predicate's GEOMETRY terms only (standoff band, lateral, heading).
+
+    The abort inhibit clears when these fail, not when `lock_ok` does: `lock_ok`
+    also tests stillness, and the release jolt plus the resumed march break
+    stillness within ~0.1 s (measured), which cleared the inhibit immediately and
+    let the predicate re-lock a robot the operator had just unlocked. Walking or
+    turning out of the band is a deliberate act; marching in place is not.
+
+    With MARGINS: the exact band is not enough either. Measured on the headless
+    abort test, the release transient alone swung heading to -6.1 deg and lateral
+    to -35 mm within 0.24 s, against 5 deg / 50 mm limits. The margins are sized to
+    take a deliberate step or turn, well past that transient; they gate only the
+    operator-abort inhibit, never the lock itself."""
+    return bool(c.fwd_lo - ABORT_MARGIN_FWD <= t["fwd"] <= c.fwd_hi + ABORT_MARGIN_FWD
+                and abs(t["lat"]) <= c.lat_max + ABORT_MARGIN_LAT
+                and abs(t["head"]) <= c.head_max_deg + ABORT_MARGIN_HEAD)
+
+
+def wrist_deviation(data, wrist_ids, pitch_only=False):
+    """(max |achieved - commanded| rad, joint) over the wrist joints."""
+    best, name = 0.0, ""
+    for qa, act, n in wrist_ids:
+        if pitch_only and "pitch" not in n:
+            continue
+        e = abs(float(data.qpos[qa] - data.ctrl[act]))
+        if e > best:
+            best, name = e, n
+    return best, name
+
+
+def draw_operator_panel(img, x, y, st):
+    """Lock state, lock / release terms, standoff, the three weld conditions
+    SEPARATELY, what is blocking, wrist deviation and B-prime - colour coded, so
+    the operator can see which condition is holding things up."""
+    dy = 24
+    t, lc, g, d = st["terms"], st["lcfg"], st["weld"], st["diag"]
+    if st["locked"]:
+        chips(img, x, y, [("BASE LOCKED", GREEN), ("legs held, policy off  |  u = abort", GREY)], 0.6)
+    else:
+        items = [("BASE FREE", AMBER)]
+        if st["inhibit"]:
+            items.append(("re-lock inhibited: walk/turn away", RED))
+        chips(img, x, y, items, 0.6)
+    y += dy
+    if t:
+        if not st["locked"]:
+            chips(img, x, y, [
+                ("lock needs:", GREY),
+                ("fwd %.2f in [%.2f,%.2f]" % (t["fwd"], lc.fwd_lo, lc.fwd_hi), GREEN if lc.fwd_lo <= t["fwd"] <= lc.fwd_hi else RED),
+                ("lat %+.2f" % t["lat"], GREEN if abs(t["lat"]) <= lc.lat_max else RED),
+                ("head %+.1f" % t["head"], GREEN if abs(t["head"]) <= lc.head_max_deg else RED),
+                ("still %s" % ("--" if t["disp"] == float("inf") else "%.0fmm" % (1000 * t["disp"])),
+                 GREEN if t["disp"] <= lc.disp_max else RED)], 0.45)
+        elif t["welded"]:
+            chips(img, x, y, [("releases when box lifted:", GREY),
+                              ("%.3f >= %.3f m" % (t["box_lift"], lc.lift_min),
+                               GREEN if t["box_lift"] >= lc.lift_min else AMBER)], 0.45)
+        else:
+            chips(img, x, y, [("releases when box placed at goal and hands withdrawn", GREY)], 0.45)
+    y += dy
+    lo, hi = st["gcfg"].grasp_min, st["gcfg"].grasp_max
+    ok = lo <= st["standoff"] <= hi
+    chips(img, x, y, [("STANDOFF %.3f m" % st["standoff"], GREEN if ok else RED),
+                      ("[%.2f, %.2f] %s" % (lo, hi, "IN BAND" if ok else "OUT"), GREEN if ok else RED)], 0.6)
+    y += dy + 6
+    gstate = "WELDED" if st["weld_on"] else ("GATED" if st["grasp_cmd"] >= 0.5 else "open")
+    chips(img, x, y, [("GRASP cmd %.0f" % st["grasp_cmd"], GREY),
+                      (gstate, GREEN if st["weld_on"] else (RED if gstate == "GATED" else GREY))], 0.6)
+    y += dy
+    blocking = []
+    if d:
+        rows = [("L palm-box %.3f m <= %.2f" % (d["d_left"], g.palm_radius), d["d_left"] <= g.palm_radius, "L palm-box"),
+                ("R palm-box %.3f m <= %.2f" % (d["d_right"], g.palm_radius), d["d_right"] <= g.palm_radius, "R palm-box"),
+                ("opposition %+.2f <= %.2f" % (d["opposed"], g.opposed_dot), d["opposed"] <= g.opposed_dot, "opposition"),
+                ("separation %.3f m in [%.2f, %.2f]" % (d["sep"], g.sep_min, g.sep_max),
+                 g.sep_min <= d["sep"] <= g.sep_max, "separation")]
+        for label, good, short in rows:
+            m_, col = mark(good)
+            chips(img, x + 10, y, [(m_, col), (label, col)], 0.5)
+            if not good:
+                blocking.append(short)
+            y += dy - 2
+    if st["weld_on"]:
+        text(img, "weld engaged", (x, y), 0.55, GREEN)
+    elif blocking:
+        text(img, "BLOCKING: " + ", ".join(blocking), (x, y), 0.55, RED)
+    else:
+        text(img, "GATE OPEN - press g", (x, y), 0.55, GREEN)
+    y += dy + 6
+    pc = RED if st["pitch"] >= WEDGE_RAD else (AMBER if st["wrist"] >= 0.5 else GREEN)
+    text(img, "WRIST dev max %.2f rad (%s)  pitch %.2f%s" % (
+        st["wrist"], st["wrist_joint"].replace("_joint", ""), st["pitch"],
+        "  WEDGE" if st["pitch"] >= WEDGE_RAD else ""), (x, y), 0.5, pc)
+    y += dy
+    text(img, "B-PRIME %s  (b)" % ("ON" if st["bprime"] else "OFF"), (x, y), 0.55,
+         GREEN if st["bprime"] else AMBER)
+    return y + dy
+
+
+class SimClockGrabber:
+    """Headless stand-in for FrameGrabber: one frame per FRAME_STEPS physics
+    steps, pulled synchronously, so a synthetic stream plays at 29.4 Hz of
+    SIMULATED time however fast the loop runs."""
+
+    def __init__(self, source):
+        self.source, self._frame, self._seq = source, None, 0
+
+    def poll(self, counter):
+        if counter % FRAME_STEPS == 0:
+            f = self.source.grab()
+            if f is not None:
+                self._frame, self._seq = f, self._seq + 1
+
+    def latest(self):
+        return self._frame, self._seq
+
+    def stop(self):
+        pass
+
+    def join(self, timeout=None):
+        pass
 
 
 class FrameGrabber(threading.Thread):
@@ -196,11 +373,26 @@ class FrameGrabber(threading.Thread):
 
 
 def main():
-    which = sys.argv[1] if len(sys.argv) > 1 else "pelvis"
+    ap = argparse.ArgumentParser(description="ZED | MuJoCo teleoperation")
+    ap.add_argument("which", nargs="?", default="pelvis", help="pelvis | lean | keyboard")
     # Episode seed for box placement (O4). Same seed -> same box pose, so a
     # demonstration can be re-run; different seeds -> different poses, which is
     # what Objectives 3 and 4 need and what the keyframe pose never gave.
-    episode_seed = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    ap.add_argument("seed", nargs="?", type=int, default=0)
+    ap.add_argument("--synthetic", nargs="?", const="reach", choices=("reach", "grasp"),
+                    help="no camera: fabricated BODY_38 stream (test fixture)")
+    ap.add_argument("--headless", action="store_true",
+                    help="no window, no renderer, no wall-clock pacing; needs --synthetic")
+    ap.add_argument("--seconds", type=float, default=30.0, help="headless: simulated seconds")
+    ap.add_argument("--start-standoff", type=float, default=None,
+                    help="start the base this far behind the box, head-on, instead of the keyframe")
+    ap.add_argument("--bprime-off", action="store_true", help="start with B-prime OFF (toggle: b)")
+    ap.add_argument("--abort-at", type=float, default=None,
+                    help="headless test fixture: press 'u' (abort the base lock) at this sim time")
+    args = ap.parse_args()
+    if args.headless and not args.synthetic:
+        ap.error("--headless needs --synthetic (there is no operator to watch a camera)")
+    which, episode_seed, headless = args.which, args.seed, args.headless
     if which.startswith("p"):
         loco, loco_name = PelvisVelocity(), "PELVIS VELOCITY (thesis 3.3.4)"
     elif which.startswith("l"):
@@ -227,7 +419,25 @@ def main():
     data.qvel[ix.leg_qvel] = 0.0
     # Randomise the box on the STEPPED model, not just the kinematic twin (O4).
     box_xy = reset_box(model, data, ix, cfg_box_for_reset, seed=episode_seed)
+    if args.start_standoff is not None:
+        data.qpos[ix.base_qpos][0] = float(box_xy[0]) - args.start_standoff
+        data.qpos[ix.base_qpos][1] = float(box_xy[1])
     mujoco.mj_forward(model, data)
+    # B-prime (adopted 2026-09-15): hands do not collide with the PICKUP slab.
+    # Compiled in by scene.xml; toggled in place with 'b'.
+    CC.set_hand_pickup_exclusion(model, not args.bprime_off)
+    print("B-prime hand<->pickup exclusion: %s" % ("ON" if CC.hand_pickup_exclusion_active(model) else "OFF"))
+    # Base lock (D12), driven by the demonstrator's state predicate.
+    base_lock = BaseLock(model)
+    sp = spec.SpecLayout.resolve(model, ix)
+    pred = LockPredicate(PlatformGeometry.resolve(model), LockConfig())
+    locked_leg_pos = None          # DEFAULT_ANGLES while locked, else None
+    relock_inhibit = False         # set by a manual abort
+    lock_terms, n_abort = {}, 0
+    wrist_ids = [(int(model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)]),
+                  mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, n), n) for n in WRIST_JOINTS]
+    weld_diag = {}
+    pel_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
     print(f"episode seed {episode_seed}: box at "
           f"({box_xy[0]:.3f}, {box_xy[1]:.3f}, {box_xy[2]:.3f})")
     start_xy = np.array(data.qpos[ix.base_xy_qpos], dtype=np.float64)
@@ -244,16 +454,36 @@ def main():
     # below the source - the same TeleopController, the same twin, the same
     # copy into ctrl. It is a flag and not a default because a synthetic source
     # is a test fixture, not a collection mode.
-    if "--synthetic" in sys.argv:
+    grasp_on_s = None
+    frame_hz = 1.0 / (FRAME_STEPS * SIM_DT)
+    if args.synthetic == "reach":
         from g1_teleop.synthetic_source import SyntheticSource, hand_path_frames
         print("[O25] SYNTHETIC keypoint source - no camera, reach-out motion")
         zed = SyntheticSource(hand_path_frames(
             lambda t: np.array([0.10 + 0.22 * t, +0.10, -0.10]),
-            lambda t: np.array([0.10 + 0.22 * t, -0.10, -0.10]), 300))
+            lambda t: np.array([0.10 + 0.22 * t, -0.10, -0.10]), 300),
+            fps=None if headless else frame_hz)
+    elif args.synthetic == "grasp":
+        from g1_teleop.synthetic_source import SyntheticSource, grasp_lift_frames
+        mujoco.mj_forward(twin.model, twin.data)
+        tp = twin.data.xpos[mujoco.mj_name2id(twin.model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")].copy()
+        shoulders = {"left": twin.left_shoulder_world() - tp, "right": twin.right_shoulder_world() - tp}
+        home = {"left": twin.data.xpos[twin.left_wrist_body] - tp,
+                "right": twin.data.xpos[twin.right_wrist_body] - tp}
+        lengths = {"left": (twin.upper_arm_left, twin.forearm_left),
+                   "right": (twin.upper_arm_right, twin.forearm_right)}
+        box_rel = data.xpos[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "box1")] - data.xpos[pel_bid]
+        frames_g, grasp_on_s, lift_s = grasp_lift_frames(shoulders, lengths, home, box_rel, frame_hz)
+        print("[synthetic] grasp-and-lift: %d frames, grasp command at %.1f s, lift at %.1f s, "
+              "box in pelvis frame %s" % (len(frames_g), grasp_on_s, lift_s, np.round(box_rel, 3)))
+        zed = SyntheticSource(frames_g, fps=None if headless else frame_hz)
     else:
         zed = ZEDSource(cfg.zed)
-    grabber = FrameGrabber(zed)
-    grabber.start()
+    if headless:
+        grabber = SimClockGrabber(zed)     # frames on the SIMULATED clock
+    else:
+        grabber = FrameGrabber(zed)
+        grabber.start()
 
     # The twin is a separate MjModel; resolve its indices independently rather
     # than assuming the two models number their joints identically.
@@ -263,8 +493,10 @@ def main():
     policy = torch.jit.load(POLICY_PATH)
     box_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "box1")
 
+    renderer = None
     try:
-        renderer = mujoco.Renderer(model, height=MUJOCO_H, width=MUJOCO_W)
+        if not headless:
+            renderer = mujoco.Renderer(model, height=MUJOCO_H, width=MUJOCO_W)
     except ValueError as e:
         print("Renderer init failed:", e)
         print("Increase <global offwidth/offheight> in scene.xml, or lower "
@@ -295,8 +527,28 @@ def main():
     frame = None
     wall_start = time.time()
 
-    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW, ZED_PANEL_W + MJ_PANEL_W, PANEL_H)
+    if not headless:
+        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW, ZED_PANEL_W + MJ_PANEL_W, PANEL_H)
+    events = []                        # (sim s, what) - printed at exit
+
+    def abort_lock(source):
+        """Manual ABORT of the base lock - the only operator input that touches
+        it; there is deliberately no way to force a lock. Logged. Re-locking is
+        inhibited until the robot leaves the lock GEOMETRY (see lock_geometry_ok),
+        otherwise the predicate would re-lock a still-settled robot a second later."""
+        nonlocal relock_inhibit, n_abort
+        if not base_lock.locked(data):
+            print("%s: base is not locked - nothing to abort" % source)
+            return
+        pred.locked = False
+        pred._run = 0
+        relock_inhibit = True
+        n_abort += 1
+        events.append((counter * SIM_DT, "MANUAL ABORT of base lock (%s) terms %s"
+                       % (source, {k: (round(v, 3) if isinstance(v, float) else v)
+                                   for k, v in lock_terms.items()})))
+        print("[%.2f s] %s" % events[-1])
 
     print(f"=== Vision locomotion evaluation ===")
     print(f"locomotion command source: {loco_name}")
@@ -304,12 +556,72 @@ def main():
 
     try:
         while True:
+            t_sim = counter * SIM_DT
+            if headless:
+                grabber.poll(counter)
+                if grasp_on_s is not None and grasp_cmd < 0.5 and t_sim >= grasp_on_s:
+                    grasp_cmd = 1.0
+                    events.append((t_sim, "grasp command -> 1 (synthetic schedule)"))
+                if args.abort_at is not None and t_sim >= args.abort_at:
+                    abort_lock("--abort-at fixture")
+                    args.abort_at = None
+                if t_sim >= args.seconds:
+                    break
+
+            # ── Base lock (D12): the demonstrator's predicate, at 25 Hz on the
+            # 47-D state from the STEPPED model (sync=False, as scripted_demo:
+            # weld.update below must see what it saw before). A tick index is
+            # not an input to the predicate - only the sampling rate is.
+            if counter % spec.PHYSICS_STEPS_PER_TICK == 0:
+                state = sp.build_state(model, data, ix, sync=False)
+                lock_terms = pred.terms(state)
+                if relock_inhibit and not pred.locked and not lock_geometry_ok(lock_terms, pred.cfg):
+                    relock_inhibit = False
+                    events.append((t_sim, "re-lock allowed again (left the lock geometry) fwd %.3f lat %+.3f head %+.1f" % (lock_terms["fwd"], lock_terms["lat"], lock_terms["head"])))
+                ev = pred.update(state)
+                if ev == "lock" and relock_inhibit:
+                    # Operator aborted and has not moved out of the lock
+                    # condition: undo the latch. The predicate has no notion of
+                    # an abort, so this is the only place one is honoured.
+                    pred.locked = False
+                    pred.n_lock -= 1
+            want_lock = pred.locked
+            if want_lock and not base_lock.locked(data):
+                base_lock.lock(model, data)
+                locked_leg_pos = DEFAULT_ANGLES.copy()
+                sto = float(np.linalg.norm(data.xpos[box_body_id][:2] - data.qpos[ix.base_xy_qpos]))
+                events.append((t_sim, "BASE LOCKED (predicate) standoff %.3f fwd %.3f lat %+.3f head %+.1f"
+                               % (sto, lock_terms.get("fwd", np.nan), lock_terms.get("lat", np.nan),
+                                  lock_terms.get("head", np.nan))))
+                print("[%.2f s] %s" % events[-1])
+            elif not want_lock and base_lock.locked(data):
+                base_lock.release(model, data, policy=policy)   # zeroes the LSTM state
+                locked_leg_pos = None
+                action = np.zeros(NUM_ACTIONS, dtype=np.float32)
+                target_leg_pos = DEFAULT_ANGLES.copy()
+                hold_target[:] = data.qpos[ix.base_xy_qpos]
+                hold_yaw = yaw_from_quat(data.qpos[ix.base_quat_qpos])
+                events.append((t_sim, "BASE RELEASED (%s) box_lift %.3f welded %s"
+                               % ("manual abort" if relock_inhibit else "predicate",
+                                  lock_terms.get("box_lift", np.nan), lock_terms.get("welded"))))
+                print("[%.2f s] %s" % events[-1])
+
             leg_q, leg_dq = data.qpos[ix.leg_qpos], data.qvel[ix.leg_qvel]
-            data.ctrl[ix.leg_ctrl] = ((target_leg_pos - leg_q) * KPS
+            leg_target = target_leg_pos if locked_leg_pos is None else locked_leg_pos
+            data.ctrl[ix.leg_ctrl] = ((leg_target - leg_q) * KPS
                                       + (0.0 - leg_dq) * KDS)
             data.ctrl[ix.upper_ctrl] = arm_targets
-            data.ctrl[ix.pad_ctrl] = grasp_cmd
+            # TR17: pads stay RETRACTED. The gripper command is the WELD command;
+            # driving the pads with it buries them in a box whose contact the weld
+            # disables, and release() then ejects the box (~145 mm, measured).
+            data.ctrl[ix.pad_ctrl] = 0.0
+            was_on = weld.engaged(data)
             weld_on, weld_diag = weld.update(model, data, grasp_cmd)
+            if weld_on != was_on:
+                events.append((t_sim, "WELD %s  L %.3f R %.3f opp %+.2f sep %.3f"
+                               % ("ENGAGED" if weld_on else "RELEASED", weld_diag["d_left"],
+                                  weld_diag["d_right"], weld_diag["opposed"], weld_diag["sep"])))
+                print("[%.2f s] %s" % events[-1])
             mujoco.mj_step(model, data)
             counter += 1
 
@@ -321,11 +633,15 @@ def main():
             # time, which is unusable for teleoperation.
             sim_elapsed = counter * SIM_DT
             wall_elapsed = time.time() - wall_start
-            if sim_elapsed > wall_elapsed:
+            if sim_elapsed > wall_elapsed and not headless:
                 time.sleep(sim_elapsed - wall_elapsed)
 
             # ── Velocity command: hold station when nothing is commanded ────
-            if np.linalg.norm(cmd) < IDLE_THRESHOLD:
+            # While LOCKED (D12) none of this runs and the policy is not queried:
+            # the legs are PD-held at DEFAULT_ANGLES in the physics step above.
+            if locked_leg_pos is not None:
+                active_cmd = np.zeros(3, dtype=np.float32)
+            elif np.linalg.norm(cmd) < IDLE_THRESHOLD:
                 active_cmd = np.zeros(3, dtype=np.float32)
                 yaw_now = yaw_from_quat(data.qpos[ix.base_quat_qpos])
 
@@ -346,21 +662,22 @@ def main():
                 hold_target[:] = data.qpos[ix.base_xy_qpos]
                 hold_yaw = yaw_from_quat(data.qpos[ix.base_quat_qpos])
 
-            qj = (data.qpos[ix.leg_qpos] - DEFAULT_ANGLES) * DOF_POS_SCALE
-            dqj = data.qvel[ix.leg_qvel] * DOF_VEL_SCALE
-            t = counter * SIM_DT
-            phase = (t % GAIT_PERIOD) / GAIT_PERIOD
+            if locked_leg_pos is None:
+                qj = (data.qpos[ix.leg_qpos] - DEFAULT_ANGLES) * DOF_POS_SCALE
+                dqj = data.qvel[ix.leg_qvel] * DOF_VEL_SCALE
+                t = counter * SIM_DT
+                phase = (t % GAIT_PERIOD) / GAIT_PERIOD
 
-            obs[:3] = data.qvel[ix.base_angvel_qvel] * ANG_VEL_SCALE
-            obs[3:6] = get_gravity_orientation(data.qpos[ix.base_quat_qpos])
-            obs[6:9] = active_cmd * CMD_SCALE
-            obs[9:9 + NUM_ACTIONS] = qj
-            obs[9 + NUM_ACTIONS:9 + 2 * NUM_ACTIONS] = dqj
-            obs[9 + 2 * NUM_ACTIONS:9 + 3 * NUM_ACTIONS] = action
-            obs[9 + 3 * NUM_ACTIONS:9 + 3 * NUM_ACTIONS + 2] = [
-                np.sin(2 * np.pi * phase), np.cos(2 * np.pi * phase)]
-            action = policy(torch.from_numpy(obs).unsqueeze(0)).detach().numpy().squeeze()
-            target_leg_pos = action * ACTION_SCALE + DEFAULT_ANGLES
+                obs[:3] = data.qvel[ix.base_angvel_qvel] * ANG_VEL_SCALE
+                obs[3:6] = get_gravity_orientation(data.qpos[ix.base_quat_qpos])
+                obs[6:9] = active_cmd * CMD_SCALE
+                obs[9:9 + NUM_ACTIONS] = qj
+                obs[9 + NUM_ACTIONS:9 + 2 * NUM_ACTIONS] = dqj
+                obs[9 + 2 * NUM_ACTIONS:9 + 3 * NUM_ACTIONS] = action
+                obs[9 + 3 * NUM_ACTIONS:9 + 3 * NUM_ACTIONS + 2] = [
+                    np.sin(2 * np.pi * phase), np.cos(2 * np.pi * phase)]
+                action = policy(torch.from_numpy(obs).unsqueeze(0)).detach().numpy().squeeze()
+                target_leg_pos = action * ACTION_SCALE + DEFAULT_ANGLES
 
             # ── ZED: non-blocking read of the newest frame ──────────────────
             # The grabber thread owns zed.grab(). We only process a frame when
@@ -391,6 +708,19 @@ def main():
                 cmd[:] = loco()
                 loco_diag = getattr(loco, "diag", {})
 
+            if headless:
+                if counter % 500 == 0:
+                    wd, wj = wrist_deviation(data, wrist_ids)
+                    print("  t %5.1f  base %-6s z %.3f  standoff %.3f  weld %-3s L %.3f R %.3f "
+                          "opp %+.2f sep %.3f  box_lift %+.3f  wrist %.3f"
+                          % (t_sim, "LOCKED" if base_lock.locked(data) else "free",
+                             data.qpos[ix.base_qpos][2],
+                             float(np.linalg.norm(data.xpos[box_body_id][:2] - data.qpos[ix.base_xy_qpos])),
+                             "ON" if weld_on else "off", weld_diag.get("d_left", np.nan),
+                             weld_diag.get("d_right", np.nan), weld_diag.get("opposed", np.nan),
+                             weld_diag.get("sep", np.nan), lock_terms.get("box_lift", np.nan), wd))
+                continue
+
             # ── Render and input on their own cadence ───────────────────────
             if counter % RENDER_DECIMATION or frame is None:
                 continue
@@ -412,52 +742,35 @@ def main():
                                MJ_PANEL_W, PANEL_H)
 
             travelled = float(np.linalg.norm(data.qpos[ix.base_xy_qpos] - start_xy))
-            text(right, loco_name, (10, 28), 0.6, (255, 255, 0))
-            text(right, f"TRAVELLED  {travelled:.2f} m", (10, 56), 0.7,
-                 (0, 255, 255))
-            text(right, f"LOCO cmd  fwd {cmd[0]:+.2f}  turn {cmd[2]:+.2f}",
-                 (10, 84), 0.55)
-
-            # ── Approach feedback ───────────────────────────────────────────
-            # Distance from the robot's shoulders to the box, so the approach
-            # can be judged from a number instead of timed by feel. The arm can
-            # only reach about ARM_REACH, so this is the difference between a
-            # graspable stop and one that is 10 cm short.
-            box_xy = data.xpos[box_body_id][:2]
-            base_xy = data.qpos[ix.base_xy_qpos]
-            gap = float(np.linalg.norm(box_xy - base_xy))
-            in_range = GRASP_MIN <= gap <= GRASP_MAX
-            colour = (0, 255, 0) if in_range else (0, 200, 255)
-            text(right, f"BOX DISTANCE  {gap:.2f} m", (10, 118), 0.7, colour)
-            gcol = (0, 255, 0) if weld_on else ((0, 200, 255) if grasp_cmd > 0.5 else (200, 200, 200))
-            text(right, f"GRASP  cmd {grasp_cmd:.0f}  " +
-                 ("WELDED" if weld_on else ("gated" if grasp_cmd > 0.5 else "open")),
-                 (10, 246), 0.6, gcol)
-            if in_range:
-                text(right, "IN GRASP RANGE", (10, 150), 0.7, (0, 255, 0))
-            elif gap > GRASP_MAX:
-                text(right, f"too far  (walk {gap - GRASP_MAX:.2f} m closer)",
-                     (10, 150), 0.55, (0, 200, 255))
-            else:
-                text(right, "too close  (back up)", (10, 150), 0.55, (0, 200, 255))
+            text(right, loco_name, (10, 24), 0.55, CYAN)
+            text(right, f"TRAVELLED {travelled:.2f} m   LOCO cmd fwd {cmd[0]:+.2f}  turn {cmd[2]:+.2f}",
+                 (10, 46), 0.5)
+            wd, wj = wrist_deviation(data, wrist_ids)
+            draw_operator_panel(right, 10, 76, dict(
+                locked=base_lock.locked(data), inhibit=relock_inhibit, n_lock=pred.n_lock,
+                n_release=pred.n_release, n_abort=n_abort, terms=lock_terms, lcfg=pred.cfg,
+                standoff=float(np.linalg.norm(data.xpos[box_body_id][:2] - data.qpos[ix.base_xy_qpos])),
+                gcfg=cfg.grasp, weld=weld.cfg, diag=weld_diag, weld_on=weld_on, grasp_cmd=grasp_cmd,
+                wrist=wd, wrist_joint=wj, pitch=wrist_deviation(data, wrist_ids, pitch_only=True)[0],
+                bprime=CC.hand_pickup_exclusion_active(model)))
 
             if isinstance(loco, KeyboardCommand) and loco.precision:
-                text(right, "PRECISION", (10, 182), 0.6, (255, 200, 0))
+                text(right, "PRECISION", (MJ_PANEL_W - 130, 24), 0.55, (255, 200, 0))
             yaw_now_disp = yaw_from_quat(data.qpos[ix.base_quat_qpos])
             hd = np.degrees((hold_yaw - yaw_now_disp + np.pi)
                             % (2 * np.pi) - np.pi)
             text(right, f"HEADING  now {np.degrees(yaw_now_disp):+6.1f}"
                         f"   target {np.degrees(hold_yaw):+6.1f}   err {hd:+5.1f}",
-                 (10, 210), 0.5, (255, 255, 255))
+                 (10, PANEL_H - 60), 0.45, GREY)
 
             # Flag motion that the demonstrator did not ask for.
             moving = last_disp is not None and abs(travelled - last_disp) > 0.004
             commanded = np.linalg.norm(cmd) > IDLE_THRESHOLD
             if moving and not commanded:
-                text(right, "UNCOMMANDED MOTION", (10, 242), 0.7, (0, 80, 255))
+                text(right, "UNCOMMANDED MOTION", (10, PANEL_H - 36), 0.6, (0, 80, 255))
             last_disp = travelled
 
-            hint = "a/d rot  w/s tilt  +/- zoom  r reset  space stop  q quit"
+            hint = "g grasp  u unlock  b B-prime  |  a/d rot  w/s tilt  +/- zoom  r reset  space stop  q quit"
             if isinstance(loco, KeyboardCommand):
                 hint = ("arrows = walk/turn (hold)   p = precision   |   " + hint)
             text(right, hint, (10, PANEL_H - 14), 0.45, (200, 200, 200))
@@ -534,6 +847,13 @@ def main():
                 print("grasp command -> %.0f%s" % (
                     grasp_cmd, "" if weld_on or grasp_cmd == 0 else
                     "  (gated: hands not in a grasp configuration)"))
+            elif key == ord("u"):
+                abort_lock("key u")
+            elif key == ord("b"):
+                on = not CC.hand_pickup_exclusion_active(model)
+                CC.set_hand_pickup_exclusion(model, on)
+                events.append((counter * SIM_DT, "B-prime -> %s (key b)" % ("ON" if on else "OFF")))
+                print("[%.2f s] %s" % events[-1])
             elif key == ord("p") and isinstance(loco, KeyboardCommand):
                 loco.toggle_precision()
             elif key == 32:
@@ -546,9 +866,16 @@ def main():
     finally:
         grabber.stop()
         grabber.join(timeout=1.0)
-        renderer.close()
-        cv2.destroyAllWindows()
+        if renderer is not None:
+            renderer.close()
+        if not headless:
+            cv2.destroyAllWindows()
         zed.close()
+        print("\nEVENTS (sim s):")
+        for t_, what in events:
+            print("  %7.2f  %s" % (t_, what))
+        print("locks %d, releases %d (predicate), manual aborts %d"
+              % (pred.n_lock, pred.n_release, n_abort))
         print("Done.")
 
 

@@ -70,6 +70,18 @@ class ZEDSource:
 
     @staticmethod
     def _select_best_body(body_list):
+        """Best body by mean arm-keypoint confidence; reject only NaN KEYPOINTS.
+
+        2026-09-15: the score was `np.mean` of the six arm confidences. With body
+        fitting on, SDK 5.4 fills occluded keypoints with finite positions and
+        reports NaN CONFIDENCE for them, so one NaN made the score NaN, `NaN >
+        best_score` was False, and a body with six valid arm keypoints was
+        silently discarded - measured on the first real take, 160/160 frames
+        (tools/record_keypoints.py, status arm_conf_nan). Now: `nanmean` over the
+        finite confidences, and 0.0 when all six are NaN, which still beats the
+        -1.0 floor. The NaN-keypoint rejection, the only input guard kept (TR6),
+        is unchanged.
+        """
         arm_ids = [12, 13, 14, 15, 16, 17]
         best, best_score = None, -1.0
         for b in body_list:
@@ -77,7 +89,8 @@ class ZEDSource:
             conf = b.keypoint_confidence
             if any(np.any(np.isnan(kp[i])) for i in arm_ids):
                 continue
-            score = float(np.mean([conf[i] for i in arm_ids]))
+            c = np.asarray([conf[i] for i in arm_ids], dtype=float)
+            score = float(np.nanmean(c)) if np.isfinite(c).any() else 0.0
             if score > best_score:
                 best, best_score = b, score
         return best

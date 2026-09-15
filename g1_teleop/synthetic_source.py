@@ -131,7 +131,14 @@ class SyntheticSource:
     """
 
     def __init__(self, frames: Sequence[List[np.ndarray]], image_hw=(8, 8),
-                 confidences: Optional[Sequence[List[float]]] = None):
+                 confidences: Optional[Sequence[List[float]]] = None,
+                 fps: Optional[float] = None):
+        # `fps`: pace grab() to wall clock, like a camera. Without it a grabber
+        # thread drains every frame in milliseconds and the control loop sees
+        # only the last one. Leave None when the caller pulls frames on its own
+        # (simulated) clock, as run_integrated_combined.py --headless does.
+        self.fps = fps
+        self._t0 = None
         self.frames = list(frames)
         self.confidences = None if confidences is None else list(confidences)
         if self.confidences is not None:
@@ -161,6 +168,13 @@ class SyntheticSource:
     def grab(self) -> Optional[BodyFrame]:
         if self.i >= len(self.frames):
             return None
+        if self.fps:
+            import time
+            if self._t0 is None:
+                self._t0 = time.monotonic()
+            wait = self._t0 + self.i / self.fps - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
         kp = self.frames[self.i]
         self.i += 1
         conf = ([1.0] * N_KEYPOINTS if self.confidences is None
@@ -227,6 +241,64 @@ def with_dropout(frames: List[List[np.ndarray]],
     return out
 
 
+# ─── generator (c): grasp and lift, for the base-lock / weld path ─────────────
+def grasp_lift_frames(shoulders, lengths, home, box, fps: float,
+                      hand_dx: float = -0.09, face_y: float = 0.13, hand_dz: float = 0.04,
+                      clear_dz: float = 0.14, lift: float = 0.20,
+                      t_home: float = 5.0, t_up: float = 1.5, t_out: float = 1.5,
+                      t_down: float = 1.5, t_hold: float = 2.0, t_lift: float = 2.0,
+                      t_end: float = 4.0):
+    """A two-handed grasp-and-lift in the robot's PELVIS frame. Returns
+    (frames, grasp_on_s, lift_start_s).
+
+    `shoulders`, `home` and `box` are pelvis-frame positions (dicts per side for
+    the first two); `lengths[side] = (upper, fore)` are the ROBOT's limb lengths,
+    because retargeting keeps only directions and rescales by them. Hand targets
+    are wrist points.
+
+    Path per hand: hold home (the base-lock predicate needs a settled base first)
+    -> rise straight up beside the body to `clear_dz` above the box centre -> out
+    to the box -> down to the grasp point -> hold (grasp command goes on at the
+    start of the hold) -> lift by `lift` -> hold.
+
+    The default grasp point (hand 0.09 m behind the box centre, 0.13 m to the
+    side, 0.04 m up) came from a probe on the kinematic TWIN, which only picks a
+    candidate (TR16a); whether it passes the weld gate is decided on the stepped
+    model by the run that uses it. Palms at 0.13 m lateral sit ~37 mm outside the
+    box faces, so the hands close the gate without pushing the box.
+    """
+    box = np.asarray(box, float)
+    segs = [("home", t_home), ("up", t_up), ("out", t_out), ("down", t_down),
+            ("hold", t_hold), ("lift", t_lift), ("end", t_end)]
+    paths = {}
+    for side, sg in (("left", 1.0), ("right", -1.0)):
+        h0 = np.asarray(home[side], float)
+        grasp = box + np.array([hand_dx, sg * face_y, hand_dz])
+        up = np.array([h0[0], grasp[1], box[2] + clear_dz])
+        out = np.array([grasp[0], grasp[1], box[2] + clear_dz])
+        lifted = grasp + np.array([0.0, 0.0, lift])
+        paths[side] = {"home": (h0, h0), "up": (h0, up), "out": (up, out),
+                       "down": (out, grasp), "hold": (grasp, grasp),
+                       "lift": (grasp, lifted), "end": (lifted, lifted)}
+    frames, t = [], 0.0
+    marks = {}
+    for name, dur in segs:
+        marks[name] = t
+        n = max(1, int(round(dur * fps)))
+        for k in range(n):
+            a = 0.5 - 0.5 * np.cos(np.pi * k / max(n - 1, 1))     # ease in/out
+            dirs = []
+            for side, sg in (("left", 1.0), ("right", -1.0)):
+                p0, p1 = paths[side][name]
+                hand = p0 + a * (p1 - p0) - np.asarray(shoulders[side], float)
+                u, f = arm_dirs_from_hand(hand, np.array([0.0, sg * 0.35, -1.0]),
+                                          *lengths[side])
+                dirs += [u, f]
+            frames.append(keypoints_from_arm_dirs(*dirs))
+        t += n / fps
+    return frames, marks["hold"], marks["lift"]
+
+
 # ─── recorded real motion: the on-disk form of the `frames` sequence ─────────
 # The replay format above is a sequence of BODY_38 keypoint lists in the CAMERA
 # frame. A recording is that same sequence stored as arrays - no second format:
@@ -262,6 +334,11 @@ STATUS_ARM_CONF_NAN = 5  # a body's arm keypoints are all finite but one of its
                          # first real take (2026-09-15): with body fitting on,
                          # SDK 5.4 fills occluded keypoints and reports NaN
                          # confidence for them. Stored body = best such body.
+                         # FIXED the same day (nanmean score): the current
+                         # selector cannot produce it. Kept so recordings made
+                         # before the fix still load; their meta has no
+                         # `selector` key, and mode="zed" replays the OLD
+                         # selector's decision recorded in `status`.
 STATUS_NAMES = {STATUS_OK: "ok", STATUS_GRAB_FAILED: "grab_failed",
                 STATUS_NOT_NEW: "not_new", STATUS_NO_BODY: "no_body",
                 STATUS_ARM_NAN: "arm_nan", STATUS_ARM_CONF_NAN: "arm_conf_nan"}

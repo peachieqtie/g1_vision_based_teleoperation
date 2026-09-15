@@ -99,7 +99,13 @@ def main():
     rec = buf.to_recording(dict(label="selftest", still_s=0.0))
     counts = {SS.STATUS_NAMES[c]: int((rec.status == c).sum()) for c in SS.STATUS_NAMES}
     print("statuses:", counts)
+    # arm_conf_nan must be ZERO: the fixed selector (nanmean, 2026-09-15) selects
+    # a body whose arm keypoints are finite even when a confidence is NaN.
+    assert counts.pop("arm_conf_nan") == 0, "selector regressed to rejecting NaN confidence"
     assert all(v > 0 for v in counts.values()), counts
+    conf_rows = np.flatnonzero(rec.body_id == 11)
+    assert len(conf_rows) == 7 and (rec.status[conf_rows] == SS.STATUS_OK).all()
+    assert np.isnan(rec.confidence[conf_rows, 13]).all(), "NaN confidence must be recorded as-is"
     arm_nan_rows = np.flatnonzero(rec.status == SS.STATUS_ARM_NAN)
     assert np.isnan(rec.keypoints[arm_nan_rows, 16]).all() and not np.isnan(rec.keypoints[arm_nan_rows, 12]).any(), \
         "arm_nan rows must keep the rejected body's keypoints, NaN wrist included"

@@ -5038,3 +5038,240 @@ the slab knock the box off. The 12-seed phase-lock gate alone would have said "n
 - **TR15's mechanism is stale:** the loop cannot form because the twin's base is never
   synced, not because the target follows the robot.
 - **The recorded-contract check is a hook only** until the recorder and evaluator call it.
+
+---
+
+## 2026-09-15 — Teleoperated grasp made physically possible in run_integrated_combined.py
+
+**Trigger.** A live camera test confirmed O17 on the teleop path. The robot walks and
+mirrors the operator's arms but cannot grasp: the free base settles at the 0.47–0.59 m
+attractor while the arms serve 0.28–0.36 m, so the palms never reach the box and
+`GraspWeld` correctly refuses.
+
+**Result.** With the changes below, a synthetic operator stream running through the
+**unmodified teleop stack** does all four steps on the stepped model:
+
+1. the base locks on the predicate;
+2. the weld engages through the geometric gate;
+3. the base releases on the predicate once the box is lifted;
+4. the robot stands holding the box.
+
+Headless, seed 0, `--start-standoff 0.32`.
+
+The same run with B-prime OFF wedges a wrist at 1.42 rad (the O26 jam) and never welds.
+
+**Scope held to the brief.** No episode loop, phase machine, recorder or PoseBook: the
+human (or the synthetic stream) provides the arm trajectory. CLAUDE.md and
+`g1_data/spec.py` untouched.
+
+### Commits on `adopt-bprime`
+
+| commit | what |
+|---|---|
+| `080237b` | safety commit: the keypoint recorder work, before starting |
+| `51fc1d7` | **cherry-pick of 827d8bf (B-prime)**, message corrected |
+| (this change) | see below |
+
+B-prime was reverted earlier today in `0144e0a` on the strict any-measure gate rule:
+- 12-seed: max base pitch +0.116°;
+- 40-seed: max carry drift +0.002 mm, and box sink ≤0.06 mm deeper.
+
+It is re-adopted here **by instruction**. Those same sub-millimetre envelope moves against
+the pre-B-prime baseline therefore come with it. The gate check below compares against
+the B-prime results, which is the configuration now in force.
+
+### The five changes
+
+**1. Base lock (D12), driven by the demonstrator's own predicate.**
+- `LockPredicate(PlatformGeometry.resolve(model), LockConfig())`, updated every
+  `spec.PHYSICS_STEPS_PER_TICK` = 20 physics steps (25 Hz) on
+  `SpecLayout.build_state(..., sync=False)`. That is the same predicate, the same
+  thresholds, the same rate and the same `sync=False` as `scripted_demo.run_episode`.
+- The lock and release edges follow `pred.locked` against `BaseLock.locked(data)`,
+  exactly as the demonstrator does.
+- **While locked:**
+  - the locomotion policy is not queried;
+  - the velocity/heading hold is skipped;
+  - the legs are PD-held at `DEFAULT_ANGLES`.
+- **On release:**
+  - `BaseLock.release(..., policy=policy)` zeroes the LSTM state;
+  - `action` is zeroed and `target_leg_pos` set to `DEFAULT_ANGLES`;
+  - the station-keeping anchor is reset to where the base is.
+- **Manual abort** (key `u`, headless fixture `--abort-at`) is the only operator input
+  that touches the lock. There is deliberately no key to force one. Every abort is logged
+  with the predicate terms.
+- **The abort needed a re-lock inhibit, and it took two attempts. Both were measured, not
+  assumed.**
+  - Without an inhibit, a still robot re-locks about 1 s after an abort.
+  - First try, "clear the inhibit when `lock_ok` goes false": it cleared after 0.12 s.
+    The release jolt breaks the stillness term at once.
+  - Second try, "clear when the lock geometry (fwd / lat / heading) fails": it cleared
+    after 0.24 s. The release transient alone swung heading to −6.1° and lateral to
+    −35 mm, against 5° / 50 mm limits.
+  - **Adopted:** the inhibit clears only when the robot leaves the geometry band by a
+    margin — standoff ±0.05 m, lateral +0.05 m, heading +10°. Those margins take a
+    deliberate step or turn.
+  - Verified: after an abort at 3.0 s the robot stayed unlocked, marching in place, until
+    the weld engaged at 9.5 s. At that point the lock target became the goal platform,
+    as the predicate defines.
+  - The margins gate **only** the abort inhibit, never the lock itself.
+
+**2. TR17 pad fix.** `ctrl[pad_ctrl]` was driven with `grasp_cmd`. It is now held at
+**zero**, and the command goes only to `GraspWeld.update`, as in the demonstrator.
+Weld engage and release are logged with all four gate measurements.
+
+**3. B-prime merged**, default ON, toggleable at runtime with key `b` (`--bprime-off` to
+start off).
+- `nexclude` is fixed at compile time, but `exclude_signature` is a live array the
+  collision filter reads every step.
+- `contact_contract.set_hand_pickup_exclusion` writes signature 0 (world|world, two
+  static geoms that never collide) into every slot for OFF, and the six real signatures
+  back for ON.
+- Measured on a hand posed inside the slab: 0 contacts ON, 2 OFF, 0 ON again.
+- `contract_of` skips the switched-off slots, so a model toggled OFF reports exactly the
+  contract of a model compiled without the exclusion. Anything recorded after a toggle
+  carries the physics it was actually recorded under.
+- A model compiled without the exclusion refuses a runtime ON.
+- New test: `test_runtime_toggle_switches_the_physics_and_the_contract`. Contract tests
+  are now 14/14.
+
+**4. NaN confidence in `ZEDSource._select_best_body`.**
+- **The bug:** the score was `np.mean` of the six arm confidences. One NaN made it NaN,
+  `NaN > -1.0` is False, and a body with six valid arm keypoints was silently discarded.
+- **Found on real data:** the first recorder take, 160/160 frames, where body fitting
+  filled the right elbow and both wrists with finite positions but NaN confidence.
+- **Now:** `nanmean` over the finite confidences, and 0.0 when all six are NaN (which
+  still beats the −1.0 floor).
+- The NaN-*keypoint* rejection (TR6's only surviving guard) is unchanged.
+- Checked on fake bodies:
+
+  | body | selected? |
+  |---|---|
+  | partial NaN confidence | yes |
+  | all-NaN confidence | yes |
+  | NaN wrist keypoint | no |
+  | two bodies | the higher `nanmean` |
+
+- **Recorder follow-on:**
+  - `classify` asserts the old rejection can no longer happen;
+  - new recordings carry `meta["selector"] = "nanmean-2026-09-15"`;
+  - status `arm_conf_nan` stays defined, so earlier recordings still load. Their
+    `mode="zed"` replay reproduces the OLD selector's decision.
+  - Self-test updated: it now requires 0 `arm_conf_nan` frames.
+
+**5. Operator overlay** (right panel, colour-coded; rendered offline and inspected in
+three states — free with the gate blocked, locked and welded, locked with the gate open):
+- **BASE LOCKED** (green) / **BASE FREE** (amber), and "re-lock inhibited" in red after
+  an abort.
+- **When free:** the predicate's lock terms, each green or red — fwd in [0.26, 0.40],
+  lat, heading, stillness over one gait period.
+- **When locked:** what will release it — box lift vs 0.055 m while welded, or "placed
+  at goal and hands withdrawn".
+- **STANDOFF** |box − base| in xy against [0.28, 0.36], IN BAND / OUT.
+- **GRASP** cmd, and WELDED / GATED / open.
+- **The weld gate conditions, one [OK]/[X] line each:**
+  - L palm-box ≤ 0.16;
+  - R palm-box ≤ 0.16;
+  - opposition ≤ −0.50;
+  - separation in [0.12, 0.30].
+- **Status line:** `BLOCKING: <the failing ones>`, or "GATE OPEN – press g", or "weld
+  engaged".
+- **WRIST** max |qpos − ctrl| over the six wrist joints with the joint name, plus pitch
+  on its own: amber at 0.5 rad, red **WEDGE** at 0.8 rad of pitch (TR23).
+- **B-PRIME ON/OFF.**
+
+### Headless fixtures (for validation only; none is a collection mode)
+
+- `--synthetic grasp`: new `synthetic_source.grasp_lift_frames`. The path, per hand, in
+  the pelvis frame with the robot's own limb lengths:
+  hold home 5 s → rise beside the body → out → down to the grasp point → hold (grasp
+  command on) → lift 0.20 m → hold.
+  - The grasp point (hand 0.09 m behind the box centre, 0.13 m to the side, 0.04 m up)
+    came from a probe on the kinematic twin. That only picks a candidate (TR16a); the
+    stepped run is the verdict.
+  - On the stepped model it closed the gate at palms 0.131 / 0.130 m from the box,
+    opposition −0.88, separation 0.253 m.
+  - Palms 0.13 m lateral sit ~37 mm outside the box faces, so the gate closes without
+    pushing the box.
+  - A 0.12 m lift (the first attempt) raised the box only 48–59 mm, not enough for the
+    0.055 m release. 0.20 m raised it 89–129 mm.
+- `--headless`: no window, no renderer, no wall-clock pacing. `SimClockGrabber` pulls one
+  frame per 17 physics steps (29.4 Hz of simulated time) synchronously, so the stream
+  cannot be drained by a fast loop.
+  - `SyntheticSource` gained `fps` for the windowed synthetic mode. Previously a
+    `FrameGrabber` thread would drain a synthetic stream in milliseconds and the loop saw
+    only its last frame.
+- `--start-standoff S` starts the base S behind the box, head-on. `--seconds`,
+  `--abort-at`, `--bprime-off` as named.
+- Positional `which` and `seed` are unchanged; argument parsing moved to argparse.
+
+### Validation
+
+**Headless runs**, all `keyboard --synthetic grasp --headless --start-standoff 0.32`:
+
+| run | lock | weld | release | wrist | after |
+|---|---|---|---|---|---|
+| seed 0, B-prime ON | 0.96 s, standoff 0.327, lat +0.003, head +0.5° | ENGAGED 9.49 s (L 0.131, R 0.130, opp −0.88, sep 0.253) | **predicate, 12.72 s**, box_lift 0.089, welded | ≤0.005 rad | stands, pelvis z 0.760–0.779, base recedes to 0.40 m once free (O17), box stays welded 54–129 mm up |
+| seed 0, abort at 3.0 s | 0.96 s | ENGAGED 9.49 s with the base free, standoff 0.320 | none by predicate (inhibit held; no re-lock) | ≤0.005 | box lift 0.11–0.12 m |
+| seed 0, B-prime OFF | 0.96 s | **never** (L 0.345, R 0.213, sep 0.526) | none | **1.42 rad — wedged** | — |
+| seed 3, B-prime ON | identical to seed 0 to the printed digit | | | | |
+| seed 3, B-prime OFF | 0.96 s | never | none | 1.42 rad | differs from seed 0 OFF (L 0.290) |
+
+- **TR18 on the identical seed-3 run: explained, not an artifact.** `--start-standoff`
+  places the base relative to the box, so the robot-relative problem is identical unless
+  something touches the platform, whose position relative to the robot does differ
+  between seeds. Only the B-prime-OFF runs touch it, and only they differ.
+- **Consequence:** the headless test covers one relative configuration, not two seeds.
+- Why ~0 wrist deviation is plausible: the palms are not touching the box, and 0.4 kg on
+  a 500 N·m/rad servo is ~0.001 rad. The demonstrator's 0.55 rad came from pad contact.
+
+**Tests:** spec 43/43, contact contract 14/14, keypoint recorder self-test PASS.
+
+**Scripted gates:** **unchanged — byte-identical to the committed B-prime results.**
+`tools/bprime_validate.py gates adopted 12 lock` and `... adopted 40 pred` rewrote
+`docs/measurements/bprime_gates_adopted_{lock_12,pred_40}.json` (timestamps 14:05 and
+14:14), and `git diff` on both files is empty.
+
+| | 12-seed, phase lock | 40-seed, predicate |
+|---|---|---|
+| result | **12/12** | **40/40** |
+| palm error | 34.54–34.55 mm | 30.09–36.15 mm |
+| placement | 0.0377–0.0429 m | 0.0316–0.0523 m |
+| carry drift | 2.43–2.79 mm | 2.41–2.78 mm |
+| max pitch | 8.37–10.77° | 6.73–14.14° |
+| samples | 1278 | 694–846 |
+| falls / wedges / fallbacks | 0 / 0 / 0 | 0 / 0 / 0 |
+| resting | 12/12 | 40/40 |
+
+Expected: nothing in the demonstrator's path changed after the cherry-pick. The changes
+touch `ZEDSource`, `run_integrated_combined.py`, `synthetic_source.py`, the recorder, and
+a contract-string helper whose output is unchanged for a model that is not toggled.
+
+### What is NOT validated
+
+- **The windowed path was never opened.** The overlay drawing function was rendered
+  offline in three states and inspected, and everything else in the loop is shared with
+  the headless run. But the `cv2` window, key handling (`u`, `b`, `g`) and the renderer
+  were not exercised in this session; the headless fixture calls the same abort function
+  the `u` key does.
+- **No real operator.** A live operator must walk the robot into the lock band
+  (fwd 0.26–0.40, |lat| ≤ 0.05, |head| ≤ 5°) and then stand still for about 1 s; the
+  overlay shows which term is failing. `--start-standoff` skips that walk and is a
+  fixture only.
+- **Synthetic hand paths are idealised.** Real retargeting loss (0.13 rad mean, O25) and
+  ZED noise can put a palm outside the gate that this stream closes with ~30 mm to spare.
+- **B-prime's teleop box-disturbance finding stands** (14/14 motions disturb the box,
+  3/14 knock it off; NOTES 2026-09-15 B-prime adoption section). This path was chosen to
+  avoid it — hands rise beside the body — and a live operator's may not.
+- **Existing behaviour left unchanged, flagged:** the loop calls `controller.step` only
+  when a frame HAS keypoints. An empty frame never reaches the coast logic, so arms hold
+  indefinitely on a dropout instead of freezing after `max_coast_frames`, and the
+  recorder analysis assumes the controller definition. Not in this brief.
+
+### For the closeout (not written here)
+
+- D12 now applies to teleoperated collection too: same predicate, manual abort only.
+- A new deviation row for B-prime (simulation-only relaxation, collection AND evaluation).
+- D2's rationale protects the place, not the grasp pose; TR15's mechanism is the unsynced
+  twin base (both carried over from earlier today).
+- The `_select_best_body` NaN-confidence bug, found by the recorder, is fixed.
