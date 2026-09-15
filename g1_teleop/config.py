@@ -345,6 +345,19 @@ class ZEDConfig:
 
 
 @dataclass(frozen=True)
+class ContactConfig:
+    """Which contacts the physics excludes. See g1_teleop/contact_contract.py.
+
+    `hand_pickup_exclusion` (B-prime, adopted 2026-09-15): the hands pass
+    through the PICKUP platform only. The pairs themselves live in scene.xml;
+    this flag is what `reset_episode` checks the compiled model against, so
+    recording and evaluation cannot silently run different contact models.
+    Set False ONLY for A/B measurement, and load with `contact_contract.load_model`.
+    """
+    hand_pickup_exclusion: bool = True
+
+
+@dataclass(frozen=True)
 class TeleopConfig:
     """Top-level config aggregating all subsystems."""
     model_path: str = MODEL_PATH
@@ -357,3 +370,4 @@ class TeleopConfig:
     grasp: GraspConfig = field(default_factory=GraspConfig)
     loco: LocomotionConfig = field(default_factory=LocomotionConfig)
     zed: ZEDConfig = field(default_factory=ZEDConfig)
+    contact: ContactConfig = field(default_factory=ContactConfig)

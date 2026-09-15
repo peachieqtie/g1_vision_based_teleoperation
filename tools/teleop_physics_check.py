@@ -60,6 +60,7 @@ from g1_teleop import teleop as TP
 from g1_teleop.base_lock import BaseLock
 from g1_teleop.box_reset import reset_box
 from g1_teleop.config import TeleopConfig
+from g1_teleop.contact_contract import load_model
 from g1_teleop.grasp import GraspWeld
 from g1_teleop.indices import ModelIndex
 from g1_teleop.robot import G1Robot
@@ -110,7 +111,7 @@ class Rig:
     def __init__(self, cfg: TeleopConfig, seed: int = 0, standoff: float = 0.32,
                  filter_hands=False):
         self.cfg = cfg
-        m = self.m = mujoco.MjModel.from_xml_path(cfg.model_path)
+        m = self.m = load_model(cfg)   # contact contract per cfg.contact
         m.opt.timestep = cfg.loco.sim_dt
         d = self.d = mujoco.MjData(m)
         mujoco.mj_resetDataKeyframe(m, d, 0)
@@ -308,7 +309,7 @@ def run_stream(rig: Rig, frames, policy=None, locked=True):
 
 
 # ─── generator (b): scripted human, authored in the ROBOT's shoulder frame ────
-def scripted_human(geo, n=150, ramp=45, home=15, approach="direct"):
+def scripted_human(geo, n=150, ramp=45, home=15, approach="direct", extra=False):
     """Hand paths a demonstrator would make, placed where they matter FOR THE ROBOT.
 
     The retargeting keeps only segment DIRECTIONS and rescales them by the
@@ -329,6 +330,16 @@ def scripted_human(geo, n=150, ramp=45, home=15, approach="direct"):
                   perform it if TRAINED to
     Returns {name: (frames, segment_lengths)} where segments are
     (home, approach, motion).
+
+    `extra=True` (2026-09-15, B-prime validation) adds two adversarial motions,
+    kept out of the default set so the O25 table stays reproducible:
+      "hands_cross"    - both hands sweep across the midline into each other
+                         above the box, to prove hand<->hand contact survives
+                         the pickup-platform exclusion
+      "rise_under_box" - hands forward UNDER the slab, beneath the box
+                         footprint, then straight up through the slab into the
+                         box: the worst an operator can do to the box pre-grasp
+                         now that the slab no longer stops the hand
     """
     box = geo["box"]
     bz, bx = float(box[2]), float(box[0])
@@ -390,6 +401,15 @@ def scripted_human(geo, n=150, ramp=45, home=15, approach="direct"):
         "lateral_sweep": lambda s_, t: np.array(
             [bx - 0.06, face_y(s_) + 0.15 * np.sin(10 * np.pi * t), bz + 0.12]),
     }
+    if extra:
+        under = bz - 0.22                         # below the slab's underside
+        motions["hands_cross"] = lambda s_, t: np.array(
+            [bx - 0.06, (1.0 if s_ == "left" else -1.0)
+             * (0.14 - 0.30 * min(1.0, 2.0 * t)), bz + 0.12])
+        motions["rise_under_box"] = lambda s_, t: np.array(
+            [min(bx, 0.10 + (bx - 0.10) * 3.0 * t),
+             box[1] + (0.05 if s_ == "left" else -0.05),
+             under + (bz + 0.10 - under) * max(0.0, (t - 1.0 / 3.0) * 1.5)])
     out = {name: build(fn) for name, fn in motions.items()}
     frames, seg = build(lambda s_, t: np.array(
         [0.10 + (bx - 0.10) * t, face_y(s_), bz + 0.12]))

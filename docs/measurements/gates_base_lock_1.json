@@ -1,0 +1,23 @@
+[
+ {
+  "seed": 0,
+  "ok": true,
+  "fail": null,
+  "engaged": true,
+  "palm": 34.548134662668474,
+  "place": 0.03928013270122999,
+  "tilt": 1.9090959104164224e-06,
+  "resting": true,
+  "fell": false,
+  "pitch": 9.023244220752435,
+  "n": 1278,
+  "wedged": false,
+  "wristP": 0.46419357241418896,
+  "hits": 196,
+  "depth": -10.849271290481761,
+  "twist_angle": 37.07301945015334,
+  "twist_joint": 0.0008307690253689659,
+  "box_below_mm": -0.28755424172555166,
+  "palm_below_top_mm": -93.56619351524031
+ }
+]
