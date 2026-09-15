@@ -5354,3 +5354,163 @@ change touches drawing only.
 The windowed path still has not been opened in this session, so the `o` toggle, like `u`,
 `b` and `g`, is exercised only through the code path the headless run and the offline
 renders cover. The first live session should check the `o` toggle early.
+
+---
+
+## 2026-09-15 — Teleop throughput: the sim ran at 37% of real time with a body detected. Now 128%.
+
+**One change to the IK solver** — `mj_forward` inside the iteration loop replaced by
+`mj_kinematics` + `mj_comPos` — takes the live loop from **37.4% to 128.2% of real time**
+with a real body detected, and the arm trajectory is **bit-identical**. The hypothesis in
+the brief was right about the call and wrong about the iteration count.
+
+### 1. Sim-to-wall ratio, measured
+
+`run_integrated_combined.py --profile` runs the real loop with the renderer and the
+overlay, without the window, the key polling or the pacing, so the number is capacity and
+not a measurement of the sleep. 30 s of simulated time each.
+
+| source | before | after |
+|---|---|---|
+| **real ZED, body detected** | **37.4%** | **128.2%** |
+| synthetic body (`--synthetic grasp`) | 124.6 / 128.9 / 128.9% | 178.4 / 178.5 / 176.4% |
+| synthetic, NO body (`--synthetic none`) | — | 357% |
+
+- The real-camera figure is the operator's complaint reproduced: at 37.4% the robot walks
+  and turns at about a third of the speed the operator expects.
+- **With no body the loop runs 357% of real time**, so the cost really is what happens on
+  a frame with keypoints, exactly as reported.
+- Ratios are noisy under machine load: one early post-fix run read 119.5% while something
+  else was running. The before/after pairs above were run **interleaved**, three times
+  each, and are stable to ~2%.
+- The synthetic numbers are higher than the camera numbers because a synthetic frame is
+  free to grab; the camera's own pipeline (NEURAL depth + HUMAN_BODY_ACCURATE) runs
+  alongside and was separately measured at ~21 Hz with 77 dropped frames in 8 s.
+
+### 2. Where the time actually goes
+
+One `controller.step`, mean over 280 frames (`tools/teleop_throughput.py profile`):
+
+| | before | after |
+|---|---|---|
+| **solve_arm_ik (both arms)** | **34.33 ms, 97.4%** | **16.91 ms, 94.0%** |
+| retargeting | 0.14 ms, 0.4% | 0.11 ms, 0.6% |
+| `robot.forward()` | 0.20 ms, 0.6% | 0.49 ms, 2.7% |
+| smoothing, One-Euro, bookkeeping | 0.57 ms, 1.6% | 0.47 ms, 2.6% |
+| **total** | **35.24 ms** | **17.99 ms** |
+
+So it *is* the IK: retargeting and smoothing together are under 1% of the step. In the
+whole loop, before the fix, `controller.step` was 43% of wall and the renderer 34%.
+
+### 3. IK iterations — the brief's expectation was wrong, and this is why (b) is not adopted
+
+    mean 30.00, median 30, p95 30, max 30, hit max_iter(30) on 100.0% of solves
+
+**The solver never converges.** It warm-starts from the twin's current qpos as the brief
+says, but `tol = 1e-3` is never reached, because 4 joints per arm (D2) cannot satisfy a
+6-D elbow+wrist task: the residual plateaus above 1 mm and the loop always runs its full
+30 iterations. Warm-starting buys nothing at all here.
+
+### 4. Fix (a): `mj_kinematics` + `mj_comPos` in the solver loop
+
+`mj_forward` also runs collision detection over the whole robot, builds and solves the
+constraint system and evaluates actuation and the dynamics pipeline. The solver reads
+body poses, site poses, and what `mj_jac` derives from `subtree_com` and `cdof`.
+
+**Verified identical** before adopting (`tools/teleop_throughput.py verify`), over 25
+random arm poses spanning the joint limits:
+
+| quantity | max difference |
+|---|---|
+| `mj_jac` | **0.000e+00** |
+| `xpos` | **0.000e+00** |
+| `site_xpos` | **0.000e+00** |
+
+**Speedup:** IK 34.33 → 16.91 ms per frame (2.03×); whole loop 37.4 → 128.2% of real
+time with the camera.
+
+### 5. (b) max_iter — measured, NOT adopted
+
+Fix (a) already passes the 100% target, and lowering `max_iter` would change the SCRIPTED
+demonstrator's solves as well (it shares `IKConfig`), which would break the byte-identical
+gate requirement. Measured anyway, so the headroom is on record:
+
+**Achieved error on the STEPPED model** (O25 harness, base locked, TR16a — the IK target
+against the stepped wrist, each in its own pelvis frame):
+
+| max_iter | p50 | p95 | max | ms per controller.step (twin) |
+|---|---|---|---|---|
+| 30 | 56.0 mm | 241.3 | 254.6 | 11.42 |
+| 16 | 56.0 | 241.3 | 254.6 | 6.32 |
+| 12 | 56.0 | 241.3 | 254.6 | 5.22 |
+| 8 | 56.0 | 241.3 | 254.6 | 3.56 |
+| 4 | 55.9 | 241.5 | 254.5 | 2.53 |
+
+- **The 45 mm guard is already missed at max_iter = 30** (p50 56 mm): that error is
+  retargeting loss and unreachable close-in targets (O19/O25), not iteration count.
+  Iteration count moves it by ≤0.5 mm, so "the smallest max_iter that keeps palm error
+  inside the guard" has no answer — nothing here is inside it.
+- On the stepped grasp fixture, cutting 30 → 2 moved the achieved palm by **1.4 mm** and
+  the weld still engaged (L 0.131 → 0.132, sep 0.253 unchanged).
+- **What it does cost:** a transient lag on fast motion. Against the 30-iteration command,
+  max_iter 20 differs by >0.05 rad on 3 ticks of 280 and max_iter 8 on 12 ticks, always on
+  the right elbow during the fast reach, decaying to zero once the hand slows. Mean
+  deviation stays ~1e-3 rad. It is a lag, not a different solution branch.
+
+### 6. (c) Which `mj_forward` calls were kept, and why
+
+| call | kept? | why |
+|---|---|---|
+| inside the solver loop, per iteration | **replaced** | nothing in the loop reads dynamics; identical Jacobians |
+| the solver's trailing refresh | **replaced** with the same cheap pair | it exists so the twin matches the qpos just written — for the second arm's solve and for whoever reads `xpos`/`site_xpos` next; both are what `mj_kinematics` produces |
+| `TeleopController._step_inner` → `robot.forward()` (full `mj_forward`, once per frame) | **kept** | 0.2–0.5 ms per frame against a 13–17 ms step, so there is nothing to win; and `G1Robot.forward` is shared with the preview entry points, where narrowing it would be an unmeasured change |
+
+### 7. After the fix, what is next
+
+At 128% with the camera the loop is no longer the limit. In the post-fix profile the
+renderer is the largest remaining term (31–42% of wall, 4.9–7.0 ms per 25 Hz tick), then
+`controller.step` at 27–29%. Two things now bound the operator's experience instead:
+
+1. **the camera**, ~21 Hz with dropped frames (2026-09-15 recorder section), which sets
+   how often the arms get a new pose;
+2. **the renderer**, which is pure display and could be decimated further if needed.
+
+### 8. Validation
+
+- **Scripted gates:** **12/12 and 40/40, byte-identical.** Both result files were rewritten this run
+  (16:52 and 16:59) and `git diff` on them is empty. This is the check that matters for
+  the IK change: the scripted demonstrator solves its poses through the same
+  `solve_arm_ik`, so a solver that moved at all would show up here.
+- **Arm trajectory unchanged, two streams**, replayed through the real `TeleopController`
+  (`tools/teleop_throughput.py replay --forward --save` / `--cmp`):
+
+  | stream | ticks | max &#124;after − before&#124; |
+  |---|---|---|
+  | fabricated grasp-and-lift | 280 | **0.000e+00 rad** |
+  | recorded ZED take (`smoketest_01`) | 160 | **0.000e+00 rad** |
+
+  Bit-identical, not merely within tolerance. This is a speed fix.
+- Headless synthetic grasp run: lock 0.96 s, weld 9.49 s, release 12.72 s — unchanged.
+- Tests: spec 43/43, contact contract 14/14, keypoint recorder self-test PASS.
+
+### 9. Tooling added
+
+- `run_integrated_combined.py --profile` — the ratio and the per-section breakdown, the
+  real loop rather than a replica. `--synthetic none` delivers body-less frames (the cheap
+  path). `--ik-max-iter` and `--ik-mj-forward` are measurement knobs; `--ik-mj-forward`
+  restores the old solver so before/after can be run back to back on the same machine.
+- `tools/teleop_throughput.py` — `verify` (Jacobian identity), `profile`/`iters` (inside
+  one `controller.step`, plus iteration statistics), `sweep` (command deviation vs
+  max_iter), `stepped` (achieved error vs max_iter on the stepped model), `replay`
+  (trajectory equivalence, `--save`/`--cmp`).
+- `g1_teleop/ik.py` gained `COLLECT_STATS` / `ITERATIONS`, off by default.
+
+### For the closeout (not fixed here)
+
+**Demonstration timing is inconsistent while the sim runs off real time.** Below real time
+the operator's motion is time-compressed in sim time, and the compression VARIES with
+whether tracking is holding — 37% with a body, 100%+ without, before this fix. The
+recorder must log the **sim-to-wall ratio per episode** (and ideally per tick) in its
+metadata so the variation is visible in the dataset rather than silent. Above 100% the
+pacing sleep absorbs the difference, so the ratio should sit at 1.0 and any episode that
+drops below it is the one to look at.

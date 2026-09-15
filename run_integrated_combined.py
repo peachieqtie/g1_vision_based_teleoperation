@@ -57,6 +57,7 @@ Test fixtures, no camera:
   python run_integrated_combined.py keyboard 0 --synthetic grasp --headless --start-standoff 0.32
 """
 import argparse
+import dataclasses
 import sys
 import threading
 import time
@@ -464,20 +465,39 @@ def main():
     # demonstration can be re-run; different seeds -> different poses, which is
     # what Objectives 3 and 4 need and what the keyframe pose never gave.
     ap.add_argument("seed", nargs="?", type=int, default=0)
-    ap.add_argument("--synthetic", nargs="?", const="reach", choices=("reach", "grasp"),
-                    help="no camera: fabricated BODY_38 stream (test fixture)")
+    ap.add_argument("--synthetic", nargs="?", const="reach", choices=("reach", "grasp", "none"),
+                    help="no camera: fabricated BODY_38 stream (test fixture). "
+                         "'none' delivers frames with NO body, the cheap path")
     ap.add_argument("--headless", action="store_true",
                     help="no window, no renderer, no wall-clock pacing; needs --synthetic")
     ap.add_argument("--seconds", type=float, default=30.0, help="headless: simulated seconds")
     ap.add_argument("--start-standoff", type=float, default=None,
                     help="start the base this far behind the box, head-on, instead of the keyframe")
     ap.add_argument("--bprime-off", action="store_true", help="start with B-prime OFF (toggle: b)")
+    ap.add_argument("--ik-max-iter", type=int, default=None,
+                    help="override IKConfig.max_iter (throughput measurement)")
+    ap.add_argument("--ik-mj-forward", action="store_true",
+                    help="throughput measurement: put mj_forward back inside the IK loop "
+                         "(the pre-2026-09-15 solver), for before/after comparison")
+    ap.add_argument("--profile", action="store_true",
+                    help="throughput measurement: render and draw as usual but no window, "
+                         "no pacing; prints the sim-to-wall ratio and where the time went")
     ap.add_argument("--abort-at", type=float, default=None,
                     help="headless test fixture: press 'u' (abort the base lock) at this sim time")
     args = ap.parse_args()
     if args.headless and not args.synthetic:
         ap.error("--headless needs --synthetic (there is no operator to watch a camera)")
     which, episode_seed, headless = args.which, args.seed, args.headless
+    profile = args.profile
+    if args.ik_mj_forward:
+        from g1_teleop import ik as _ik
+        _ik._kinematics = lambda m_, d_: mujoco.mj_forward(m_, d_)
+        print("IK solver refresh forced to mj_forward (the OLD path)")
+    # --profile keeps the renderer and the overlay (they are part of what the
+    # operator pays for) but drops the window, the key polling and the pacing,
+    # so the loop runs as fast as the machine allows and the ratio is a capacity
+    # measurement rather than a measurement of the sleep.
+    prof = dict(step=0.0, ctrl=0.0, policy=0.0, render=0.0, overlay=0.0, frames=0, ticks=0)
     if which.startswith("p"):
         loco, loco_name = PelvisVelocity(), "PELVIS VELOCITY (thesis 3.3.4)"
     elif which.startswith("l"):
@@ -528,6 +548,9 @@ def main():
     start_xy = np.array(data.qpos[ix.base_xy_qpos], dtype=np.float64)
 
     cfg = TeleopConfig()
+    if args.ik_max_iter is not None:
+        cfg = dataclasses.replace(cfg, ik=dataclasses.replace(cfg.ik, max_iter=args.ik_max_iter))
+        print("IK max_iter overridden to %d" % cfg.ik.max_iter)
     twin = G1Robot(cfg)
     # Keep the twin's box on the same seed as the physics model. Nothing reads
     # the twin's box today, but letting the two models hold different box poses
@@ -547,7 +570,11 @@ def main():
         zed = SyntheticSource(hand_path_frames(
             lambda t: np.array([0.10 + 0.22 * t, +0.10, -0.10]),
             lambda t: np.array([0.10 + 0.22 * t, -0.10, -0.10]), 300),
-            fps=None if headless else frame_hz)
+            fps=None if (headless or profile) else frame_hz)
+    elif args.synthetic == "none":
+        from g1_teleop.synthetic_source import SyntheticSource
+        print("[profile] SYNTHETIC source with NO body - the cheap path")
+        zed = SyntheticSource([[] for _ in range(100000)], fps=None if (headless or profile) else frame_hz)
     elif args.synthetic == "grasp":
         from g1_teleop.synthetic_source import SyntheticSource, grasp_lift_frames
         mujoco.mj_forward(twin.model, twin.data)
@@ -561,11 +588,14 @@ def main():
         frames_g, grasp_on_s, lift_s = grasp_lift_frames(shoulders, lengths, home, box_rel, frame_hz)
         print("[synthetic] grasp-and-lift: %d frames, grasp command at %.1f s, lift at %.1f s, "
               "box in pelvis frame %s" % (len(frames_g), grasp_on_s, lift_s, np.round(box_rel, 3)))
-        zed = SyntheticSource(frames_g, fps=None if headless else frame_hz)
+        zed = SyntheticSource(frames_g, fps=None if (headless or profile) else frame_hz)
     else:
         zed = ZEDSource(cfg.zed)
-    if headless:
-        grabber = SimClockGrabber(zed)     # frames on the SIMULATED clock
+    if (headless or profile) and args.synthetic:
+        # Only a SYNTHETIC stream may be pulled on the simulated clock. The real
+        # camera must keep its thread: zed.grab() blocks 35-50 ms and calling it
+        # inline would put the camera back inside the physics loop (TR10).
+        grabber = SimClockGrabber(zed)
     else:
         grabber = FrameGrabber(zed)
         grabber.start()
@@ -580,7 +610,7 @@ def main():
 
     renderer = None
     try:
-        if not headless:
+        if not headless or profile:
             renderer = mujoco.Renderer(model, height=MUJOCO_H, width=MUJOCO_W)
     except ValueError as e:
         print("Renderer init failed:", e)
@@ -612,7 +642,7 @@ def main():
     frame = None
     wall_start = time.time()
 
-    if not headless:
+    if not headless and not profile:
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW, ZED_PANEL_W + MJ_PANEL_W, PANEL_H)
     events = []                        # (sim s, what) - printed at exit
@@ -647,7 +677,7 @@ def main():
     try:
         while True:
             t_sim = counter * SIM_DT
-            if headless:
+            if (headless or profile) and args.synthetic:
                 grabber.poll(counter)
                 if grasp_on_s is not None and grasp_cmd < 0.5 and t_sim >= grasp_on_s:
                     grasp_cmd = 1.0
@@ -655,8 +685,10 @@ def main():
                 if args.abort_at is not None and t_sim >= args.abort_at:
                     abort_lock("--abort-at fixture")
                     args.abort_at = None
-                if t_sim >= args.seconds:
-                    break
+            # The run limit is NOT synthetic-only: --profile with the real camera
+            # would otherwise never stop (measured, 2026-09-15).
+            if (headless or profile) and t_sim >= args.seconds:
+                break
 
             # ── Base lock (D12): the demonstrator's predicate, at 25 Hz on the
             # 47-D state from the STEPPED model (sync=False, as scripted_demo:
@@ -708,11 +740,19 @@ def main():
             was_on = weld.engaged(data)
             weld_on, weld_diag = weld.update(model, data, grasp_cmd)
             if weld_on != was_on:
-                events.append((t_sim, "WELD %s  L %.3f R %.3f opp %+.2f sep %.3f"
+                events.append((t_sim, "WELD %s  L %.3f R %.3f opp %+.2f sep %.3f  "
+                               "palmL %s palmR %s"
                                % ("ENGAGED" if weld_on else "RELEASED", weld_diag["d_left"],
-                                  weld_diag["d_right"], weld_diag["opposed"], weld_diag["sep"])))
+                                  weld_diag["d_right"], weld_diag["opposed"], weld_diag["sep"],
+                                  np.round(data.site_xpos[weld.site_l], 4),
+                                  np.round(data.site_xpos[weld.site_r], 4))))
                 print("[%.2f s] %s" % events[-1])
-            mujoco.mj_step(model, data)
+            if profile:
+                _t = time.perf_counter()
+                mujoco.mj_step(model, data)
+                prof["step"] += time.perf_counter() - _t
+            else:
+                mujoco.mj_step(model, data)
             counter += 1
 
             if counter % CONTROL_DECIMATION:
@@ -723,7 +763,7 @@ def main():
             # time, which is unusable for teleoperation.
             sim_elapsed = counter * SIM_DT
             wall_elapsed = time.time() - wall_start
-            if sim_elapsed > wall_elapsed and not headless:
+            if sim_elapsed > wall_elapsed and not headless and not profile:
                 time.sleep(sim_elapsed - wall_elapsed)
 
             # ── Velocity command: hold station when nothing is commanded ────
@@ -752,6 +792,8 @@ def main():
                 hold_target[:] = data.qpos[ix.base_xy_qpos]
                 hold_yaw = yaw_from_quat(data.qpos[ix.base_quat_qpos])
 
+            prof["ticks"] += 1
+            _t = time.perf_counter() if profile else 0.0
             if locked_leg_pos is None:
                 qj = (data.qpos[ix.leg_qpos] - DEFAULT_ANGLES) * DOF_POS_SCALE
                 dqj = data.qvel[ix.leg_qvel] * DOF_VEL_SCALE
@@ -769,6 +811,9 @@ def main():
                 action = policy(torch.from_numpy(obs).unsqueeze(0)).detach().numpy().squeeze()
                 target_leg_pos = action * ACTION_SCALE + DEFAULT_ANGLES
 
+            if profile:
+                prof["policy"] += time.perf_counter() - _t
+
             # ── ZED: non-blocking read of the newest frame ──────────────────
             # The grabber thread owns zed.grab(). We only process a frame when
             # its sequence number changes, so the physics loop never waits on
@@ -778,7 +823,11 @@ def main():
                 last_seq = seq
                 frame = new_frame
                 if frame.keypoints_3d:
+                    prof["frames"] += 1
+                    _t = time.perf_counter() if profile else 0.0
                     outcome = controller.step(frame)
+                    if profile:
+                        prof["ctrl"] += time.perf_counter() - _t
                     tracking_ok = bool(outcome.applied)
                     status_text = ("IK OK" if outcome.applied
                                    else f"HOLD: {outcome.reason.value}")
@@ -800,7 +849,7 @@ def main():
                 cmd[:] = loco()
                 loco_diag = getattr(loco, "diag", {})
 
-            if headless:
+            if headless and not profile:
                 if counter % 500 == 0:
                     wd, wj = wrist_deviation(data, wrist_ids)
                     print("  t %5.1f  base %-6s z %.3f  standoff %.3f  weld %-3s L %.3f R %.3f "
@@ -830,9 +879,13 @@ def main():
                     y += 24
 
             # ── Right panel: simulation ─────────────────────────────────────
+            _t = time.perf_counter() if profile else 0.0
             renderer.update_scene(data, camera=cam, scene_option=scene_option)
             right = fit_to_box(cv2.cvtColor(renderer.render(), cv2.COLOR_RGB2BGR),
                                MJ_PANEL_W, PANEL_H)
+            if profile:
+                prof["render"] += time.perf_counter() - _t
+            _t = time.perf_counter() if profile else 0.0
 
             travelled = float(np.linalg.norm(data.qpos[ix.base_xy_qpos] - start_xy))
             wd, wj = wrist_deviation(data, wrist_ids)
@@ -879,6 +932,9 @@ def main():
                 for k_, h_ in enumerate(hints):
                     text(right, h_, (10, PANEL_H - 30 + 16 * k_), 0.45, (200, 200, 200))
 
+            if profile:
+                prof["overlay"] += time.perf_counter() - _t
+                continue                      # no window, no keys: this is a measurement
             cv2.imshow(WINDOW, np.hstack([left, right]))
 
             # DRAIN the key queue rather than taking one event per poll.
@@ -978,6 +1034,19 @@ def main():
         if not headless:
             cv2.destroyAllWindows()
         zed.close()
+        if profile:
+            wall = time.time() - wall_start
+            sim = counter * SIM_DT
+            print("\nTHROUGHPUT  sim %.2f s / wall %.2f s = %.1f%% of real time"
+                  % (sim, wall, 100.0 * sim / max(wall, 1e-9)))
+            other = wall - sum(prof[k] for k in ("step", "ctrl", "policy", "render", "overlay"))
+            for k in ("step", "ctrl", "policy", "render", "overlay"):
+                per = prof[k] / max(prof["frames"] if k in ("ctrl",) else prof["ticks"], 1)
+                print("  %-8s %7.2f s  %5.1f%% of wall   %6.2f ms per %s"
+                      % (k, prof[k], 100.0 * prof[k] / max(wall, 1e-9), 1000 * per,
+                         "frame" if k == "ctrl" else "tick"))
+            print("  %-8s %7.2f s  %5.1f%% of wall" % ("other", other, 100.0 * other / max(wall, 1e-9)))
+            print("  camera frames processed %d, control ticks %d" % (prof["frames"], prof["ticks"]))
         print("\nEVENTS (sim s):")
         for t_, what in events:
             print("  %7.2f  %s" % (t_, what))
