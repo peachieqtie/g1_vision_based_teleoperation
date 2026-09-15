@@ -45,24 +45,6 @@
     </body>
   </worldbody>
 
-  <!-- B-prime (adopted 2026-09-15): the hands do not collide with the PICKUP
-       platform. Teleop reaches hooked the hand under the slab edge and jammed the
-       wrist permanently (6/10 motions, O25); excluding these pairs removes every
-       jam. SIMULATION-ONLY RELAXATION, disclosed. Pair excludes, not contype
-       bits, so hand<->hand, hand<->GOAL platform (load-bearing at release) and
-       hand<->box all still collide. wrist_pitch_link is included because yaw+pad
-       alone left pitch-link slab contact in 10/10 motions. The list is mirrored
-       in g1_teleop/contact_contract.py HAND_BODIES, and reset_episode refuses a
-       model whose compiled exclude table does not match TeleopConfig.contact. -->
-  <contact>
-    <exclude body1="left_wrist_pitch_link"  body2="platform_pickup"/>
-    <exclude body1="left_wrist_yaw_link"    body2="platform_pickup"/>
-    <exclude body1="left_pad"               body2="platform_pickup"/>
-    <exclude body1="right_wrist_pitch_link" body2="platform_pickup"/>
-    <exclude body1="right_wrist_yaw_link"   body2="platform_pickup"/>
-    <exclude body1="right_pad"              body2="platform_pickup"/>
-  </contact>
-
   <!-- Grasp weld (D11). Friction grasping was characterised as infeasible under
        our constraints: 1 of 9 standoffs holds, and holding couples to unrelated
        foot-floor contacts. See CLAUDE.md O2 / section 7 D11 and NOTES.md.

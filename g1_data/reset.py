@@ -46,16 +46,6 @@ Teleop stack, when present: `TeleopController.reset()` (arm smoothing, depth
 filter, stillness lock, coast counter, One-Euro history) and the locomotion
 input strategy's `reset()`.
 
-CONTACT CONTRACT (2026-09-15)
------------------------------
-Before anything is reset, the model's compiled exclude table is checked against
-`cfg.contact` (g1_teleop/contact_contract.py) and a mismatch RAISES. Every
-recording and every evaluation rollout starts here, so a demonstration set
-collected under the B-prime hand <-> pickup-platform exclusion cannot be
-evaluated in a model without it (or vice versa) by accident. The contract
-string is returned in `EpisodeStart.contact_contract` for the recorder to store
-and the evaluator to check with `assert_recorded_contract`.
-
 WHAT IS DELIBERATELY PERSISTENT
 -------------------------------
   MjModel                 immutable scene
@@ -79,7 +69,6 @@ import mujoco
 
 from g1_teleop.box_reset import in_heldout, sample_box_pose
 from g1_teleop.config import LocomotionConfig, TeleopConfig
-from g1_teleop.contact_contract import assert_contract
 
 
 # Buffer names that carry recurrent state on the pre-trained locomotion policy.
@@ -151,9 +140,6 @@ class EpisodeStart:
     seed: int
     box_pos: np.ndarray
     heldout: bool          # in the Objective 4 held-out patch?
-    # contact_contract.contract_of(model) at reset. The recorder stores it per
-    # episode; evaluation checks it with assert_recorded_contract.
-    contact_contract: str = ""
 
     @property
     def split(self) -> str:
@@ -175,10 +161,6 @@ def reset_episode(model, data, index, cfg: TeleopConfig, seed: int,
     defined once so a relabelling can never disagree with the audit.
     """
     box_cfg, loco = cfg.box, cfg.loco
-
-    # 0. Contact contract: recording and evaluation must run the same contact
-    #    model. Raises on mismatch (g1_teleop/contact_contract.py).
-    contract = assert_contract(model, cfg.contact, where="reset_episode")
 
     # 1. Full MjData reset. Do NOT hand-clear fields instead: qacc_warmstart and
     #    the contact list would survive and break bit-reproducibility.
@@ -235,8 +217,7 @@ def reset_episode(model, data, index, cfg: TeleopConfig, seed: int,
         twin.reset_box(seed=seed)
 
     return EpisodeStart(seed=seed, box_pos=pos.copy(),
-                        heldout=in_heldout(pos[:2], box_cfg),
-                        contact_contract=contract)
+                        heldout=in_heldout(pos[:2], box_cfg))
 
 
 def state_fingerprint(data, index) -> str:

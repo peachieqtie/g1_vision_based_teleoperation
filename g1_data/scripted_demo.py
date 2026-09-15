@@ -66,7 +66,6 @@ import mujoco
 
 from g1_teleop.base_lock import BaseLock
 from g1_teleop.config import TeleopConfig
-from g1_teleop.contact_contract import load_model
 from g1_teleop.grasp import GraspWeld
 from g1_teleop.ik import solve_arm_ik
 from g1_teleop.indices import ModelIndex
@@ -687,10 +686,7 @@ def run_episode(seed: int, cfg: Optional[TeleopConfig] = None,
     # With a fixed base the standoff is whatever the spawn makes it - measuring
     # which spawns work is the point, so the band is reported, not asserted.
 
-    # Contact contract (B-prime, 2026-09-15): loads scene.xml with or without
-    # the hand <-> pickup-platform exclusion per cfg.contact; reset_episode
-    # re-checks the compiled model against the same setting.
-    m = load_model(cfg)
+    m = mujoco.MjModel.from_xml_path(cfg.model_path)
     m.opt.timestep = dt
     d = mujoco.MjData(m)
     ix = ModelIndex.resolve(m)

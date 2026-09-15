@@ -209,10 +209,7 @@ def main():
         loco, loco_name = KeyboardCommand(), "KEYBOARD (decoupled)"
 
     cfg_box_for_reset = TeleopConfig().box
-    # Contact contract (2026-09-15): the collection entry point must load the
-    # same contact model evaluation will; load_model raises on a mismatch.
-    from g1_teleop.contact_contract import load_model
-    model = load_model(TeleopConfig(), SCENE_PATH)
+    model = mujoco.MjModel.from_xml_path(SCENE_PATH)
     data = mujoco.MjData(model)
     model.opt.timestep = SIM_DT
     mujoco.mj_resetDataKeyframe(model, data, 0)
