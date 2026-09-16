@@ -88,6 +88,10 @@ def main():
         reset_fingerprint="",            # this entry point does not reset_episode
         contact_contract=__import__("g1_teleop.contact_contract",
                                     fromlist=["contract_of"]).contract_of(rec.model),
+        # O28: how many ticks were NOT backed by a live tracked frame. The
+        # per-tick detail is the `tracking_ok` array; this is the summary an
+        # operator reads at ACCEPT time.
+        degraded_ticks=sum(1 for v in rec.buf.tracking if not v),
         note="teleop: phase_labels are UNKNOWN by construction - derive them offline")
     rec.buf.save(a.out, meta)
     # `checks` mirrors the scripted recorder's shape (name -> bool). The fixture
@@ -96,7 +100,8 @@ def main():
     ledger.append("accept", seed=a.seed, path=_rel(a.out),
                   heldout=bool(meta["heldout"]), label=label,
                   checks={"weld fired": rec.weld_engage_tick >= 0,
-                          "ticks recorded": len(rec.buf) > 0},
+                          "ticks recorded": len(rec.buf) > 0,
+                          "tracking never lost": meta["degraded_ticks"] == 0},
                   placement_error=None)
     print("saved %s: %d ticks, weld tick %s, lock tick %s"
           % (a.out, len(rec.buf), rec.weld_engage_tick, rec.lock_engage_tick))

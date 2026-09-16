@@ -127,6 +127,28 @@ HOLD_YAW_KP = 1.2         # rad/s per radian of heading error
 HOLD_YAW_MAX = 0.25       # cap on corrective turn rate
 HOLD_YAW_DEADBAND = 0.03  # ignore errors under ~1.7 degrees
 
+# ── O28: the arm hold during a tracking dropout ──────────────────────────────
+# A frame with no usable body never reaches `controller.step` (the branch at
+# `if frame.keypoints_3d:` below), so `SmoothingConfig.max_coast_frames` - which
+# lives INSIDE `TeleopController._coast` - is never consulted on this path.
+# Measured 2026-09-16 with the synthetic fixture: at gaps of 5, 50 and 500
+# frames `controller.step` was called 0 times and `arm_targets` was byte-for-
+# byte constant for the whole window, because the loop re-applies the same latch
+# to `data.ctrl[ix.upper_ctrl]` on every physics step. A 500-frame gap held the
+# arms for 17.0 s with no bound and no signal beyond a status string.
+#
+# Two harms: the operator sees a robot that has stopped responding, and the
+# RECORDER writes those ticks as a deliberate hold - 39 of 39 consecutive ticks
+# at exactly zero arm delta in the measurement, indistinguishable from the
+# demonstrator choosing to stay still.
+#
+# This bounds the hold's VALIDITY. The arms keep their last pose past the bound
+# (commanding motion nobody asked for is strictly worse while a box is welded to
+# the hands), but the ticks stop counting as demonstration data and the operator
+# gets a loud signal. The per-tick `tracking_ok` array records which ticks were
+# backed by a live tracked frame; see g1_data/recorder.py.
+NO_BODY_HOLD_S = 0.40     # seconds of stale arm command before ticks are degraded
+
 # ── Why the robot always marches in place ────────────────────────────────────
 # The policy's observation includes a gait phase as sin/cos of a clock that runs
 # unconditionally. It was trained with that clock always cycling, including at
@@ -651,6 +673,13 @@ def main():
     # the session (it is not written to disk, so a restart is MINIMAL again).
     overlay_full = False
     tracking_ok = False
+    # O28: sim time of the last controller.step that actually applied a pose.
+    # Time, not a frame count, because the other dropout mode is "no new frame
+    # arrives at all", which produces no frame to count at all.
+    last_applied_s = 0.0
+    arm_stale = False
+    stale_reported = False
+    degraded_ticks = 0
 
     def abort_lock(source):
         """Manual ABORT of the base lock - the only operator input that touches
@@ -829,6 +858,8 @@ def main():
                     if profile:
                         prof["ctrl"] += time.perf_counter() - _t
                     tracking_ok = bool(outcome.applied)
+                    if outcome.applied:
+                        last_applied_s = t_sim
                     status_text = ("IK OK" if outcome.applied
                                    else f"HOLD: {outcome.reason.value}")
                     status_color = (0, 255, 0) if outcome.applied else (0, 100, 255)
@@ -842,6 +873,30 @@ def main():
                 else:
                     tracking_ok = False
                     status_text, status_color = "no body detected", (0, 100, 255)
+
+            # ── O28: bound the arm hold ────────────────────────────────────
+            # `tracking_ok` alone is not enough: it is only assigned inside the
+            # "a new frame arrived" block, so if the camera stops delivering
+            # frames ENTIRELY it keeps its last value - which may be True - and
+            # the stale arms would go unmarked. Elapsed time since the last
+            # APPLIED pose covers both dropout modes with one test.
+            arm_stale = (t_sim - last_applied_s) > NO_BODY_HOLD_S
+            if arm_stale:
+                degraded_ticks += 1
+                status_text = ("TRACKING LOST %.1fs - ARMS HELD, TICKS DEGRADED"
+                               % (t_sim - last_applied_s))
+                status_color = (0, 0, 255)
+                if not stale_reported:
+                    stale_reported = True
+                    events.append((t_sim, "TRACKING LOST: arm command stale > "
+                                          "%.2f s, ticks marked degraded"
+                                          % NO_BODY_HOLD_S))
+                    print("[O28] tracking lost at t %.2f s - arms holding, ticks "
+                          "from here are marked NOT tracking_ok" % t_sim, flush=True)
+            elif stale_reported:
+                stale_reported = False
+                events.append((t_sim, "tracking recovered"))
+                print("[O28] tracking recovered at t %.2f s" % t_sim, flush=True)
 
             # KeyboardCommand ignores keypoints, so it updates every control
             # tick rather than only when the camera delivers a frame.

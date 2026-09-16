@@ -182,10 +182,15 @@ class EpisodeBuffer:
         self.sp = sp or spec.SpecLayout.resolve(model, self.ix)
         self.states, self.actions, self.phases = [], [], []
         self.gait, self.qpos, self.qvel, self.ticks = [], [], [], []
+        # O28. Per tick: was the arm command backed by a LIVE tracked frame?
+        # An auxiliary array, not a state or action dim - the 47/22 layout and
+        # SPEC_VERSION are untouched (see `tracking_ok_of`).
+        self.tracking = []
         self.t_wall0 = time.perf_counter()
 
     def tick(self, model, data, act, cmd, phase_label: int, gait_counter: int,
-             step_index: int, dt: float, gait_period: float) -> None:
+             step_index: int, dt: float, gait_period: float,
+             tracking_ok: bool = True) -> None:
         """One recorded tick. Call at `mj_step` entry, never after it."""
         s, a = self.sp.build(model, data, self.ix, act=act, cmd=cmd, sync=True)
         # D15, at the moment it would be written. ASSERT, never clip: clipping
@@ -205,6 +210,9 @@ class EpisodeBuffer:
         self.qpos.append(np.array(data.qpos, dtype=np.float64))
         self.qvel.append(np.array(data.qvel, dtype=np.float64))
         self.ticks.append(int(step_index))
+        # Defaults True: the scripted demonstrator has no camera and no tracking
+        # path, so every one of its ticks is genuinely backed by a real command.
+        self.tracking.append(bool(tracking_ok))
 
     def __len__(self) -> int:
         return len(self.states)
@@ -229,8 +237,33 @@ class EpisodeBuffer:
             qpos=np.asarray(self.qpos, dtype=np.float32),
             qvel=np.asarray(self.qvel, dtype=np.float32),
             step_index=np.asarray(self.ticks, dtype=np.int64),
+            tracking_ok=np.asarray(self.tracking, dtype=np.uint8),
             meta=np.array(json.dumps(m)))
         return path
+
+
+def tracking_ok_of(arrays: dict, n_ticks: Optional[int] = None) -> np.ndarray:
+    """Per-tick "was the arm command backed by a live tracked frame" (O28).
+
+    BACKWARD COMPATIBLE BY CONSTRUCTION. `load_episode` builds its dict from
+    `z.files`, so an episode written before this array existed simply does not
+    have the key - it does not fail to load, and nothing in `assert_uniform`
+    (which reads metadata only) or the loader inspects the array set. No
+    SPEC_VERSION bump: the 47-D state and 22-D action layout, the masks, the
+    clips and the normalization contract are all untouched, and `fit_norm_stats`
+    reads only `states` and `actions`.
+
+    A missing array means "recorded before the field existed". It is reported as
+    all-True, which is CORRECT for every episode that exists today: all 45 came
+    from the scripted demonstrator, which has no camera and no tracking path.
+    Do not read that default as a measurement on a teleop episode - a teleop
+    episode written after this change always carries the real array.
+    """
+    got = arrays.get("tracking_ok")
+    if got is not None:
+        return np.asarray(got, dtype=bool)
+    n = len(arrays["states"]) if n_ticks is None else int(n_ticks)
+    return np.ones(n, dtype=bool)
 
 
 def load_episode(path: str):
@@ -343,7 +376,11 @@ class ScriptedRecorder:
         act = L.get("act")
         act = np.zeros(3) if act is None else np.asarray(act, dtype=np.float64)
         loco = L["cfg"].loco
+        # O28: `arm_stale` is a local of the TELEOP loop only. The scripted
+        # demonstrator has no such local and no tracking path, so `.get` falls
+        # back to False and its ticks record as tracked, which is the truth.
         self.buf.tick(m, d, act=act, cmd=float(L.get("cmd", 0.0)),
+                      tracking_ok=not bool(L.get("arm_stale", False)),
                       phase_label=int(L["phase"]),
                       gait_counter=int(L["carry"].counter),
                       step_index=i, dt=loco.sim_dt, gait_period=loco.gait_period)

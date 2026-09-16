@@ -241,6 +241,28 @@ def with_dropout(frames: List[List[np.ndarray]],
     return out
 
 
+def with_no_body(frames: List[List[np.ndarray]],
+                 gaps: Sequence[tuple]) -> List[List[np.ndarray]]:
+    """Replace frames with an EMPTY list: "no usable body" (O28).
+
+    NOT the same dropout as `with_dropout`, and the difference is the whole of
+    O28. `with_dropout` writes NaN keypoints, which still reach
+    `TeleopController.step` and drive the coast path, so `max_coast_frames`
+    applies. An EMPTY list is what `ZEDSource.grab` returns when no body was
+    detected at all, and the consumer loop skips `controller.step` entirely on
+    it - so the coast path, and `max_coast_frames` with it, is never reached.
+
+    Measured 2026-09-16 at gaps of 5, 50 and 500 frames: 0 calls to
+    `controller.step` in every case, arm targets byte-identical for the whole
+    window, 17.0 s of frozen arms at 500 frames.
+    """
+    out = [list(f) for f in frames]
+    for start, length in gaps:
+        for k in range(start, min(start + length, len(out))):
+            out[k] = []
+    return out
+
+
 # ─── generator (c): grasp and lift, for the base-lock / weld path ─────────────
 def grasp_lift_frames(shoulders, lengths, home, box, fps: float,
                       hand_dx: float = -0.09, face_y: float = 0.13, hand_dz: float = 0.04,
