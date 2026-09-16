@@ -5821,3 +5821,248 @@ knowing before Objective 4 reads spatial generalization off a 60 mm held-out pat
   flags off the quantities already in each file — nothing further needs recording.
 - `docs/measurements` is not where episodes go: `recordings/episodes/` is gitignored
   (`*.npz`), so the dataset needs the off-machine backup PLAN.md Phase 6 already calls for.
+
+## 2026-09-16 — PHASE 3, second chunk: success detection, the offline phase labeller, the dataset, and normalization
+
+Four pieces, no model code. The two things worth reading if nothing else: the proposal's grasp
+criterion and its lift criterion are **both** satisfiable by an episode that failed, and each
+needed a deviation row (**D19**, **D20**). Both were found by deliberately breaking a healthy
+episode, not by reading the text.
+
+### 1. Success detection — and two unsound criteria in §3.8.2
+
+`g1_data/success.py`. The four criteria are pure functions of a RECORDED episode plus its
+metadata: nothing is computed live, so a recording can be re-scored after the thresholds change
+without re-running physics. That matters because the thresholds did change twice below.
+
+**D19 — the grasp criterion needs the box to still be where it spawned.**
+§3.8.2 reads "grippers closed AND box above the platform". The replay negative control from the
+first chunk satisfies both while failing: the arm shoved the box **185 mm** into its own palms,
+at which point the weld gate's proximity/opposition/separation conditions were all genuinely met
+and the box was genuinely above the platform. Nothing in the criterion distinguishes "reached
+the box" from "pushed the box until it was reachable", and *bulldoze until the gate fires* is
+exactly the degenerate strategy a policy will find. Added: at the engage tick the box must be
+within **50 mm** of `box_spawn_xy`.
+
+The threshold is measured, not chosen. Over the 40 healthy scripted episodes the box moves
+**0.0–1.9 mm** from spawn before engage (mean 0.3). 50 mm is **26x the worst healthy episode**
+and **3.7x below** the bulldoze it has to reject — separation of that size is why it can be a
+fault detector rather than a tuned threshold.
+
+**D20 — the lift criterion is vacuous read as the box centre.**
+The injected `never_lifted` fault — hold the box on the platform for the whole episode — was
+**MISSED** on the first run. The box is 0.18 m, so at rest its CENTRE already sits 0.09 m above
+the platform top, and "box centre >= 0.05 m above the platform" is true before the robot touches
+it. Scored on the box **BOTTOM** instead, which is what "lifted" means. Caught after the change.
+
+This one is worth stating plainly in the writeup: the criterion as written cannot fail, so any
+lift success rate computed from the proposal's text would have been 100% by construction.
+
+**Thresholds and where each came from.** Two were wrong the first time and both failures were
+the same mistake — inventing a number instead of measuring the healthy population:
+
+| threshold | value | provenance |
+|---|---|---|
+| `lift_above_platform` | 0.05 m | §3.8.2, but of the box BOTTOM (D20) |
+| `place_radius` | 0.10 m | `d_place`, Q4 — unchanged from the proposal |
+| `upright_deg` | 15 deg | measured max 10.9 deg |
+| `resting_tol` | 0.03 m | 1.6x the measured max (18.3 mm) |
+| `settled_speed` | 0.25 m/s | 4x the measured max (0.060 m/s) |
+| `grasp_spawn_max` | 0.05 m | D19, 26x the measured max (1.9 mm) |
+
+`settled_speed` was first set to 0.05 m/s out of nowhere and disagreed with the demonstrator on
+seed 24. The measured healthy population peaks at 0.0603 m/s, i.e. **the invented threshold sat
+inside the healthy distribution**. Related: the demonstrator's own "resting" test is a CONTACT
+test (`scripted_demo.py:1243`) and is **not derivable from a recording at all** — the recorded
+approximation is a displacement-plus-speed test, which is why it needs a tolerance and the
+demonstrator does not.
+
+**Validation.** 40/40 agreement with the demonstrator's independently computed `outcome.ok`
+(different code, computed live, from the stepped model). All six injected faults caught:
+`no_weld`, `box_dropped`, `placement_out`, `tipped`, `bulldozed`, `never_lifted` — the last two
+being the ones that found D19 and D20.
+
+### 2. The phase labeller is OFFLINE, and the reason is in its docstring
+
+`g1_data/phase_label.py`. Derives `spec.Phase` from recorded state only — weld bit, box height,
+box-to-base distance, lock ticks. **No live phase classifier is needed anywhere**, which is what
+lets teleop record episodes without an operator-side phase machine (the 2026-09-08 decision).
+It uses `spec.Phase` and `spec.SCORED_OF`; there is no second vocabulary.
+
+**What actually made it work was reusing `LockPredicate`, not adding thresholds.** It went
+50.9% -> 53.0% -> 55.1% per-tick through three rounds of threshold tuning, and the LOWER boundary
+was still 2575 ticks wrong. Running the project's own `LockPredicate` over the recorded states
+offline — recovering BOTH lock instants, where the recorder stores only the first — took it to
+**64.6%** and the LOWER offset to −1 tick. The lesson is the same one as `settled_speed`: the
+information was already in the project, in a validated component, and inventing a threshold was
+the slower path.
+
+**Confusion matrix, 40 episodes, 30256 ticks** (rows truth, columns derived):
+
+```
+             SETTLE   REACH  REPOSI  APPROA   GRASP    LIFT    MOVE   LOWER  RELEAS  VERIFY
+  SETTLE       3478      40       0       0       0       0       0       0       0       0
+  REACH           0    3000       0       0       0       0       0       0       0       0
+  REPOSI          0    6000       0       0       0       0       0       0       0       0
+  APPROA          0    2000       0       0       0       0       0       0       0       0
+  GRASP           0     800       0       0     800       0       0       0       0       0
+  LIFT            0       0       0       0    1120     521     359       0       0       0
+  MOVE            0       0       0       0       0       0    5618      40       0       0
+  LOWER           0       0       0       0       0       0       0    2000       0       0
+  RELEAS          0       0       0       0       0       0       0       0    1642     358
+  VERIFY          0       0       0       0       0       0       0       0       0    2480
+```
+
+- all 10 phases: **19539/30256 = 64.6%**
+- the 5 SCORED buckets: **28697/30256 = 94.8%**
+
+**The gap is one block and it is not a defect.** REACH / REPOSITION / APPROACH are three
+schedule stages of the same motion — the arm descending beside the box — and they are **not
+separable from state**, because the state does not record which schedule segment produced it.
+All three map to `ScoredPhase.GRASP`, so the taxonomy the labels exist for is unaffected. That
+is the whole 8000-tick difference between 64.6% and 94.8%.
+
+**Per-boundary offsets, derived minus truth, in ticks at 25 Hz:**
+
+| boundary | offset | spread |
+|---|---|---|
+| SETTLE | +0 | exact, 40/40 |
+| REACH | −1 | exact, 40/40 |
+| GRASP | +20 | exact, 40/40 |
+| LIFT | +28 | exact, 40/40 |
+| MOVE | −9 | −11..−7 |
+| LOWER | −1 | exact, 40/40 |
+| RELEASE | +0 | exact, 40/40 |
+| VERIFY | −9 | −11..−7 |
+
+Six of the eight are **identical on all 40 seeds**; the other two vary by 4 ticks (160 ms) and
+are consistently EARLY, never sometimes-early-sometimes-late. This is the "consistently late is
+fine, erratic is not" test passing: every boundary has a fixed sign and a spread under 0.2 s.
+GRASP +20 and LIFT +28 are the largest and both are *late* by construction — the weld bit and
+the box height are consequences of the motion, and they change after the demonstrator's schedule
+says the phase did.
+
+**On a teleop recording, with no ground truth** (`recordings/teleop_ep.npz`, the headless
+synthetic fixture, 550 ticks):
+
+```
+SETTLE -> REACH -> GRASP -> LIFT -> MOVE
+```
+
+Monotone, **0 hysteresis corrections**, 4 transitions, no phase entered twice, no oscillation.
+The trailing phases collapse to tick 550 because the fixture grasps and lifts but never
+transports or places — the labeller reporting three empty phases at the end is correct, not a
+failure to detect them. This is the plausibility check the brief asked for and it passes.
+
+### 3. The dataset, and a leak the layout caught in its own data
+
+Layout: `data/raw/train/`, `data/raw/heldout/` (**must stay empty** — that emptiness IS the
+leak check), `data/synthetic/`, `data/eval/`, `data/processed/`. Scripted episodes are staged to
+`data/synthetic/` and never mixed with real data.
+
+**The loader RAISES, it does not warn**, on three things: mixed `SPEC_VERSION`, mixed
+`contact_contract` (D18 — half a dataset in different physics), and a held-out spawn among the
+training episodes. A warning would be read on the day it was written and never again.
+
+**THE FINDING: the seed stream was not partitioned, and 5 of 45 episodes leaked.** Running
+`split` on the staged scripted episodes raised:
+
+```
+DatasetError: 5 accepted training episode(s) spawned inside the HELD-OUT patch:
+seeds [15, 18, 23, 37, 40]
+```
+
+This is the check working, on real recorded data, and it is not a small effect: **11% of the
+recorded set (5/45)**, consistent with the held-out patch's measured **14.25%** area fraction.
+Those episodes came from a contiguous seed stream 0–44 because nothing partitioned it — the
+recorder issued seeds in order and neither it nor the demonstrator has any notion of the
+held-out patch. **A 150-episode collection run would have leaked ~21 episodes into Objective 4,
+and the only thing that would have caught it is an audit run after the collection cost was
+already paid.**
+
+Fixed in the direction CLAUDE.md §8 already specified ("seed streams pre-partitioned before
+collection so leakage is provable, not audited") — the specification existed, the code did not:
+
+- `dataset.partition_seeds()` walks the seed space, classifies each seed by `in_heldout`, and
+  writes three disjoint streams to `data/eval/`: **train** (in-region, for collection),
+  **exp1** (in-region and disjoint from train — D16: Exp 1 uses FRESH seeds, not collection
+  spawns replayed back), **exp2** (the held-out patch). Disjointness is by construction, and
+  tested.
+- `stage` now **quarantines** held-out spawns at the door rather than copying them in. The
+  audit in `split` stays as a second line, but it is no longer the only line.
+
+The 5 leaked episodes were quarantined; 40 of 45 staged.
+
+**The 80/20 split was really 90/10.** Stratification bins the spawn region into a 3x3 grid and
+splits within bins — correct, because the stratifying variable is continuous and 2-D, and a
+random split of 150 episodes leaves the 30 validation episodes clustered in some corner by
+chance. But taking "every 5th episode within a bin" silently drops the fraction: a bin holding 3
+or 4 episodes never reaches index 4 and contributes **no validation episodes at all**. The split
+came out **36/4 = 90/10 wearing an 80/20 label**, and nothing reported it. Replaced with a
+per-bin quota that carries its remainder to the next bin: now exactly **32/8 = 80/20**, and
+**30/150 at the planned collection size**, tested at both.
+
+Two bins get no validation episode at 40 episodes, because 8 cannot cover 9 bins. That is
+arithmetic, not a bug, so it is REPORTED (`bins_without_val`) rather than hidden; at 150
+episodes every bin draws ~3.
+
+**Coverage** against the ledger: 45 accepted, 40 on disk, 5 missing-from-disk (the quarantined
+held-out seeds, accounted for), 0 not-in-ledger, 0 rejected, spawn x [1.4405, 1.5547]
+y [−0.2099, 0.2047], held-out leak **NONE**.
+
+### 4. Normalization — training split only, and the binary dims are fine
+
+`NormStats` fitted on the **32 training episodes only** (24242 ticks). Validation, evaluation
+and synthetic data never enter the statistics; synthetic needs an explicit `--allow-synthetic`
+flag, and which source was used is written INTO the stats file so it cannot be forgotten.
+Saved to `data/processed/norm_stats_v1.npz`, versioned with `SPEC_VERSION`.
+
+- **Masked action dims (6, 13, 14, 15, 16, 18): mean 0 / std 1 exactly.** Verified on reload.
+- **Round trip** normalize -> denormalize after saving and reloading: max |error| **2.22e-16**
+  on both state and action, i.e. one float64 ulp.
+- **Nothing hit `STD_FLOOR`** (1e-6). The smallest unmasked state std is dim 43
+  `q_right_wrist_yaw` at 2.03e-3; the smallest action std is dim 5 `a_left_wrist_pitch` at
+  6.42e-2.
+
+**The binary weld-bit dims (state 28 and 29, D14): normalized like any other dim, deliberately.**
+Checked rather than assumed, because z-scoring a binary dim can be absurd. Here it is not:
+mean **0.347**, std **0.476** — a Bernoulli with p ~ 0.35, which is a real 2.1 sigma separation,
+and z-scoring maps it to exactly two values, **−0.73 released** and **+1.37 welded**. An affine
+map of a two-valued variable is still two-valued: no information is created or destroyed, and
+the weld bit stays exactly as recoverable after normalization as before.
+
+The case where this WOULD be absurd is the one D14 already documents — `pad_qpos` has std 9e-4
+of pure noise, and z-scoring it would amplify noise to unit variance and hand the policy a
+feature made of nothing. The distinguishing question is not "is the dim binary" but "is the
+variance signal". For dims 28/29 it is the grasp itself.
+
+### 5. Validation
+
+- **Scripted gates: 12/12 and 40/40, BYTE-IDENTICAL.** Both result files rewritten this run;
+  `git diff docs/measurements/` is empty. Nothing in this chunk touches `scripted_demo.py`,
+  `spec.py` or the demonstrator's behaviour.
+- Spec tests **43/43**; contact-contract tests **14/14**; new dataset tests **13/13**.
+- Success detection: **40/40** agreement with the demonstrator, **6/6** injected faults caught.
+- Phase labeller: confusion matrix over 40 episodes above; teleop sequence monotone.
+- Loader refusals proved on **deliberately corrupted real .npz files on disk**, not just
+  hand-built metadata dicts — mixed `SPEC_VERSION` and mixed `contact_contract` both raise
+  through `scan()`.
+- Normalization fitted, saved, reloaded, round-tripped.
+
+### For the closeout — do not write it here
+
+1. **Two new deviation rows.** **D19**: the §3.8.2 grasp criterion admits a bulldoze; add the
+   box-near-spawn condition, 50 mm, 26x the healthy maximum. **D20**: the §3.8.2 lift criterion
+   is vacuous read as the box centre (a 0.18 m box at rest is already 0.09 m above the platform);
+   score the box BOTTOM. Both affect chapter 3.8 and both belong in the results as *criteria
+   that could not fail as written*.
+2. **A §9 entry is arguable** for "inventing a threshold instead of measuring the healthy
+   population" — it cost two wrong numbers in one session (`settled_speed` 0.05, and three
+   rounds of labeller tuning) and both were fixed by measuring.
+3. **The leak is a §8 decision entry**, not just a bug: collection cannot start from an
+   unpartitioned seed stream, and `data/eval/{train,exp1,exp2}_seeds.json` now exist so it does
+   not have to.
+4. **O-issue candidate:** the per-tick phase agreement of 64.6% will be quoted somewhere, and
+   the honest figure for the taxonomy is **94.8%** — the difference is entirely REACH /
+   REPOSITION / APPROACH, which no state-based labeller can separate. State which one is being
+   quoted and why.

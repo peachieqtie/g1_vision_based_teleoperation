@@ -287,3 +287,60 @@ class ScriptedRecorder:
         if extra:
             m.update(extra)
         return m
+
+
+class TeleopRecorder(ScriptedRecorder):
+    """The same recorder, attached to `run_integrated_combined.main` instead.
+
+    Teleop episodes have NO ground-truth phase column - the operator does not run
+    a phase machine - so `phase_labels` is written as `Phase.UNKNOWN` and the
+    labels are derived offline by `g1_data.phase_label`. That is the whole reason
+    the labeller is offline (2026-09-08).
+
+    The velocity command logged is `active_cmd`: the command actually fed to the
+    locomotion policy after the station-keeping and heading hold, not the raw key
+    state. While the base lock is engaged `build_action` zeroes it anyway (D17).
+    `reset_episode` is not wrapped: that entry point does not call it, so there is
+    no reset fingerprint to capture and the field is left empty rather than faked.
+    """
+
+    FRAME = "main"
+
+    def __enter__(self) -> "TeleopRecorder":
+        self._real_step = mujoco.mj_step
+        rec = self
+
+        def step_wrapper(m, d, *a, **k):
+            f = sys._getframe(1)
+            if f.f_code.co_name == rec.FRAME:
+                rec._observe_teleop(m, d, f.f_locals)
+            return rec._real_step(m, d, *a, **k)
+
+        mujoco.mj_step = step_wrapper
+        return self
+
+    def __exit__(self, *exc) -> None:
+        mujoco.mj_step = self._real_step
+
+    def _observe_teleop(self, m, d, L: dict) -> None:
+        ix = L.get("ix")
+        if ix is None or "weld" not in L:
+            return
+        i = int(L.get("counter", 0))
+        shim = dict(L)
+        shim["i"] = i
+        shim["ix"] = ix
+        shim["cmd"] = float(L.get("grasp_cmd", 0.0))
+        shim["act"] = L.get("active_cmd")
+        shim["phase"] = int(spec.Phase.UNKNOWN)
+        shim["carry"] = _GaitClock(i)
+        shim["cfg"] = L.get("cfg")
+        self._observe(m, d, shim)
+
+
+class _GaitClock:
+    """`carry.counter` is all `_observe` wants from the demonstrator's carryover;
+    the teleop loop keeps the same clock in its own `counter`."""
+
+    def __init__(self, counter: int):
+        self.counter = counter
