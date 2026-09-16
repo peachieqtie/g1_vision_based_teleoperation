@@ -181,6 +181,61 @@ def test_real_files_on_disk_are_refused_when_mixed():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ─── the provenance and velocity guards (decision audit, 2026-09-16) ──────────
+def test_every_registered_source_declares_whether_it_is_real():
+    from g1_data import recorder as REC
+    assert REC.SOURCES, "the registry must not be empty"
+    for src, info in REC.SOURCES.items():
+        assert isinstance(src, str) and src
+        assert set(info) == {"label", "real"}, info
+        assert isinstance(info["real"], bool)
+    # Neither entry point that exists today produces real demonstrations, so
+    # nothing can currently route into data/raw/train. That is correct: no human
+    # demonstration has been collected yet.
+    assert not any(i["real"] for i in REC.SOURCES.values())
+
+
+def test_unknown_source_is_refused_not_guessed():
+    from g1_data import recorder as REC
+    e = _raises(REC.UnknownSource, REC.source_info, "brand_new_tool.py",
+                where="ep_seed0007.npz")
+    assert "brand_new_tool.py" in str(e) and "ep_seed0007.npz" in str(e)
+    _raises(REC.UnknownSource, REC.source_info, None)
+    _raises(REC.UnknownSource, REC.label_of, "")
+
+
+def test_label_is_derived_from_source():
+    from g1_data import recorder as REC
+    assert REC.label_of(REC.SOURCE_SCRIPTED) == "scripted"
+    assert REC.label_of(REC.SOURCE_TELEOP_FIXTURE) == "teleop-fixture"
+
+
+def test_velocity_guard_refuses_an_out_of_clip_command():
+    """The D15 guard the recorder now calls on every tick."""
+    rail = np.array([0.80, 0.80, 0.60], dtype=np.float32).astype(np.float64)
+    spec.assert_velocity_within_clip(rail)                    # must not raise
+    for dim, over in ((0, [0.81, 0.0, 0.0]), (1, [0.0, 0.81, 0.0]),
+                      (2, [0.0, 0.0, 0.61])):
+        e = _raises(AssertionError, spec.assert_velocity_within_clip,
+                    np.asarray(over), where="tick 42")
+        assert "tick 42" in str(e)
+
+
+def test_staged_episodes_all_pass_both_guards():
+    """The guards must be no-ops on the data already collected."""
+    from g1_data import recorder as REC
+    eps = DS.scan(DS.SYNTHETIC)
+    if not eps:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    for e in eps:
+        REC.source_info(e.meta.get("source"), where=os.path.basename(e.path))
+        arrays, _ = e.load()
+        spec.assert_velocity_within_clip(
+            np.asarray(arrays["actions"][:, spec.VEL_A], dtype=np.float64),
+            where=os.path.basename(e.path))
+
+
 def _tests():
     return [(n, f) for n, f in sorted(globals().items())
             if n.startswith("test_") and callable(f)]

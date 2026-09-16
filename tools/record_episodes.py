@@ -44,7 +44,7 @@ sys.path.insert(0, ROOT)
 
 from g1_data import spec
 from g1_data.ledger import EpisodeLedger, seed_stream
-from g1_data.recorder import ScriptedRecorder
+from g1_data.recorder import SOURCE_SCRIPTED, ScriptedRecorder, label_of
 from g1_teleop.config import TeleopConfig
 
 OUT_DIR = os.path.join(ROOT, "recordings", "episodes")
@@ -151,13 +151,19 @@ def cmd_record(a):
     if not pending:
         print("nothing pending: every seed in the stream already has an ACCEPT")
         return 0
-    ledger.append("session", label=a.label, seeds=pending, auto=a.auto,
+    # A2: DERIVED, not operator-supplied. This tool drives the scripted
+    # demonstrator and nothing else, so its source string is known here and the
+    # ledger label follows from it. The old `--label` defaulted to "scripted",
+    # which meant a piloted episode recorded without the flag was labelled
+    # scripted - a provenance field that is wrong by default is worse than none.
+    label = label_of(SOURCE_SCRIPTED, where="record_episodes")
+    ledger.append("session", label=label, seeds=pending, auto=a.auto,
                   spec_version=spec.SPEC_VERSION)
-    print("session %r: %d seed(s) pending -> %s" % (a.label, len(pending), pending))
+    print("session %r: %d seed(s) pending -> %s" % (label, len(pending), pending))
     accepted = 0
     for seed in pending:
         while True:
-            ledger.append("issue", seed=seed, label=a.label)
+            ledger.append("issue", seed=seed, label=label)
             print("\n=== seed %d ===" % seed)
             t0 = time.perf_counter()
             try:
@@ -168,7 +174,7 @@ def cmd_record(a):
                 break
             # The model the episode ran on is the one the recorder saw.
             meta = rec.metadata(rec.model, result, cfg, demo, seed,
-                                extra=dict(label=a.label,
+                                extra=dict(label=label,
                                            wall_seconds_total=time.perf_counter() - t0))
             rows, recommend = verdict(meta)
             print_verdict(meta, rows, recommend)
@@ -177,7 +183,7 @@ def cmd_record(a):
                 path = os.path.join(a.out, "ep_seed%04d.npz" % seed)
                 rec.buf.save(path, meta)
                 ledger.append("accept", seed=seed, path=os.path.relpath(path, ROOT),
-                              heldout=meta["heldout"], label=a.label,
+                              heldout=meta["heldout"], label=label,
                               checks={n: ok for n, ok, _ in rows},
                               placement_error=meta["outcome"]["placement_error"])
                 print("  ACCEPTED -> %s (%.0f KB)"
@@ -186,7 +192,7 @@ def cmd_record(a):
                 break
             if choice == "discard":
                 reason = ", ".join(n for n, ok, _ in rows if not ok) or "operator"
-                ledger.append("discard", seed=seed, reason=reason, label=a.label,
+                ledger.append("discard", seed=seed, reason=reason, label=label,
                               checks={n: ok for n, ok, _ in rows})
                 print("  DISCARDED (%s) - nothing written" % reason)
                 break
@@ -216,7 +222,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--count", type=int, default=1)
-    ap.add_argument("--label", default="scripted")
+    # No --label: it is derived from the recorder-set source (A2). An operator
+    # flag that defaults to a provenance claim is a field that lies quietly.
     ap.add_argument("--seeds", default=None, help="JSON file of the pre-partitioned stream")
     ap.add_argument("--start-seed", type=int, default=0)
     ap.add_argument("--out", default=OUT_DIR)

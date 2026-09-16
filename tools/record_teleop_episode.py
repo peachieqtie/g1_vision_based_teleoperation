@@ -21,7 +21,18 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from g1_data.recorder import TeleopRecorder
+from g1_data import spec
+from g1_data.ledger import EpisodeLedger
+from g1_data.recorder import SOURCE_TELEOP_FIXTURE, TeleopRecorder, label_of
+
+
+def _rel(path: str) -> str:
+    """Repo-relative like the scripted ledger writes, absolute if that is not
+    expressible - `--out` may legitimately sit on another drive."""
+    try:
+        return os.path.relpath(path, ROOT)
+    except ValueError:
+        return os.path.abspath(path)
 
 
 def main():
@@ -31,7 +42,22 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--standoff", type=float, default=0.32)
     ap.add_argument("--out", default=os.path.join(ROOT, "recordings", "teleop_ep.npz"))
+    ap.add_argument("--ledger", default=None,
+                    help="ledger to append to; defaults to one beside --out")
     a = ap.parse_args()
+
+    # A3: the ledger, in the SAME schema the scripted recorder writes. Before
+    # this, a piloted episode left no ledger row at all, so `coverage` could not
+    # see it and nothing recorded that the session had happened. The field names
+    # below are copied from tools/record_episodes.py, not invented: session
+    # (label, seeds, auto, spec_version), issue (seed, label), accept (seed,
+    # path, heldout, label, checks, placement_error).
+    label = label_of(SOURCE_TELEOP_FIXTURE, where="record_teleop_episode")
+    ledger = EpisodeLedger(a.ledger or os.path.join(
+        os.path.dirname(os.path.abspath(a.out)), "ledger.jsonl"))
+    ledger.append("session", label=label, seeds=[a.seed], auto="pass",
+                  spec_version=spec.SPEC_VERSION)
+    ledger.append("issue", seed=a.seed, label=label)
 
     import run_integrated_combined as RIC
     argv = ["run_integrated_combined.py", "keyboard", str(a.seed), "--synthetic",
@@ -49,6 +75,7 @@ def main():
         sys.argv = old
 
     if rec.buf is None or not len(rec.buf):
+        ledger.append("error", seed=a.seed, reason="no ticks recorded")
         raise SystemExit("nothing was recorded - did the loop run?")
     meta = dict(
         seed=a.seed, source="run_integrated_combined --synthetic grasp",
@@ -62,8 +89,18 @@ def main():
                                     fromlist=["contract_of"]).contract_of(rec.model),
         note="teleop: phase_labels are UNKNOWN by construction - derive them offline")
     rec.buf.save(a.out, meta)
+    # `checks` mirrors the scripted recorder's shape (name -> bool). The fixture
+    # runs no placement, so `placement_error` is null rather than a number that
+    # would read as a measured 0.0 m placement.
+    ledger.append("accept", seed=a.seed, path=_rel(a.out),
+                  heldout=bool(meta["heldout"]), label=label,
+                  checks={"weld fired": rec.weld_engage_tick >= 0,
+                          "ticks recorded": len(rec.buf) > 0},
+                  placement_error=None)
     print("saved %s: %d ticks, weld tick %s, lock tick %s"
           % (a.out, len(rec.buf), rec.weld_engage_tick, rec.lock_engage_tick))
+    print("ledger %s: session/issue/accept appended, label %r"
+          % (ledger.path, label))
 
 
 if __name__ == "__main__":

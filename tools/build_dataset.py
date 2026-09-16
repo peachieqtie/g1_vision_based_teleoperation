@@ -31,6 +31,7 @@ sys.path.insert(0, ROOT)
 
 from g1_data import dataset as DS
 from g1_data import phase_label as PL
+from g1_data import recorder as REC
 from g1_data import spec
 from g1_data import success as SU
 from g1_data.ledger import EpisodeLedger
@@ -54,34 +55,58 @@ def cmd_layout(a):
 
 
 def cmd_stage(a):
-    """Stage, EXCLUDING held-out spawns at the door.
+    """Stage, routing on `meta["source"]` and EXCLUDING held-out spawns.
 
-    The exclusion belongs here and not only in `split`: `assert_no_leak` is an
-    audit, and an audit that fires after a 150-episode collection run has already
-    cost the collection. Seeds 0-44 were recorded before the partitioner existed
-    and 5 of them spawn in the held-out patch; those are quarantined, not copied.
+    TWO doors, and both were open before:
+
+    1. PROVENANCE. The destination used to come from the operator's
+       `--synthetic` flag, so forgetting it put scripted episodes into the
+       training set. It now comes from `recorder.SOURCES`, which is keyed on a
+       field the RECORDER writes. An episode whose source is not registered is
+       REFUSED, not routed on a guess - an unknown source is an entry point
+       nobody declared, so nothing here knows whether it is a demonstration.
+
+    2. HELD-OUT SPAWN. `assert_no_leak` is an audit, and an audit that fires
+       after a 150-episode run has already cost the collection. Seeds 0-44 were
+       recorded before the partitioner existed and 5 spawn in the held-out
+       patch; those are quarantined here, at the door.
     """
     DS.ensure_layout()
-    dst = DS.SYNTHETIC if a.synthetic else DS.RAW_TRAIN
-    n, held = 0, []
+    n, held, by_dst = 0, [], {}
     for f in sorted(os.listdir(a.source)):
         if not f.endswith(".npz"):
             continue
         src = os.path.join(a.source, f)
-        ep = DS.Episode(src, DS.read_meta(src))
+        meta = DS.read_meta(src)
+        # Raises UnknownSource, naming the file and the source string.
+        info = REC.source_info(meta.get("source"), where=f)
+        dst = DS.RAW_TRAIN if info["real"] else DS.SYNTHETIC
+        ep = DS.Episode(src, meta)
         if DS.heldout_leak([ep]):
             held.append(ep.seed)
             continue
         shutil.copy2(src, os.path.join(dst, f))
+        by_dst.setdefault(dst, []).append(info["label"])
         n += 1
-    print("staged %d episode(s) -> %s" % (n, os.path.relpath(dst, ROOT)))
+    print("staged %d episode(s), routed by meta[\"source\"]:" % n)
+    for dst, labels in sorted(by_dst.items()):
+        counts = {L: labels.count(L) for L in sorted(set(labels))}
+        print("  %-20s %s" % (os.path.relpath(dst, ROOT), counts))
+    if a.synthetic and DS.RAW_TRAIN in by_dst:
+        raise SystemExit(
+            "--synthetic was passed but %d episode(s) are registered as REAL "
+            "demonstrations and went to data/raw/train. The flag does not "
+            "route any more; fix the invocation or the registry."
+            % len(by_dst[DS.RAW_TRAIN]))
     if held:
         print("  QUARANTINED %d episode(s) whose spawn is in the HELD-OUT patch: "
               "seeds %s" % (len(held), held))
         print("  they were recorded from an unpartitioned seed stream; "
               "`partition` now prevents this before collection, not after.")
-    eps = DS.scan(dst)
-    print("uniform spec version and contact contract: %d episode(s) pass" % len(eps))
+    for dst in sorted(by_dst):
+        eps = DS.scan(dst)
+        print("uniform spec version and contact contract: %d episode(s) pass in %s"
+              % (len(eps), os.path.relpath(dst, ROOT)))
     return 0
 
 

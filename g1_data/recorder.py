@@ -56,6 +56,52 @@ from g1_teleop.indices import ModelIndex
 TICK = spec.PHYSICS_STEPS_PER_TICK
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# ─── the source registry ──────────────────────────────────────────────────────
+# `meta["source"]` is written by the recorder, not by an operator flag, so it is
+# the only provenance field that cannot be got wrong by forgetting an argument.
+# Every entry point that can produce an episode is registered here with the
+# label the ledger should carry and whether its episodes are REAL demonstrations.
+#
+# `real=False` is not a judgement about quality - it means no human produced the
+# trajectory, so the episode is not a demonstration of the task being learned and
+# must never reach a training split. The scripted demonstrator and the headless
+# synthetic teleop fixture are both in that class.
+#
+# An unregistered source is a new entry point that nobody declared. Staging
+# REFUSES it rather than guessing: guessing wrong routes non-demonstration data
+# into training, which is the failure this registry exists to prevent.
+SOURCE_SCRIPTED = "scripted_demo.run_episode"
+SOURCE_TELEOP_FIXTURE = "run_integrated_combined --synthetic grasp"
+
+SOURCES = {
+    SOURCE_SCRIPTED:       dict(label="scripted", real=False),
+    SOURCE_TELEOP_FIXTURE: dict(label="teleop-fixture", real=False),
+}
+
+
+class UnknownSource(ValueError):
+    """An episode whose `meta["source"]` is not in `SOURCES`."""
+
+
+def source_info(source: Optional[str], where: str = "") -> dict:
+    """The registry row for `source`, or raise. Never returns a default."""
+    if source in SOURCES:
+        return SOURCES[source]
+    raise UnknownSource(
+        "unregistered episode source %r%s.\n"
+        "  registered: %s\n"
+        "  An unrecognised source is an entry point that was never declared, "
+        "so nothing here knows whether its episodes are real demonstrations. "
+        "Add it to g1_data.recorder.SOURCES with the correct `real` flag "
+        "rather than letting it be routed on a guess."
+        % (source, " in " + where if where else "",
+           ", ".join(sorted(map(repr, SOURCES)))))
+
+
+def label_of(source: str, where: str = "") -> str:
+    """The ledger label, DERIVED from the recorder-set source (A2)."""
+    return source_info(source, where)["label"]
+
 
 def _git_commit() -> str:
     try:
@@ -85,6 +131,15 @@ class EpisodeBuffer:
              step_index: int, dt: float, gait_period: float) -> None:
         """One recorded tick. Call at `mj_step` entry, never after it."""
         s, a = self.sp.build(model, data, self.ix, act=act, cmd=cmd, sync=True)
+        # D15, at the moment it would be written. ASSERT, never clip: clipping
+        # here would make the recorded action differ from the command that
+        # actually drove the robot, so the state/action pair would stop being a
+        # record of what happened - and it would hide the one condition worth
+        # seeing. The limits are the demonstrator's own `hold_max` /
+        # `hold_max_yaw`, so a violation means a NEW command path is writing
+        # velocities, which is a recorder-level fact, not a tuning question.
+        spec.assert_velocity_within_clip(
+            a[spec.VEL_A], where="recorded tick %d" % len(self.states))
         self.states.append(s)
         self.actions.append(a)
         self.phases.append(int(phase_label))
@@ -281,7 +336,7 @@ class ScriptedRecorder:
             reset_fingerprint=self.reset_fingerprint,
             contact_contract=contract_of(model),
             lock_predicate=bool(demo.lock_predicate),
-            source="scripted_demo.run_episode",
+            source=SOURCE_SCRIPTED,
             n_ticks=len(self.buf),
         )
         if extra:
