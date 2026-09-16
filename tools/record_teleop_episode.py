@@ -23,7 +23,8 @@ sys.path.insert(0, ROOT)
 
 from g1_data import spec
 from g1_data.ledger import EpisodeLedger
-from g1_data.recorder import SOURCE_TELEOP_FIXTURE, TeleopRecorder, label_of
+from g1_data.recorder import (SOURCE_TELEOP_FIXTURE, TeleopRecorder,
+                             assert_namespace, label_of, ledger_for)
 
 
 def _rel(path: str) -> str:
@@ -42,8 +43,6 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--standoff", type=float, default=0.32)
     ap.add_argument("--out", default=os.path.join(ROOT, "recordings", "teleop_ep.npz"))
-    ap.add_argument("--ledger", default=None,
-                    help="ledger to append to; defaults to one beside --out")
     a = ap.parse_args()
 
     # A3: the ledger, in the SAME schema the scripted recorder writes. Before
@@ -53,8 +52,10 @@ def main():
     # (label, seeds, auto, spec_version), issue (seed, label), accept (seed,
     # path, heldout, label, checks, placement_error).
     label = label_of(SOURCE_TELEOP_FIXTURE, where="record_teleop_episode")
-    ledger = EpisodeLedger(a.ledger or os.path.join(
-        os.path.dirname(os.path.abspath(a.out)), "ledger.jsonl"))
+    # A2: derived from --out, never a separate argument (see recorder.ledger_for).
+    assert_namespace(os.path.dirname(os.path.abspath(a.out)),
+                     SOURCE_TELEOP_FIXTURE, where="record_teleop_episode --out")
+    ledger = EpisodeLedger(ledger_for(os.path.dirname(os.path.abspath(a.out))))
     ledger.append("session", label=label, seeds=[a.seed], auto="pass",
                   spec_version=spec.SPEC_VERSION)
     ledger.append("issue", seed=a.seed, label=label)

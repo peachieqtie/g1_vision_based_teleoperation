@@ -236,6 +236,58 @@ def test_staged_episodes_all_pass_both_guards():
             where=os.path.basename(e.path))
 
 
+def test_namespaces_are_separate_and_each_owns_its_ledger():
+    from g1_data import recorder as REC
+    assert REC.NS_SCRIPTED != REC.NS_COLLECTION
+    assert REC.NAMESPACES[REC.NS_SCRIPTED]["real"] is False
+    assert REC.NAMESPACES[REC.NS_COLLECTION]["real"] is True
+    # The ledger is derived from the directory, so the two can never be paired
+    # wrongly - that pairing is what silently skipped 40 of 200 training seeds.
+    assert REC.ledger_for(REC.NS_SCRIPTED) != REC.ledger_for(REC.NS_COLLECTION)
+    for ns in (REC.NS_SCRIPTED, REC.NS_COLLECTION):
+        assert os.path.dirname(REC.ledger_for(ns)) == os.path.abspath(ns)
+
+
+def test_scripted_source_refused_in_the_collection_namespace():
+    from g1_data import recorder as REC
+    e = _raises(REC.NamespaceMismatch, REC.assert_namespace,
+                REC.NS_COLLECTION, REC.SOURCE_SCRIPTED)
+    assert "demonstrations" in str(e) and REC.SOURCE_SCRIPTED in str(e)
+    # and the reverse: a real demonstration may not land in the scripted tree
+    REC.SOURCES["__test_real__"] = dict(label="test-real", real=True)
+    try:
+        e = _raises(REC.NamespaceMismatch, REC.assert_namespace,
+                    REC.NS_SCRIPTED, "__test_real__")
+        assert "episodes" in str(e)
+    finally:
+        del REC.SOURCES["__test_real__"]
+
+
+def test_unregistered_directory_is_allowed():
+    """Ad-hoc output dirs are fine: staging routes on source, so an
+    unregistered directory cannot smuggle anything into a training split."""
+    from g1_data import recorder as REC
+    assert REC.namespace_info(tempfile.gettempdir()) is None
+    REC.assert_namespace(tempfile.gettempdir(), REC.SOURCE_SCRIPTED)
+
+
+def test_collection_ledger_does_not_inherit_the_scripted_accepts():
+    """The A4 failure case, as a test."""
+    from g1_data.ledger import EpisodeLedger
+    tmp = tempfile.mkdtemp()
+    try:
+        old = EpisodeLedger(os.path.join(tmp, "scripted", "ledger.jsonl"))
+        for seed in range(5):
+            old.append("accept", seed=seed, path="x.npz", heldout=False,
+                       label="scripted", checks={}, placement_error=0.0)
+        new = EpisodeLedger(os.path.join(tmp, "demonstrations", "ledger.jsonl"))
+        stream = list(range(8))
+        assert old.pending(stream) == [5, 6, 7], "shared ledger skips 0-4"
+        assert new.pending(stream) == stream, "separate ledger issues every seed"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _tests():
     return [(n, f) for n, f in sorted(globals().items())
             if n.startswith("test_") and callable(f)]

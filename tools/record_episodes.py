@@ -44,10 +44,16 @@ sys.path.insert(0, ROOT)
 
 from g1_data import spec
 from g1_data.ledger import EpisodeLedger, seed_stream
-from g1_data.recorder import SOURCE_SCRIPTED, ScriptedRecorder, label_of
+from g1_data.recorder import (NS_COLLECTION, NS_SCRIPTED, SOURCE_SCRIPTED,
+                             ScriptedRecorder, assert_namespace, label_of,
+                             ledger_for)
 from g1_teleop.config import TeleopConfig
 
-OUT_DIR = os.path.join(ROOT, "recordings", "episodes")
+# A1: the destination is a named constant in the recorder registry, not a
+# string typed at the command line. NS_COLLECTION is the real collection's
+# namespace; this tool drives the scripted demonstrator and may not write
+# there (A3), which `assert_namespace` enforces below.
+OUT_DIR = NS_SCRIPTED
 
 # ---- rejection checks. (label, provenance, predicate, formatter) ------------
 # Measured envelopes over the 40-seed predicate gate (docs/measurements/
@@ -140,7 +146,9 @@ def cmd_invariance(a):
 
 
 def cmd_record(a):
-    ledger = EpisodeLedger(a.ledger)
+    # A3: the scripted demonstrator may not write into the collection namespace.
+    assert_namespace(a.out, SOURCE_SCRIPTED, where="record_episodes --out")
+    ledger = EpisodeLedger(ledger_for(a.out))
     if a.ledger_summary:
         s = ledger.summary()
         print("\n".join("%-18s %s" % (k, v) for k, v in s.items()))
@@ -226,8 +234,12 @@ def main():
     # flag that defaults to a provenance claim is a field that lies quietly.
     ap.add_argument("--seeds", default=None, help="JSON file of the pre-partitioned stream")
     ap.add_argument("--start-seed", type=int, default=0)
-    ap.add_argument("--out", default=OUT_DIR)
-    ap.add_argument("--ledger", default=os.path.join(OUT_DIR, "ledger.jsonl"))
+    # A2: ONE argument. The ledger is DERIVED from the output directory and is
+    # not separately settable - an operator who can pair the new directory with
+    # the old ledger eventually will, and that pairing silently skips every
+    # seed the old ledger already accepted.
+    ap.add_argument("--out", default=OUT_DIR,
+                    help="output namespace; its ledger is %s inside it" % "ledger.jsonl")
     ap.add_argument("--ledger-summary", action="store_true")
     ap.add_argument("--auto", choices=("pass", "all", "off"), default="off",
                     help="pass: accept when every check passes (unattended runs)")

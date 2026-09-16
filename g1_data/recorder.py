@@ -79,6 +79,63 @@ SOURCES = {
 }
 
 
+# ─── the recording namespaces ─────────────────────────────────────────────────
+# A namespace is a directory AND the ledger that belongs to it. They are one
+# thing, never two arguments, because `EpisodeLedger.pending` skips any seed
+# that already has an ACCEPT row: point the real collection at the scripted
+# ledger and it silently skips seeds 0-44 - 40 of the 200 partitioned training
+# seeds - with no warning, because skipping accepted seeds is the intended
+# resume behaviour. A separate directory alone does NOT fix that; only a
+# separate ledger does. Measured 2026-09-16, hence this registry.
+LEDGER_NAME = "ledger.jsonl"
+NS_SCRIPTED = os.path.join(ROOT, "recordings", "episodes")
+NS_COLLECTION = os.path.join(ROOT, "recordings", "demonstrations")
+
+NAMESPACES = {
+    NS_SCRIPTED:   dict(real=False, what="scripted-demonstrator episodes"),
+    NS_COLLECTION: dict(real=True,  what="real teleoperated demonstrations"),
+}
+
+
+def ledger_for(directory: str) -> str:
+    """The ledger that BELONGS to an output directory. Never a free argument."""
+    return os.path.join(os.path.abspath(directory), LEDGER_NAME)
+
+
+def namespace_info(directory: str) -> Optional[dict]:
+    """The registry row for a directory, or None if it is not a declared
+    namespace. Ad-hoc directories are allowed - staging routes on source, so an
+    unregistered directory cannot smuggle anything into a training split."""
+    d = os.path.abspath(directory)
+    for path, info in NAMESPACES.items():
+        if os.path.abspath(path) == d:
+            return info
+    return None
+
+
+class NamespaceMismatch(ValueError):
+    """A source writing into a namespace declared for the other kind."""
+
+
+def assert_namespace(directory: str, source: str, where: str = "") -> None:
+    """Refuse a writer whose source does not belong in this namespace."""
+    ns = namespace_info(directory)
+    if ns is None:
+        return
+    src = source_info(source, where)
+    if bool(ns["real"]) != bool(src["real"]):
+        raise NamespaceMismatch(
+            "refusing to write %s into %s.\n"
+            "  directory holds : %s\n"
+            "  this source is  : %r (real demonstrations: %s)\n"
+            "  The two namespaces are separate so that a real collection cannot "
+            "inherit the scripted ledger, which would silently skip every seed "
+            "already accepted there. Write to %s instead."
+            % ("a real demonstration" if src["real"] else "scripted output",
+               os.path.relpath(directory, ROOT), ns["what"], source, src["real"],
+               os.path.relpath(NS_COLLECTION if src["real"] else NS_SCRIPTED, ROOT)))
+
+
 class UnknownSource(ValueError):
     """An episode whose `meta["source"]` is not in `SOURCES`."""
 
