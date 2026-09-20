@@ -1,4 +1,4 @@
-"""The policies. Stage 2 has exactly one: BC, the floor baseline.
+"""The policies. Stage 3 has ONE class: BC at K=1, chunked BC at K>1.
 
 =============================================================================
 EVERY HYPERPARAMETER IN THIS FILE IS PROVISIONAL. NONE OF IT IS TUNED.
@@ -41,6 +41,8 @@ of that contract, not a different interface: it flattens the window and emits on
 timestep. It predicts all 22 dims, including the 6 constant ones - the loss masks
 them, and having the head emit 22 keeps the action vector one shape everywhere,
 so nothing downstream has to know which 16 were trained.
+
+Chunked BC is the SAME class at K>1. See `BCPolicy` for why that matters.
 """
 from __future__ import annotations
 
@@ -61,13 +63,33 @@ PROVISIONAL = (
     "piloted data exists; no result obtained with them may be cited as tuned."
 )
 
+#: The chunk length used for Stage 3 plumbing. PROVISIONAL, and NOT SWEPT.
+#: 100 ticks is 4.0 s at the 25 Hz record rate (D4) and is the value ACT uses in
+#: the original paper, which is the only reason it was picked: it is an ordinary
+#: number from the literature rather than a measurement on this task. Episodes
+#: here run 694-846 ticks, so it covers roughly an eighth of one. The right K
+#: depends on how long a piloted operator's intent stays coherent, which cannot
+#: be measured on a scripted demonstrator that never changes its mind. SETTLE IT
+#: ON PILOTED DATA.
+K_PROVISIONAL: int = 100
+
 
 @dataclass(frozen=True)
 class BCConfig:
-    """Every hyperparameter of the BC policy, in one place. See PROVISIONAL."""
+    """Every hyperparameter of the BC policy, in one place. See PROVISIONAL.
 
-    obs_window: int = 1          # BC is single-step by definition (C1)
-    chunk_size: int = 1          # one action out
+    `obs_window` AND `chunk_size` ARE REQUIRED, with no defaults, for the same
+    reason `LoaderConfig` requires them: K is what separates BC from chunked BC,
+    and a default would make one of the two the normal case and the other an
+    opt-in. Stage 3 exists to isolate the effect of K, which it cannot do if K
+    can be inherited silently.
+
+    K_PROVISIONAL below is the value used for plumbing. It is NOT tuned and was
+    NOT swept - see PROVISIONAL - and it must be settled on piloted data.
+    """
+
+    obs_window: int              # required (C3)
+    chunk_size: int              # required (C3): 1 = BC, >1 = chunked BC
     hidden: Tuple[int, ...] = (512, 512)   # ordinary 2x512 MLP
     activation: str = "relu"
     dropout: float = 0.0         # the overfit-10 gate must NOT be regularized
@@ -91,30 +113,40 @@ _ACT = dict(relu=nn.ReLU, gelu=nn.GELU, tanh=nn.Tanh, silu=nn.SiLU)
 
 
 class BCPolicy(nn.Module):
-    """Single-step behavioural cloning: one observation in, ONE action out.
+    """Behavioural cloning: one observation in, K actions out.
 
-    The flattened observation window goes through an MLP to 22 action dims. No
-    memory, no chunk, no attention - see the module docstring.
+    K=1 IS BC. K>1 IS CHUNKED BC. THEY ARE THE SAME CLASS, DELIBERATELY.
+
+    Stage 2 refused `chunk_size > 1` here, so that chunked BC would have to be
+    written as its own class. That was wrong, and lifting it is the whole point
+    of Stage 3: if chunked BC were a separate class, the measured effect of
+    chunking would include every incidental difference between two
+    implementations - a different initialization, a different head, a different
+    anything - and the isolation this stage exists to provide would be gone.
+    The ONLY difference between the two conditions is now the number of actions
+    predicted from one observation, which is the variable under study.
+
+    The head emits K x 22 and reshapes. No temporal ensembling (C2): that is an
+    ACT mechanism and belongs to Stage 4, and mixing it in here would mean Stage
+    3 measured chunking-plus-ensembling. At deployment take `first_action`.
     """
 
-    def __init__(self, obs_window: int = 1, chunk_size: int = 1,
+    def __init__(self, obs_window: int, chunk_size: int,
                  hidden: Tuple[int, ...] = (512, 512), activation: str = "relu",
                  dropout: float = 0.0, layer_norm: bool = False):
         super().__init__()
-        if int(chunk_size) != 1:
-            raise ValueError(
-                "BCPolicy is single-step by definition (C1): chunk_size must be "
-                "1, got %r. Chunked BC is a separate stage and must not be got "
-                "by passing a bigger K to this class - the whole point of the "
-                "BC/chunked-BC comparison is that they are different models."
-                % (chunk_size,))
+        if int(chunk_size) < 1:
+            raise ValueError("chunk_size must be >= 1, got %r" % (chunk_size,))
+        if int(obs_window) < 1:
+            raise ValueError("obs_window must be >= 1, got %r" % (obs_window,))
         if activation not in _ACT:
             raise ValueError("unknown activation %r (have %s)"
                              % (activation, ", ".join(sorted(_ACT))))
         self.obs_window = int(obs_window)
-        self.chunk_size = 1
+        self.chunk_size = int(chunk_size)
         #: Everything needed to rebuild this module from a checkpoint alone.
-        self.hparams = dict(obs_window=int(obs_window), chunk_size=1,
+        self.hparams = dict(obs_window=int(obs_window),
+                            chunk_size=int(chunk_size),
                             hidden=tuple(hidden), activation=activation,
                             dropout=float(dropout), layer_norm=bool(layer_norm))
 
@@ -128,11 +160,11 @@ class BCPolicy(nn.Module):
             if dropout:
                 layers.append(nn.Dropout(float(dropout)))
             d = h
-        layers.append(nn.Linear(d, spec.ACTION_DIM))
+        layers.append(nn.Linear(d, self.chunk_size * spec.ACTION_DIM))
         self.net = nn.Sequential(*layers)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """(B, W_o, 47) -> (B, 1, 22)."""
+        """(B, W_o, 47) -> (B, K, 22)."""
         if obs.dim() != 3 or obs.shape[-1] != spec.STATE_DIM:
             raise ValueError("obs must be (B, W_o, %d), got %s"
                              % (spec.STATE_DIM, tuple(obs.shape)))
@@ -143,7 +175,23 @@ class BCPolicy(nn.Module):
                 "can see, which is the thing the ACT/ACT-LSTM comparison is "
                 "about." % (self.obs_window, obs.shape[1]))
         B = obs.shape[0]
-        return self.net(obs.reshape(B, -1)).view(B, 1, spec.ACTION_DIM)
+        return self.net(obs.reshape(B, -1)).view(B, self.chunk_size,
+                                                 spec.ACTION_DIM)
+
+
+def first_action(pred: torch.Tensor) -> torch.Tensor:
+    """The action a chunked policy ACTUALLY executes: the chunk's first step.
+
+    (B, K, 22) -> (B, 22). No temporal ensembling (C2). ACT averages overlapping
+    chunk predictions across timesteps, which is a real mechanism with a real
+    effect, and folding it in here would mean Stage 3 measured chunking AND
+    ensembling and could not say which contributed. Stage 4 adds it; until then
+    a chunked policy commits to its first prediction and re-plans next tick.
+    """
+    if pred.dim() != 3 or pred.shape[-1] != spec.ACTION_DIM:
+        raise ValueError("expected (B, K, %d), got %s"
+                         % (spec.ACTION_DIM, tuple(pred.shape)))
+    return pred[:, 0, :]
 
 
 def build_bc(cfg: BCConfig = None, **kw) -> BCPolicy:

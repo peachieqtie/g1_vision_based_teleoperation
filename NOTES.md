@@ -6066,3 +6066,204 @@ variance signal". For dims 28/29 it is the grasp itself.
    the honest figure for the taxonomy is **94.8%** — the difference is entirely REACH /
    REPOSITION / APPROACH, which no state-based labeller can separate. State which one is being
    quoted and why.
+
+---
+
+## 2026-09-21 — The overfit-10 gate criterion was REVISED, after seeing a result
+
+**Revising a gate after seeing the result it produced is legitimate only when the
+revision is visible.** This entry exists so it is. What follows is the original
+criterion, the measurement that motivated the change, the new criterion, and the
+reasoning — in that order, so a reader can disagree with the reasoning without
+having to reconstruct the sequence.
+
+### The original criterion
+
+Phase 4 Stage 2 (`tools/train_bc.py overfit10`) gated on: *train BC on exactly 10
+episodes, with no validation, no regularization and no augmentation; the model
+must drive training loss to near zero.* "Near zero" was operationalised in the
+session as **< 10% of the copy baseline**.
+
+The rationale was standard: a model that cannot memorise ten episodes has a bug
+in the loss, the masking, the shape contract or the optimizer wiring, and every
+later number is meaningless. That rationale is still correct.
+
+### What was measured (Stage 2, 2026-09-20)
+
+BC, 2x512 MLP, 298,518 parameters, 300 epochs, 103.7 s on the RTX 3050:
+
+| quantity | value |
+|---|---|
+| final train loss | **0.009200** |
+| ZERO baseline (predict the normalized mean) | 0.694891 |
+| COPY baseline (predict the previous tick's action) | 0.016331 |
+| as a fraction of ZERO | 0.0132 (75.6x better) |
+| as a fraction of COPY | **0.558** (1.8x better) |
+
+Under the original criterion this **fails**: 0.558 is not < 0.10. Two diagnostics
+were run before concluding anything, and both said the failure was in the
+criterion.
+
+**1. The state does not determine the action at this data density.** For every
+one of the 7,628 samples, the nearest *other* sample in 47-D state space was
+found and the two actions compared over the 16 trainable dims:
+
+    median state distance to the nearest other sample   0.200
+    mean |action - action(nearest neighbour)|            0.012764
+
+The trained model's own error, **0.009200, is BELOW that 0.012764**. The model
+already predicts better than "copy the action of the closest observation you have
+ever seen". Asking it for "near zero" was asking for something the data does not
+contain: two ticks 40 ms apart have nearly identical states and genuinely
+different commanded actions, and no deterministic function of the state produces
+both.
+
+**2. Half the residual is one identifiable, structural thing.** Per-dim error:
+
+| group | dims | error |
+|---|---|---|
+| all trainable | 16 | 0.009512 |
+| arm + gripper | 13 | **0.006026** |
+| velocity (19-21) | 3 | **0.024618** |
+
+The three velocity dims are 18.8% of the trainable dims and **48.5% of the loss**.
+Splitting those ticks by base-lock state:
+
+| | ticks | velocity err | arm err |
+|---|---|---|---|
+| lock ENGAGED | 3,480 | **0.003678** | 0.004867 |
+| lock DISENGAGED | 4,148 | **0.042185** | 0.006997 |
+
+11.5x worse unlocked. While locked, D17 pins the velocity target to exactly
+`[0,0,0]` and the model reproduces it. Unlocked, the target averages
+`[0.183, 0.221, 0.168]` and is a `KeyboardCommand` / station-keeper output that
+is not a smooth function of the 47-D state. **The lock state is deliberately not
+in the state vector** (schema freeze, 2026-09-11: "neither a state nor an action
+dim — episode metadata plus an observable predicate"), so the model cannot see
+the variable that determines its single largest error term. That is partial
+observability, not under-capacity.
+
+**Also worth stating: the COPY baseline uses information the model does not have.**
+BC at W_o=1 sees the 47-D state and no action history, while COPY is handed
+`action[t-1]`. Requiring BC to beat it by 10x was requiring it to beat something
+closer to an oracle than to a peer. That was not noticed when the threshold was
+written.
+
+### The new criterion
+
+> **A stage passes when its training error on 10 episodes falls below the
+> neighbour-ambiguity reference computed for that stage's own loader
+> configuration.**
+
+Implemented as `g1_model/ambiguity.py`: `neighbour_ambiguity()` and `gate()`,
+called by `tools/train_bc.py`, tested in `g1_model/test_ambiguity.py` (17 tests).
+Both numbers and the ratio are printed at every gate and written to
+`<run>/gate.json` — a verdict without them cannot be checked.
+
+The reference is computed **per loader configuration**, in the flattened
+observation window exactly as `ChunkDataset.__getitem__` assembles it, so it
+moves with `obs_window` and with `chunk_size`. A single global number would
+silently favour whichever stage happened to match it.
+
+**Re-run under it (2026-09-21), both gates pass:**
+
+| stage | W_o | K | train error | reference | ratio |
+|---|---|---|---|---|---|
+| BC | 1 | 1 | 0.009200 | 0.012764 | **0.721** |
+| chunked BC | 1 | 100 | 0.042763 | 0.044657 | **0.958** |
+
+The references differ by 3.5x between the two stages, which is the point: at
+K=100 the model predicts 4.0 s of future action from one observation, and the
+neighbour comparison is over that whole horizon. A fixed threshold would have
+called one of these two a failure for reasons having nothing to do with the model.
+
+### Why this is the right criterion, and what it does not claim
+
+It is an **empirical proxy for irreducible error, not a bound.** Nothing here
+proves a model cannot do better. Two neighbours differing by *d* do not force an
+error of *d*: the best deterministic L1 predictor sits at the conditional median,
+costing about *d*/2 for a coincident pair, so the reference is **lenient by
+roughly a factor of two**. A model beating it has reached the resolution the data
+supports at this density — not any theoretical floor.
+
+Consequences that must be stated wherever the number is cited (they are in the
+module docstring and in `AmbiguityResult.cite()`, which is what should be quoted
+rather than `.mean`):
+
+- **It falls as episodes are added.** Measured, K=1, W_o=1: 3 episodes 0.002779,
+  10 episodes 0.002386, 32 episodes 0.002077 (identity normalization). So a model
+  that passes against a 10-episode reference may fail against a 150-episode one
+  **without having changed**. It is not comparable across dataset sizes.
+- **It inherits the data's character.** Computed on scripted episodes it describes
+  the scripted demonstrator. Every Phase 4 gate must be re-run on piloted data
+  before any result resting on it is reported.
+- **Across `obs_window` it is confounded by dimensionality** — see the next entry.
+
+---
+
+## 2026-09-21 — The W_o selection instrument, and the confound in it
+
+Stage 4 needs W_o fixed before either ACT variant trains, identical across both,
+and justified in Chapter 3 by something other than a sweep — a sweep picks the
+window that suits the model, which is the confound it would need to avoid. So the
+instrument is a **measurement of the data**: neighbour ambiguity as a function of
+`obs_window`, with no model involved (`ambiguity_curve`, `train_bc.py wo-curve`).
+
+**Measured on 32 SCRIPTED episodes, K=1, real normalization stats:**
+
+| W_o | ambiguity | vs W=1 | nn-dist p50 | dims |
+|---|---|---|---|---|
+| 1 | 0.009608 | 1.000x | 0.1523 | 47 |
+| 2 | 0.009982 | 1.039x | 0.2226 | 94 |
+| 4 | 0.010426 | 1.085x | 0.3444 | 188 |
+| 8 | 0.011049 | 1.150x | 0.5226 | 376 |
+| 16 | 0.011128 | 1.158x | 0.8211 | 752 |
+| 32 | 0.011850 | 1.233x | 1.3339 | 1504 |
+
+**The curve RISES monotonically. It has no falling region, so there is no knee to
+read.** A longer window cannot destroy information, so the rise is the estimator,
+not the data: growing W_o multiplies the search space by W_o while the sample
+count stays fixed, neighbours get relatively farther — median distance grows 8.8x
+across a 32x larger space — and their actions differ more for reasons unrelated
+to what the window explains. Recorded as **limit 6** in `g1_model/ambiguity.py`
+and pinned by `test_the_obs_window_dimensionality_confound_is_real_and_visible`.
+
+How to read such a curve:
+
+- a **falling** region is informative — the window explains more than the added
+  sparsity costs;
+- a **rising** region means only that the dataset cannot populate a space that
+  big. Still useful: it says *data density*, not architecture, caps the usable
+  W_o. It is **not** evidence that a longer window is worse;
+- the **minimum is not automatically the right W_o**.
+
+`neighbour_distance` is reported at every point so the confound is visible rather
+than inferred. A density-matched estimator — compare at equal neighbour distance
+rather than equal sample count — is the fix, and is **not built**.
+
+**The curve above cannot choose W_o**, for two independent reasons: the scripted
+action distribution is not the piloted one, and at 32 episodes there is no falling
+region to read. The instrument is built and proven; the measurement that matters
+is one command (`tools/train_bc.py wo-curve`) once piloted data exists.
+
+---
+
+## 2026-09-21 — Chunked BC is the same class as BC
+
+Stage 2's `BCPolicy` refused `chunk_size > 1`, so chunked BC would have had to be
+a second class. Lifted in Stage 3. If chunked BC were a separate class, the
+measured effect of chunking would include every incidental difference between two
+implementations — initialization, head shape, anything — and the isolation the
+stage exists to provide would be gone. The only difference between the two
+conditions is now the number of actions predicted from one observation.
+
+`K_PROVISIONAL = 100` (4.0 s at 25 Hz) is the value ACT uses in the original
+paper and is the **only** reason it was picked. It was not swept. Episodes here
+run 694-846 ticks, so it covers about an eighth of one. The right K depends on
+how long a piloted operator's intent stays coherent, which cannot be measured on a
+scripted demonstrator that never changes its mind. **Settle it on piloted data.**
+
+**No temporal ensembling** (`models.first_action`): that is an ACT mechanism and
+belongs to Stage 4. Folding it in here would mean Stage 3 measured chunking *and*
+ensembling with no way to separate them. A chunked policy commits to its first
+prediction and re-plans on the next tick.
