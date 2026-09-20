@@ -149,9 +149,39 @@ def test_missing_array_reads_as_all_tracked():
     got = REC.tracking_ok_of(arrays)
     assert got.shape == (7,) and got.all() and got.dtype == bool
     assert REC.tracking_ok_of(arrays, n_ticks=3).shape == (3,)
-    # and a present array is returned as it stands
-    arrays["tracking_ok"] = np.array([1, 0, 1], dtype=np.uint8)
-    assert list(REC.tracking_ok_of(arrays)) == [True, False, True]
+    # and a present array of the RIGHT length is returned as it stands
+    arrays["tracking_ok"] = np.array([1, 0, 1, 1, 1, 0, 1], dtype=np.uint8)
+    assert list(REC.tracking_ok_of(arrays)) == [True, False, True, True,
+                                                True, False, True]
+
+
+def test_default_is_distinguishable_from_a_measurement():
+    """A2: both cases hand back all-True, and they do not mean the same thing.
+
+    A measured all-True episode is evidence tracking held; a defaulted one is
+    only the absence of the field. Inferring it from `.all()` would read a clean
+    teleop episode as never measured.
+    """
+    arrays = dict(states=np.zeros((4, 47), dtype=np.float32))
+    assert REC.tracking_measured(arrays) is False
+    assert REC.tracking_ok_of(arrays).all()
+    arrays["tracking_ok"] = np.ones(4, dtype=np.uint8)
+    assert REC.tracking_measured(arrays) is True
+    assert REC.tracking_ok_of(arrays).all()          # same array, other meaning
+
+
+def test_wrong_length_tracking_array_raises():
+    """A2: it used to be returned at whatever length it had, so a caller masking
+    a 706-tick episode with 3 flags silently marked the wrong ticks."""
+    arrays = dict(states=np.zeros((7, 47), dtype=np.float32),
+                  tracking_ok=np.array([1, 0, 1], dtype=np.uint8))
+    try:
+        REC.tracking_ok_of(arrays)
+    except REC.EpisodeLengthError as e:
+        assert "3" in str(e) and "7" in str(e)
+    else:
+        raise AssertionError("a length-3 tracking_ok on a 7-tick episode "
+                             "must raise, not be returned as it stands")
 
 
 def test_scripted_recorder_marks_every_tick_tracked():

@@ -258,8 +258,10 @@ def cmd_norm(a):
     eps = _episodes(a)
     sp = DS.load_splits() if os.path.exists(DS.SPLITS) else DS.stratified_split(eps)
     train = [e for e in eps if e.seed in set(sp["train"])]
-    st, ac, rep = DS.fit_norm_stats(train, allow_synthetic=a.allow_synthetic)
-    DS.save_norm_stats(st, ac, source=rep["source"], n_episodes=rep["n_episodes"])
+    st, ac, rep = DS.fit_norm_stats(train, "train",
+                                    allow_synthetic=a.allow_synthetic)
+    DS.save_norm_stats(st, ac, source=rep["source"], n_episodes=rep["n_episodes"],
+                       seeds=rep["seeds"], split=rep["split"])
     print("fitted on %d TRAIN episodes (%d ticks), source=%s"
           % (rep["n_episodes"], rep["n_ticks"], rep["source"]))
     print("saved %s" % os.path.relpath(DS.NORM_STATS, ROOT))
@@ -267,6 +269,13 @@ def cmd_norm(a):
     st2, ac2, meta = DS.load_norm_stats()
     print("reloaded: spec %s, split %s, source %s" % (meta["spec_version"],
                                                       meta["split"], meta["source"]))
+    print("provenance: %d seed(s) %s%s, fitted %s, commit %s"
+          % (len(meta["seeds"]), meta["seeds"][:8],
+             " ..." if len(meta["seeds"]) > 8 else "",
+             meta["fitted_utc"], meta["git_commit"][:12]))
+    # The provenance is only worth writing if something reads it back.
+    DS.assert_norm_stats_match(meta, train, where=os.path.basename(DS.NORM_STATS))
+    print("  seed provenance matches the %d episode(s) just fitted on" % len(train))
     # round trip
     arrays, _ = train[0].load()
     S = np.asarray(arrays["states"], dtype=np.float64)

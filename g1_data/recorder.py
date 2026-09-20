@@ -43,7 +43,7 @@ import os
 import subprocess
 import sys
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import mujoco
@@ -242,6 +242,23 @@ class EpisodeBuffer:
         return path
 
 
+class EpisodeLengthError(AssertionError):
+    """Per-tick arrays that do not agree on how many ticks there are."""
+
+
+def tracking_measured(arrays: dict) -> bool:
+    """Was `tracking_ok` MEASURED for this episode, or is it the default?
+
+    `tracking_ok_of` returns an all-True array either way, and the two cases mean
+    different things: a measured all-True episode is evidence that tracking held,
+    while a defaulted one is only the absence of the field. Nothing downstream
+    can tell them apart from the array, so the question is asked here instead of
+    being inferred from `.all()` - which would read a real teleop episode that
+    happened to hold tracking as though it had never been measured.
+    """
+    return arrays.get("tracking_ok") is not None
+
+
 def tracking_ok_of(arrays: dict, n_ticks: Optional[int] = None) -> np.ndarray:
     """Per-tick "was the arm command backed by a live tracked frame" (O28).
 
@@ -257,21 +274,107 @@ def tracking_ok_of(arrays: dict, n_ticks: Optional[int] = None) -> np.ndarray:
     all-True, which is CORRECT for every episode that exists today: all 45 came
     from the scripted demonstrator, which has no camera and no tracking path.
     Do not read that default as a measurement on a teleop episode - a teleop
-    episode written after this change always carries the real array.
+    episode written after this change always carries the real array. Ask
+    `tracking_measured` which case you are in; do not infer it from `.all()`.
+
+    A STORED array of the wrong length RAISES. It used to be returned as it
+    stood, at whatever length it had, so a caller masking `states` with it either
+    failed far downstream or - the case that motivated this - silently masked the
+    wrong ticks, because numpy is happy to index 3 positions of a 706-tick
+    episode. There is no length at which a partial tracking record is meaningful.
     """
     got = arrays.get("tracking_ok")
+    n = (len(arrays["states"]) if n_ticks is None else int(n_ticks))
     if got is not None:
-        return np.asarray(got, dtype=bool)
-    n = len(arrays["states"]) if n_ticks is None else int(n_ticks)
+        got = np.asarray(got, dtype=bool)
+        if got.ndim != 1 or got.shape[0] != n:
+            raise EpisodeLengthError(
+                "tracking_ok has length %s but the episode is %d tick(s) long. "
+                "A per-tick record that does not cover every tick cannot be "
+                "aligned to one: masking with it would silently mark the wrong "
+                "ticks." % (list(got.shape), n))
+        return got
     return np.ones(n, dtype=bool)
 
 
+# ─── the per-tick contract ────────────────────────────────────────────────────
+#: Every array in an episode file that carries ONE ROW PER TICK. They are equal
+#: in length by construction in `EpisodeBuffer` - one append per array per tick -
+#: and that construction was the only thing guaranteeing it. A file written by an
+#: older build, a hand-edited file, or an external converter has no such
+#: guarantee, and an off-by-one between `states` and `actions` is precisely the
+#: corruption that does NOT look like corruption: it silently reindexes the
+#: state/action pairing that the whole dataset means (spec.py, TIMING CONVENTION).
+#:
+#: `tracking_ok` is checked ONLY WHEN PRESENT: the 45 episodes recorded before
+#: O28 do not carry it and must keep loading (see `tracking_ok_of`).
+PER_TICK_ARRAYS: Tuple[str, ...] = (
+    "states", "actions", "phase_labels", "gait_phase", "qpos", "qvel",
+    "step_index",
+)
+OPTIONAL_PER_TICK_ARRAYS: Tuple[str, ...] = ("tracking_ok",)
+
+
+def assert_tick_lengths(arrays: dict, meta: Optional[dict] = None,
+                        where: str = "") -> int:
+    """Every per-tick array agrees on axis 0, and `meta["n_ticks"]` agrees too.
+
+    Returns the tick count. Raises `EpisodeLengthError` naming the offending key
+    and both lengths - the point is to say WHICH array disagrees, because "the
+    arrays are inconsistent" does not tell you whether to re-record or to fix a
+    reader.
+
+    `n_ticks` is required rather than optional-when-absent. `load_episode`
+    already requires `meta["spec_version"]`, every writer in the repo sets
+    `n_ticks` via `EpisodeBuffer.save`, and a per-tick contract with no declared
+    length leaves nothing to check the arrays AGAINST: if every array is short by
+    the same amount they agree with each other and the episode is still truncated.
+    """
+    tag = (" in " + where) if where else ""
+    if "states" not in arrays:
+        raise EpisodeLengthError(
+            "episode%s has no `states` array, so it has no ticks to check" % tag)
+    n = int(np.asarray(arrays["states"]).shape[0])
+    for key in PER_TICK_ARRAYS + OPTIONAL_PER_TICK_ARRAYS:
+        if key not in arrays:
+            if key in OPTIONAL_PER_TICK_ARRAYS:
+                continue
+            raise EpisodeLengthError(
+                "episode%s is missing the per-tick array %r. The per-tick "
+                "arrays are %s; a file without one of them is not an episode "
+                "this build can read." % (tag, key, ", ".join(PER_TICK_ARRAYS)))
+        got = int(np.asarray(arrays[key]).shape[0])
+        if got != n:
+            raise EpisodeLengthError(
+                "per-tick array length mismatch%s: %r has %d row(s) but "
+                "`states` has %d. Every per-tick array must cover the same "
+                "ticks - otherwise state[t] and action[t] are no longer the "
+                "pair the dataset is built from." % (tag, key, got, n))
+    if meta is not None:
+        if "n_ticks" not in meta:
+            raise EpisodeLengthError(
+                "episode%s carries no meta[\"n_ticks\"], so the arrays have "
+                "nothing to be checked against: arrays that are all short by "
+                "the same amount agree with each other and the episode is "
+                "still truncated." % tag)
+        declared = int(meta["n_ticks"])
+        if declared != n:
+            raise EpisodeLengthError(
+                "episode%s declares meta[\"n_ticks\"] = %d but its per-tick "
+                "arrays are %d tick(s) long. The file was truncated, or was "
+                "written by a path that set the count and the arrays "
+                "separately." % (tag, declared, n))
+    return n
+
+
 def load_episode(path: str):
-    """(arrays, meta). Refuses a file written under another spec version."""
+    """(arrays, meta). Refuses a file written under another spec version, or one
+    whose per-tick arrays do not agree on their length."""
     with np.load(path, allow_pickle=False) as z:
         meta = json.loads(str(z["meta"]))
         spec.assert_spec_version(meta["spec_version"], where=os.path.basename(path))
         arrays = {k: z[k].copy() for k in z.files if k != "meta"}
+    assert_tick_lengths(arrays, meta, where=os.path.basename(path))
     return arrays, meta
 
 

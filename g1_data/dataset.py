@@ -32,6 +32,7 @@ when the stratifying variable is continuous and two-dimensional.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 from dataclasses import dataclass
@@ -40,7 +41,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from g1_data import spec
-from g1_data.recorder import load_episode
+from g1_data.recorder import _git_commit, load_episode
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA = os.path.join(ROOT, "data")
@@ -290,14 +291,30 @@ def load_splits(path: str = SPLITS) -> dict:
 
 
 # ─── normalization ───────────────────────────────────────────────────────────
-def fit_norm_stats(eps: Sequence[Episode], allow_synthetic: bool = False):
-    """(state NormStats, action NormStats, report) from the TRAINING split only.
+def fit_norm_stats(eps: Sequence[Episode], split: str,
+                   allow_synthetic: bool = False):
+    """(state NormStats, action NormStats, report) from ONE named split.
 
     `allow_synthetic` exists so that fitting on scripted episodes is a deliberate
     act with a flag on it, not something that happens because the real data is
     not collected yet. Statistics fitted on the demonstrator would describe the
     demonstrator, and the file records which it was.
+
+    `split` IS REQUIRED and has no default. It used to be the literal "train",
+    written into the stats regardless of what was actually handed in, so a
+    normalizer fitted on every episode in a directory - validation included -
+    came out labelled "train" and nothing anywhere could tell. The label is not
+    a check (this function cannot know which split its argument came from), so
+    the least it can do is make the caller say it out loud. `NormStats.split`
+    then carries the caller's own claim, and `assert_norm_stats_match` checks
+    the claim against the seeds the stats were fitted on.
     """
+    if not isinstance(split, str) or not split:
+        raise DatasetError(
+            "fit_norm_stats needs the NAME of the split it is fitting on "
+            "(e.g. \"train\"); got %r. It is not inferable from the episodes, "
+            "and it is stored in the stats file as though it were a fact."
+            % (split,))
     if not eps:
         raise DatasetError("no episodes to fit normalization on")
     synth = [e for e in eps if e.meta.get("source", "").startswith("scripted")]
@@ -314,7 +331,8 @@ def fit_norm_stats(eps: Sequence[Episode], allow_synthetic: bool = False):
         A.append(np.asarray(arrays["actions"], dtype=np.float64))
     S, A = np.concatenate(S), np.concatenate(A)
     report = dict(n_episodes=len(eps), n_ticks=int(len(S)),
-                  source="synthetic" if synth else "real")
+                  source="synthetic" if synth else "real",
+                  split=split, seeds=sorted(e.seed for e in eps))
 
     def _stats(X, kind, mask):
         mean, std = X.mean(axis=0), X.std(axis=0)
@@ -325,7 +343,7 @@ def fit_norm_stats(eps: Sequence[Episode], allow_synthetic: bool = False):
         floored = [int(i) for i in np.flatnonzero(mask & (std < spec.NormStats.STD_FLOOR))]
         std = np.where(mask & (std < spec.NormStats.STD_FLOOR),
                        spec.NormStats.STD_FLOOR, std)
-        return spec.NormStats(kind=kind, mean=mean, std=std, split="train"), raw_std, floored
+        return spec.NormStats(kind=kind, mean=mean, std=std, split=split), raw_std, floored
 
     st, st_raw, st_floor = _stats(S, "state", spec.STATE_MASK)
     ac, ac_raw, ac_floor = _stats(A, "action", spec.ACTION_MASK)
@@ -335,13 +353,32 @@ def fit_norm_stats(eps: Sequence[Episode], allow_synthetic: bool = False):
 
 
 def save_norm_stats(state, action, path: str = NORM_STATS, source: str = "real",
-                    n_episodes: int = 0) -> str:
+                    n_episodes: int = 0, seeds: Optional[Sequence[int]] = None,
+                    split: Optional[str] = None) -> str:
+    """Write the stats WITH the provenance needed to check them later.
+
+    The file used to carry four fields - spec version, split, source, episode
+    count - and WHICH episodes produced it was recoverable only by re-reading
+    `splits_v1.json` and assuming nobody had regenerated it since. A count is
+    not provenance: 32 episodes of the training split and 32 of any other split
+    are the same number. The seed list makes the fit reproducible and lets
+    `assert_norm_stats_match` refuse a normalizer that belongs to a different
+    dataset, which is the one normalization failure that changes every metric
+    without changing any error message.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    seeds = sorted(int(s) for s in (seeds if seeds is not None else ()))
+    meta = dict(spec_version=spec.SPEC_VERSION,
+                split=str(split if split is not None else state.split),
+                source=source,
+                n_episodes=int(n_episodes if n_episodes else len(seeds)),
+                seeds=seeds,
+                fitted_utc=_dt.datetime.now(_dt.timezone.utc).isoformat(
+                    timespec="seconds"),
+                git_commit=_git_commit())
     np.savez(path, state_mean=state.mean, state_std=state.std,
              action_mean=action.mean, action_std=action.std,
-             meta=np.array(json.dumps(dict(spec_version=spec.SPEC_VERSION,
-                                           split="train", source=source,
-                                           n_episodes=int(n_episodes)))))
+             meta=np.array(json.dumps(meta)))
     return path
 
 
@@ -354,3 +391,53 @@ def load_norm_stats(path: str = NORM_STATS):
         ac = spec.NormStats(kind="action", mean=z["action_mean"], std=z["action_std"],
                             split=meta["split"])
     return st, ac, meta
+
+
+def assert_norm_stats_match(meta: dict, eps: Sequence,
+                            where: str = "") -> None:
+    """The stats were fitted on EXACTLY these episodes, or raise.
+
+    `eps` is a sequence of `Episode` or of plain seed integers. The integer form
+    is what a VALIDATION loader needs: its own episodes are not the ones the
+    normalizer was fitted on and must not be - it has to check the stats against
+    the TRAINING seeds, which it holds as numbers rather than as loaded files.
+
+    Version checking is not enough. Two datasets under the same SPEC_VERSION -
+    the 25-episode scaling subset and the full 150, a re-record after a discard,
+    the training split before and after a re-split - produce different
+    normalizers that load into each other without complaint. Training under the
+    wrong one does not crash, does not warn, and shifts every input by a
+    constant: the loss curve looks plausible, the policy is trained on a
+    different representation than it is evaluated under, and nothing in any
+    metric says so.
+
+    Seeds are compared, not counts, and the message names what is on each side.
+    A stats file with NO seed list is refused rather than waved through, because
+    "cannot tell" and "matches" must not be the same outcome - the only such
+    files are the ones written before the provenance fields existed, and
+    refitting is one command.
+    """
+    tag = (" (" + where + ")") if where else ""
+    want = sorted(int(getattr(e, "seed", e)) for e in eps)
+    if "seeds" not in meta:
+        raise DatasetError(
+            "normalization stats%s carry no `seeds` provenance, so there is no "
+            "way to tell whether they were fitted on this dataset. They predate "
+            "the provenance fields; refit them with `tools/build_dataset.py "
+            "norm`." % tag)
+    got = sorted(int(s) for s in meta["seeds"])
+    if got == want:
+        return
+    missing = sorted(set(want) - set(got))
+    extra = sorted(set(got) - set(want))
+    raise DatasetError(
+        "normalization stats%s were fitted on a different episode set than the "
+        "one being loaded. Stats: %d episode(s) from split %r; dataset: %d "
+        "episode(s).\n"
+        "  in the dataset but NOT in the stats: %s\n"
+        "  in the stats but NOT in the dataset: %s\n"
+        "A normalizer from another split or another dataset loads without "
+        "complaint and shifts every input by a constant - the training curve "
+        "still looks plausible and every number after it is wrong."
+        % (tag, len(got), meta.get("split", "?"), len(want),
+           missing or "none", extra or "none"))

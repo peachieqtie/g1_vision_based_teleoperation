@@ -40,6 +40,25 @@ def _ep(seed, version=spec.SPEC_VERSION, contract="bprime", spawn=(1.50, -0.10))
                            contact_contract=contract, box_spawn_xy=list(spawn)))
 
 
+def _fake_episode_files(n):
+    """(tmpdir, [Episode]) - `n` real staged episodes copied under fresh seeds.
+
+    Real files, because `fit_norm_stats` loads the arrays: the metadata-only
+    `_ep` above is enough for the refusal checks and not for this one. Returns
+    None when nothing is staged, so the caller can skip rather than fail.
+    """
+    src = sorted(p for p in DS._npz(DS.SYNTHETIC))
+    if len(src) < n:
+        return None
+    tmp = tempfile.mkdtemp()
+    eps = []
+    for i, p in enumerate(src[:n]):
+        dst = os.path.join(tmp, "ep%d.npz" % i)
+        shutil.copy2(p, dst)
+        eps.append(DS.Episode(dst, DS.read_meta(dst)))
+    return tmp, eps
+
+
 def test_uniform_dataset_passes():
     DS.assert_uniform([_ep(0), _ep(1), _ep(2)])
 
@@ -135,9 +154,131 @@ def test_norm_stats_refuse_synthetic_by_default():
     """Fitting statistics on the demonstrator has to be a deliberate act."""
     e = _ep(0)
     e.meta["source"] = "scripted_demo"
-    err = _raises(DS.DatasetError, DS.fit_norm_stats, [e])
+    err = _raises(DS.DatasetError, DS.fit_norm_stats, [e], "train")
     assert "scripted" in str(err) or "synthetic" in str(err)
-    _raises(DS.DatasetError, DS.fit_norm_stats, [])
+    _raises(DS.DatasetError, DS.fit_norm_stats, [], "train")
+
+
+def test_norm_stats_split_must_be_stated():
+    """A3: `split` was the literal "train" regardless of what was handed in, so
+    a normalizer fitted on everything in a directory came out labelled "train"
+    and nothing could tell. It is now the caller's explicit claim."""
+    import inspect
+    sig = inspect.signature(DS.fit_norm_stats).parameters["split"]
+    assert sig.default is inspect.Parameter.empty, "split must have no default"
+    e = _ep(0)
+    e.meta["source"] = "scripted_demo"
+    for bad in ("", None):
+        err = _raises(DS.DatasetError, DS.fit_norm_stats, [e], bad)
+        assert "split" in str(err).lower()
+
+
+def test_norm_stats_carry_seed_provenance_and_it_is_checked():
+    """A3: seeds, date and commit are written, and a normalizer fitted on a
+    DIFFERENT episode set is refused rather than loaded silently."""
+    eps = _fake_episode_files(3)
+    if eps is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, eps = eps
+    try:
+        st, ac, rep = DS.fit_norm_stats(eps, "train", allow_synthetic=True)
+        assert rep["seeds"] == sorted(e.seed for e in eps)
+        assert rep["split"] == "train" and st.split == "train"
+        path = os.path.join(tmp, "norm.npz")
+        DS.save_norm_stats(st, ac, path=path, source=rep["source"],
+                           n_episodes=rep["n_episodes"], seeds=rep["seeds"],
+                           split=rep["split"])
+        _, _, meta = DS.load_norm_stats(path)
+        for field in ("seeds", "fitted_utc", "git_commit", "split", "source"):
+            assert field in meta, field
+        assert meta["seeds"] == sorted(e.seed for e in eps)
+        # matching set: silent
+        DS.assert_norm_stats_match(meta, eps)
+        # one episode short, and one episode extra: both refused, by SEED
+        err = _raises(DS.DatasetError, DS.assert_norm_stats_match, meta, eps[:-1])
+        assert "NOT in the dataset" in str(err)
+        err = _raises(DS.DatasetError, DS.assert_norm_stats_match,
+                      meta, list(eps) + [_ep(999)])
+        assert "999" in str(err)
+        # stats predating the provenance fields are refused, not waved through
+        old = {k: v for k, v in meta.items() if k != "seeds"}
+        err = _raises(DS.DatasetError, DS.assert_norm_stats_match, old, eps)
+        assert "provenance" in str(err)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_per_tick_arrays_must_agree_on_length():
+    """A1: equal lengths were guaranteed by construction in EpisodeBuffer and
+    checked nowhere, so a file from an older or external path could pair
+    state[t] with action[t+1] and nothing would say so."""
+    from g1_data import recorder as REC
+    base = dict(states=np.zeros((5, 47)), actions=np.zeros((5, 22)),
+                phase_labels=np.zeros(5, dtype=np.int8),
+                gait_phase=np.zeros((5, 2)), qpos=np.zeros((5, 45)),
+                qvel=np.zeros((5, 43)), step_index=np.arange(5) * 20)
+    assert REC.assert_tick_lengths(base, dict(n_ticks=5)) == 5
+
+    short = dict(base, actions=np.zeros((4, 22)))
+    e = _raises(REC.EpisodeLengthError, REC.assert_tick_lengths, short,
+                dict(n_ticks=5))
+    assert "actions" in str(e) and "4" in str(e) and "5" in str(e)
+
+    e = _raises(REC.EpisodeLengthError, REC.assert_tick_lengths, base,
+                dict(n_ticks=9))
+    assert "9" in str(e) and "5" in str(e)
+
+    _raises(REC.EpisodeLengthError, REC.assert_tick_lengths, base, dict())
+
+    missing = {k: v for k, v in base.items() if k != "qvel"}
+    e = _raises(REC.EpisodeLengthError, REC.assert_tick_lengths, missing,
+                dict(n_ticks=5))
+    assert "qvel" in str(e)
+
+    # tracking_ok is optional, but checked when present
+    REC.assert_tick_lengths(dict(base, tracking_ok=np.ones(5, dtype=np.uint8)),
+                            dict(n_ticks=5))
+    e = _raises(REC.EpisodeLengthError, REC.assert_tick_lengths,
+                dict(base, tracking_ok=np.ones(3, dtype=np.uint8)),
+                dict(n_ticks=5))
+    assert "tracking_ok" in str(e)
+
+
+def test_length_check_runs_on_load_not_just_on_demand():
+    """A1 is only worth having if it fires on the path episodes arrive by."""
+    from g1_data import recorder as REC
+    src = sorted(p for p in DS._npz(DS.SYNTHETIC))
+    if not src:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp = tempfile.mkdtemp()
+    try:
+        dst = os.path.join(tmp, "truncated.npz")
+        with np.load(src[0], allow_pickle=False) as z:
+            arrays = {k: z[k] for k in z.files}
+        REC.load_episode(src[0])                            # intact: loads
+        arrays["actions"] = arrays["actions"][:-1]          # drop one tick
+        np.savez(dst, **arrays)
+        e = _raises(REC.EpisodeLengthError, REC.load_episode, dst)
+        assert "actions" in str(e) and "truncated.npz" in str(e)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_staged_episodes_all_pass_the_length_check():
+    """The guard must be a no-op on all 40 episodes already collected."""
+    from g1_data import recorder as REC
+    eps = DS.scan(DS.SYNTHETIC)
+    if not eps:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    for e in eps:
+        arrays, meta = e.load()                             # raises on mismatch
+        n = REC.assert_tick_lengths(arrays, meta,
+                                    where=os.path.basename(e.path))
+        assert n == int(meta["n_ticks"])
+        assert REC.tracking_measured(arrays) is False       # all on the default
 
 
 def test_real_files_on_disk_are_refused_when_mixed():
