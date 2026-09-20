@@ -90,7 +90,7 @@ def test_sample_index_is_deterministic_across_constructions():
         print("      (skipped: nothing staged in data/synthetic)")
         return
     st, ac = _identity()
-    cfg = LoaderConfig(chunk_size=100, obs_window=1)
+    cfg = LoaderConfig(chunk_size=100, obs_window=1, tracking=TrackingPolicy())
     a = ChunkDataset(eps, cfg, st, ac, None)
     b = ChunkDataset(list(reversed(eps)), cfg, st, ac, None)
     assert np.array_equal(a.index, b.index)
@@ -108,7 +108,7 @@ def test_every_tick_is_a_start_and_the_index_is_in_order():
         print("      (skipped: nothing staged in data/synthetic)")
         return
     st, ac = _identity()
-    d = ChunkDataset(eps, LoaderConfig(chunk_size=50, obs_window=1), st, ac, None)
+    d = ChunkDataset(eps, LoaderConfig(chunk_size=50, obs_window=1, tracking=TrackingPolicy()), st, ac, None)
     assert len(d) == sum(d.lengths)
     for ei, n in enumerate(d.lengths):
         rows = d.index[d.index[:, 0] == ei]
@@ -123,7 +123,7 @@ def test_chunk_is_padded_and_masked_at_the_end_of_an_episode():
         return
     st, ac = _identity()
     K = 100
-    d = ChunkDataset(eps, LoaderConfig(chunk_size=K, obs_window=1), st, ac, None)
+    d = ChunkDataset(eps, LoaderConfig(chunk_size=K, obs_window=1, tracking=TrackingPolicy()), st, ac, None)
     n = d.lengths[0]
 
     # the LAST tick: one real action, K-1 padded
@@ -159,7 +159,7 @@ def test_chunk_longer_than_the_episode_is_all_padding_after_the_end():
             return
         st, ac = _identity()
         eps = DS.scan(tmp)
-        d = ChunkDataset(eps, LoaderConfig(chunk_size=40, obs_window=1),
+        d = ChunkDataset(eps, LoaderConfig(chunk_size=40, obs_window=1, tracking=TrackingPolicy()),
                          st, ac, None)
         s = d[0]
         assert s["action"].shape == (40, spec.ACTION_DIM)
@@ -176,7 +176,7 @@ def test_obs_window_of_one_is_the_single_state():
         print("      (skipped: nothing staged in data/synthetic)")
         return
     st, ac = _identity()
-    d = ChunkDataset(eps, LoaderConfig(chunk_size=10, obs_window=1), st, ac, None)
+    d = ChunkDataset(eps, LoaderConfig(chunk_size=10, obs_window=1, tracking=TrackingPolicy()), st, ac, None)
     s = d[0]
     assert s["obs"].shape == (1, spec.STATE_DIM)
     assert bool(s["obs_mask"].all())
@@ -190,7 +190,7 @@ def test_obs_window_is_left_padded_at_tick_zero():
         return
     st, ac = _identity()
     W = 5
-    d = ChunkDataset(eps, LoaderConfig(chunk_size=10, obs_window=W), st, ac, None)
+    d = ChunkDataset(eps, LoaderConfig(chunk_size=10, obs_window=W, tracking=TrackingPolicy()), st, ac, None)
 
     s = d[0]                                    # tick 0: 4 pads then the state
     assert s["obs"].shape == (W, spec.STATE_DIM)
@@ -210,15 +210,23 @@ def test_obs_window_is_left_padded_at_tick_zero():
     assert torch.allclose(s["action"][0], torch.from_numpy(d.actions[0][W - 1]))
 
 
-def test_obs_window_has_no_default():
-    """B4: W_o can invalidate the ACT vs ACT-LSTM comparison, so it is never
-    inherited silently."""
+def test_no_loader_config_field_has_a_default():
+    """B4 + A2. `obs_window` can invalidate the ACT vs ACT-LSTM comparison;
+    `tracking` defaulting to off is how `tracking_ok` came to be written and
+    read by nothing. Neither may be inherited silently."""
     import inspect
-    for name in ("chunk_size", "obs_window"):
-        p = inspect.signature(LoaderConfig).parameters[name]
-        assert p.default is inspect.Parameter.empty, name
-    _raises(LoaderError, LoaderConfig, chunk_size=0, obs_window=1)
-    _raises(LoaderError, LoaderConfig, chunk_size=1, obs_window=0)
+    sig = inspect.signature(LoaderConfig).parameters
+    for name in ("chunk_size", "obs_window", "tracking"):
+        assert sig[name].default is inspect.Parameter.empty, \
+            "%s must have no default" % name
+    # omitting the policy is a TypeError, not a quiet "off"
+    _raises(TypeError, LoaderConfig, chunk_size=1, obs_window=1)
+    tp = TrackingPolicy()
+    _raises(LoaderError, LoaderConfig, chunk_size=0, obs_window=1, tracking=tp)
+    _raises(LoaderError, LoaderConfig, chunk_size=1, obs_window=0, tracking=tp)
+    # the switches inside it still default off: today's behaviour, written down
+    assert tp.exclude_overlapping_chunks is False
+    assert tp.max_degraded_fraction is None and tp.active is False
 
 
 # ─── B5: normalization ────────────────────────────────────────────────────────
@@ -233,7 +241,7 @@ def test_normalization_round_trips_and_masked_dims_are_untouched():
     st, ac, meta = DS.load_norm_stats()
     sp = DS.load_splits()
     train = [e for e in eps if e.seed in set(sp["train"])]
-    d = ChunkDataset(train, LoaderConfig(chunk_size=8, obs_window=1),
+    d = ChunkDataset(train, LoaderConfig(chunk_size=8, obs_window=1, tracking=TrackingPolicy()),
                      st, ac, meta)
 
     raw_arrays, _ = train[0].load()
@@ -264,7 +272,7 @@ def test_loader_refuses_to_be_handed_anything_but_norm_stats():
         print("      (skipped: nothing staged in data/synthetic)")
         return
     st, ac = _identity()
-    cfg = LoaderConfig(chunk_size=4, obs_window=1)
+    cfg = LoaderConfig(chunk_size=4, obs_window=1, tracking=TrackingPolicy())
     _raises(LoaderError, ChunkDataset, eps, cfg, None, ac, None)
     _raises(LoaderError, ChunkDataset, eps, cfg, ac, ac, None)   # kinds swapped
     assert not hasattr(ChunkDataset, "fit_norm_stats")
@@ -281,7 +289,7 @@ def test_normalizer_from_another_split_is_refused():
     sp = DS.load_splits()
     train = [e for e in eps if e.seed in set(sp["train"])]
     val = [e for e in eps if e.seed in set(sp["val"])]
-    cfg = LoaderConfig(chunk_size=8, obs_window=1)
+    cfg = LoaderConfig(chunk_size=8, obs_window=1, tracking=TrackingPolicy())
 
     ChunkDataset(train, cfg, st, ac, meta)                  # fitted on these
     # a val loader checked against ITSELF must fire: it is not the fitted set
@@ -305,7 +313,7 @@ def test_mixed_spec_version_is_refused_through_the_loader():
             return
         _synthetic_episode(tmp, 1, 30)
         st, ac = _identity()
-        cfg = LoaderConfig(chunk_size=5, obs_window=1)
+        cfg = LoaderConfig(chunk_size=5, obs_window=1, tracking=TrackingPolicy())
         ChunkDataset.from_directory(tmp, cfg, st, ac, None)      # uniform: fine
 
         p = os.path.join(tmp, "ep_seed0001.npz")
@@ -329,7 +337,7 @@ def test_a_split_seed_that_is_not_staged_is_refused():
             print("      (skipped: nothing staged in data/synthetic)")
             return
         st, ac = _identity()
-        cfg = LoaderConfig(chunk_size=5, obs_window=1)
+        cfg = LoaderConfig(chunk_size=5, obs_window=1, tracking=TrackingPolicy())
         e = _raises(LoaderError, ChunkDataset.from_directory, tmp, cfg, st, ac,
                     None, [0, 4242])
         assert "4242" in str(e)
@@ -345,7 +353,7 @@ def test_tracking_policies_are_off_by_default_and_change_nothing_today():
         return
     assert TrackingPolicy().active is False
     st, ac = _identity()
-    d = ChunkDataset(eps, LoaderConfig(chunk_size=100, obs_window=1), st, ac, None)
+    d = ChunkDataset(eps, LoaderConfig(chunk_size=100, obs_window=1, tracking=TrackingPolicy()), st, ac, None)
     s = d.summary()
     assert s["degraded_ticks"] == 0
     assert s["excluded_samples"] == 0 and s["dropped_episodes"] == []
@@ -363,7 +371,7 @@ def test_chunk_exclusion_policy_fires_on_a_degraded_episode():
         st, ac = _identity()
         K = 5
         off = ChunkDataset.from_directory(
-            tmp, LoaderConfig(chunk_size=K, obs_window=1), st, ac, None)
+            tmp, LoaderConfig(chunk_size=K, obs_window=1, tracking=TrackingPolicy()), st, ac, None)
         assert len(off) == 40 and off.summary()["degraded_ticks"] == 1
 
         on = ChunkDataset.from_directory(
@@ -394,7 +402,7 @@ def test_episode_fraction_policy_drops_the_whole_episode():
         cfg = dict(chunk_size=5, obs_window=1)
 
         both = ChunkDataset.from_directory(
-            tmp, LoaderConfig(**cfg), st, ac, None)
+            tmp, LoaderConfig(**cfg, tracking=TrackingPolicy()), st, ac, None)
         assert both.seeds == [0, 1] and len(both) == 80
 
         # threshold between the two: the 50% episode goes, the 10% one stays
@@ -439,7 +447,7 @@ def test_loader_never_reads_gait_phase_or_feeds_phase_labels():
         print("      (skipped: nothing staged in data/synthetic)")
         return
     st, ac = _identity()
-    d = ChunkDataset(eps, LoaderConfig(chunk_size=4, obs_window=1), st, ac, None)
+    d = ChunkDataset(eps, LoaderConfig(chunk_size=4, obs_window=1, tracking=TrackingPolicy()), st, ac, None)
     assert not hasattr(d, "gait_phase")
     keys = set(d[0])
     assert "gait_phase" not in keys and "phase_labels" not in keys
@@ -484,7 +492,7 @@ def test_dataloader_batches_and_shapes_are_what_a_model_expects():
         return
     st, ac = _identity()
     K, W, B = 20, 3, 8
-    d = ChunkDataset(eps, LoaderConfig(chunk_size=K, obs_window=W), st, ac, None)
+    d = ChunkDataset(eps, LoaderConfig(chunk_size=K, obs_window=W, tracking=TrackingPolicy()), st, ac, None)
     dl = DataLoader(d, batch_size=B, shuffle=True, collate_fn=collate_chunks,
                     num_workers=0)
     b = next(iter(dl))

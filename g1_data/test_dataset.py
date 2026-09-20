@@ -209,6 +209,89 @@ def test_norm_stats_carry_seed_provenance_and_it_is_checked():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_repo_relpath_survives_a_cross_drive_path():
+    """A1: `os.path.relpath` raises across Windows drive letters, and the fix had
+    been written three times separately. One helper, and a test that proves it is
+    exercising the guarded branch rather than passing because the branch is never
+    reached: the raw call on the SAME inputs must raise where the helper does not.
+
+    No second physical drive needed - relpath is string arithmetic and neither
+    path has to exist.
+    """
+    from g1_data.paths import ROOT, repo_relpath
+    other = "Z:\\scratch\\ep_seed0000.npz" if os.name == "nt" \
+        else "/mnt/other/ep_seed0000.npz"
+
+    got = repo_relpath(other)
+    assert isinstance(got, str) and got, got
+    assert os.path.isabs(got) or not got.startswith(".."), got
+
+    if os.name == "nt":
+        # the guarded branch is real on this platform, and IS the branch taken
+        _raises(ValueError, os.path.relpath, other, ROOT)   # relpath-ok: the point
+        assert got == os.path.abspath(other)
+    # a same-drive path still comes back short and relative, as every caller wants
+    inside = os.path.join(ROOT, "data", "synthetic", "ep_seed0000.npz")
+    assert repo_relpath(inside) == os.path.join("data", "synthetic",
+                                                "ep_seed0000.npz")
+    # total: no input raises
+    for p in ("", ".", "relative/bit", ROOT, other):
+        assert isinstance(repo_relpath(p), str)
+
+
+def test_every_relpath_call_site_goes_through_the_helper():
+    """A1: three copies of one fix is this repo's characteristic bug, so the
+    next site reaching for the raw call is visible here rather than in a
+    crash report months later.
+
+    Parsed, not grepped: this file and `paths.py` both DISCUSS the raw call in
+    prose, and a text scan cannot tell a docstring from a use - the same false
+    positive the loader's B7 test hit.
+    """
+    import ast
+    import g1_data.paths as PATHS
+    from g1_data.paths import repo_relpath
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    offenders = []
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs
+                   if d not in ("__pycache__", ".git", "unitree_rl_gym",
+                                "venv", ".venv", "build", "dist")]
+        for fn in files:
+            if not fn.endswith(".py"):
+                continue
+            p = os.path.join(base, fn)
+            if os.path.abspath(p) == os.path.abspath(PATHS.__file__):
+                continue                       # the one legitimate home
+            src = open(p, encoding="utf-8", errors="replace").read()
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                continue                       # not importable anyway
+            lines = src.splitlines()
+            for node in ast.walk(tree):
+                # os.path.relpath(...) is Attribute(Attribute(Name(os),path),relpath)
+                if not (isinstance(node, ast.Attribute)
+                        and node.attr == "relpath"):
+                    continue
+                v = node.value
+                if not (isinstance(v, ast.Attribute) and v.attr == "path"
+                        and isinstance(v.value, ast.Name) and v.value.id == "os"):
+                    continue
+                line = lines[node.lineno - 1] if node.lineno <= len(lines) else ""
+                # `# relpath-ok: <why>` is the deliberate-use escape hatch: a
+                # site that really does want the raw call says so where a reader
+                # sees it, rather than the whole file being exempted and the
+                # next unguarded call in it going unnoticed.
+                if "relpath-ok" in line:
+                    continue
+                offenders.append("%s:%d" % (repo_relpath(p, root), node.lineno))
+    assert not offenders, (
+        "these call the raw relpath directly instead of "
+        "`g1_data.paths.repo_relpath`, and will crash across drive letters: %s"
+        % offenders)
+
+
 def test_per_tick_arrays_must_agree_on_length():
     """A1: equal lengths were guaranteed by construction in EpisodeBuffer and
     checked nowhere, so a file from an older or external path could pair

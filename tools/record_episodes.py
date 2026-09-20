@@ -190,7 +190,7 @@ def cmd_record(a):
             if choice == "accept":
                 path = os.path.join(a.out, "ep_seed%04d.npz" % seed)
                 rec.buf.save(path, meta)
-                ledger.append("accept", seed=seed, path=os.path.relpath(path, ROOT),
+                ledger.append("accept", seed=seed, path=repo_relpath(path),
                               heldout=meta["heldout"], label=label,
                               checks={n: ok for n, ok, _ in rows},
                               placement_error=meta["outcome"]["placement_error"])

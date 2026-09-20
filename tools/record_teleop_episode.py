@@ -23,17 +23,9 @@ sys.path.insert(0, ROOT)
 
 from g1_data import spec
 from g1_data.ledger import EpisodeLedger
+from g1_data.paths import repo_relpath
 from g1_data.recorder import (SOURCE_TELEOP_FIXTURE, TeleopRecorder,
                              assert_namespace, label_of, ledger_for)
-
-
-def _rel(path: str) -> str:
-    """Repo-relative like the scripted ledger writes, absolute if that is not
-    expressible - `--out` may legitimately sit on another drive."""
-    try:
-        return os.path.relpath(path, ROOT)
-    except ValueError:
-        return os.path.abspath(path)
 
 
 def main():
@@ -97,7 +89,7 @@ def main():
     # `checks` mirrors the scripted recorder's shape (name -> bool). The fixture
     # runs no placement, so `placement_error` is null rather than a number that
     # would read as a measured 0.0 m placement.
-    ledger.append("accept", seed=a.seed, path=_rel(a.out),
+    ledger.append("accept", seed=a.seed, path=repo_relpath(a.out),
                   heldout=bool(meta["heldout"]), label=label,
                   checks={"weld fired": rec.weld_engage_tick >= 0,
                           "ticks recorded": len(rec.buf) > 0,

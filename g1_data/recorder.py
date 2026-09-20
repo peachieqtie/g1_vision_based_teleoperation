@@ -49,6 +49,7 @@ import numpy as np
 import mujoco
 
 from g1_data import spec
+from g1_data.paths import repo_relpath
 from g1_data.reset import state_fingerprint
 from g1_teleop.contact_contract import contract_of
 from g1_teleop.indices import ModelIndex
@@ -132,8 +133,8 @@ def assert_namespace(directory: str, source: str, where: str = "") -> None:
             "inherit the scripted ledger, which would silently skip every seed "
             "already accepted there. Write to %s instead."
             % ("a real demonstration" if src["real"] else "scripted output",
-               os.path.relpath(directory, ROOT), ns["what"], source, src["real"],
-               os.path.relpath(NS_COLLECTION if src["real"] else NS_SCRIPTED, ROOT)))
+               repo_relpath(directory), ns["what"], source, src["real"],
+               repo_relpath(NS_COLLECTION if src["real"] else NS_SCRIPTED)))
 
 
 class UnknownSource(ValueError):

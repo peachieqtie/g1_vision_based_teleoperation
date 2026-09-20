@@ -23,3 +23,7 @@ MUJOCO_LOG.TXT
 # Recorded demonstrations and the episode ledger: data, not source. Back these up
 # off-machine (PLAN.md Phase 6) - they are irreplaceable human-generated episodes.
 recordings/
+
+# Training run directories: metrics, checkpoints and metadata. Artifacts of a
+# run, not source. Each run's metadata.json records its own data provenance.
+runs/

@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -61,25 +61,12 @@ from torch.utils.data import Dataset
 
 from g1_data import dataset as DS
 from g1_data import recorder as REC
+from g1_data.paths import repo_relpath
 from g1_data import spec
 
 
 class LoaderError(AssertionError):
     """A dataset that would train a policy on something other than it claims."""
-
-
-def _rel(path: str) -> str:
-    """`path` relative to the repo, or the path itself when that is impossible.
-
-    `os.path.relpath` RAISES across Windows drive letters, so a loader pointed at
-    a directory on another drive - a scratch directory, an external disk holding
-    a backup of the collection - died while formatting a message rather than
-    while doing anything. Cosmetic input, real crash.
-    """
-    try:
-        return os.path.relpath(path, DS.ROOT)
-    except ValueError:
-        return str(path)
 
 
 @dataclass(frozen=True)
@@ -91,8 +78,17 @@ class TrackingPolicy:
     demonstration of anything - the operator was not driving - but it is also not
     corrupt, and on the 40 scripted episodes there are none of them at all.
 
-    BOTH POLICIES ARE OFF BY DEFAULT, so today's behaviour is unchanged and
-    turning one on is a decision someone made. They are independent:
+    THE POLICY ITSELF IS A REQUIRED ARGUMENT (`LoaderConfig.tracking`), though
+    both of its switches default off. Off-by-default on the CONFIG FIELD would
+    mean nobody ever had to look at `tracking_ok` - which is how it came to be
+    "written and read by nothing" in the first place, and is the same shape as
+    the near-miss that made seed partitioning a pre-collection step instead of
+    an after-the-fact audit. Stating `TrackingPolicy()` is cheap; not being able
+    to forget it is the point. Today every caller states off and nothing changes;
+    on the first piloted episode the choice is already in front of whoever writes
+    the call.
+
+    The two switches are independent:
 
       `exclude_overlapping_chunks`  drop the SAMPLE if its action chunk covers a
                                     degraded tick. Per-sample surgery: it keeps
@@ -129,17 +125,26 @@ class TrackingPolicy:
 class LoaderConfig:
     """Everything about a `ChunkDataset` that is not the data itself.
 
-    `chunk_size` and `obs_window` have NO DEFAULTS. `obs_window` especially:
-    it is the hyperparameter that can invalidate the whole ACT vs ACT-LSTM
-    comparison, because an observation window long enough to carry the task's
-    temporal structure hands BC the capability the LSTM is supposed to supply.
-    Inheriting it silently from a default is exactly how that happens without
-    anyone choosing it, so every call site states it.
+    NONE OF THE THREE FIELDS HAS A DEFAULT, and each for its own reason.
+
+    `obs_window` is the hyperparameter that can invalidate the whole ACT vs
+    ACT-LSTM comparison: a window long enough to carry the task's temporal
+    structure hands BC the capability the LSTM is supposed to supply. Inheriting
+    it silently is exactly how that happens without anyone choosing it.
+
+    `tracking` is required because a default of "off" means no call site ever
+    has to consider O28 - and `tracking_ok` being written and read by nothing is
+    precisely the state that produced. The switches inside `TrackingPolicy` do
+    default off, so `TrackingPolicy()` is today's behaviour written down; what
+    cannot happen is nobody writing anything.
+
+    `chunk_size` is required for symmetry: K=1 (BC) and K=100 (ACT) are the same
+    loader, and a default would make one of them look like the normal case.
     """
 
     chunk_size: int
     obs_window: int
-    tracking: TrackingPolicy = field(default_factory=TrackingPolicy)
+    tracking: TrackingPolicy
 
     def __post_init__(self):
         if int(self.chunk_size) < 1:
@@ -221,6 +226,16 @@ class ChunkDataset(Dataset):
         # ─── B1: read everything, once ───────────────────────────────────────
         self.seeds: List[int] = []
         self.paths: List[str] = []
+        #: Per episode, the registry LABEL of `meta["source"]` - "scripted",
+        #: "teleop-fixture", or a real demonstration label. Carried so that a
+        #: training run can state in its own metadata which data it ran on: a
+        #: gate passed on scripted episodes is provisional on the data, and that
+        #: has to travel with the run rather than with a report (C5).
+        self.sources: List[str] = []
+        #: Per episode, the registry's `real` flag: did a human produce this
+        #: trajectory? `False` is not a quality judgement - it means the episode
+        #: is not a demonstration of the task being learned.
+        self.real_demonstration: List[bool] = []
         self.states: List[np.ndarray] = []       # normalized, float32
         self.actions: List[np.ndarray] = []      # normalized, float32
         self.phase_labels: List[np.ndarray] = []  # taxonomy only, never a sample
@@ -240,6 +255,13 @@ class ChunkDataset(Dataset):
                 continue
             self.seeds.append(int(e.seed))
             self.paths.append(e.path)
+            # Through the registry, never the raw string: an unregistered source
+            # raises here rather than being reported as itself, which is the
+            # same refusal staging applies.
+            info = REC.source_info(meta.get("source"),
+                                   where=os.path.basename(e.path))
+            self.sources.append(info["label"])
+            self.real_demonstration.append(bool(info["real"]))
             self.states.append(
                 self.state_norm.normalize(
                     np.asarray(arrays["states"], dtype=np.float64)
@@ -313,11 +335,11 @@ class ChunkDataset(Dataset):
                     "%d seed(s) in the requested split are not staged in %s: %s. "
                     "A split that silently loses episodes makes the train/val "
                     "proportions something other than what they say."
-                    % (len(missing), _rel(directory), missing))
+                    % (len(missing), repo_relpath(directory), missing))
             eps = [e for e in eps if int(e.seed) in want]
         return cls(eps, cfg, state_norm, action_norm, norm_meta,
                    norm_fit_seeds=norm_fit_seeds,
-                   where=_rel(directory))
+                   where=repo_relpath(directory))
 
     # ---- the constant dimension mask -------------------------------------
     @property

@@ -35,6 +35,7 @@ from g1_data import recorder as REC
 from g1_data import spec
 from g1_data import success as SU
 from g1_data.ledger import EpisodeLedger
+from g1_data.paths import repo_relpath
 
 
 def _episodes(a):
@@ -47,7 +48,7 @@ def _episodes(a):
 
 def cmd_layout(a):
     for d in DS.ensure_layout():
-        print("  %s%s" % (os.path.relpath(d, ROOT),
+        print("  %s%s" % (repo_relpath(d),
                           "   (must stay empty during collection)"
                           if d == DS.RAW_HELDOUT else ""))
     print("SPEC_VERSION %s" % spec.SPEC_VERSION)
@@ -91,7 +92,7 @@ def cmd_stage(a):
     print("staged %d episode(s), routed by meta[\"source\"]:" % n)
     for dst, labels in sorted(by_dst.items()):
         counts = {L: labels.count(L) for L in sorted(set(labels))}
-        print("  %-20s %s" % (os.path.relpath(dst, ROOT), counts))
+        print("  %-20s %s" % (repo_relpath(dst), counts))
     if a.synthetic and DS.RAW_TRAIN in by_dst:
         raise SystemExit(
             "--synthetic was passed but %d episode(s) are registered as REAL "
@@ -106,7 +107,7 @@ def cmd_stage(a):
     for dst in sorted(by_dst):
         eps = DS.scan(dst)
         print("uniform spec version and contact contract: %d episode(s) pass in %s"
-              % (len(eps), os.path.relpath(dst, ROOT)))
+              % (len(eps), repo_relpath(dst)))
     return 0
 
 
@@ -224,7 +225,7 @@ def cmd_partition(a):
           % (len(part["exp2"]), part["exp2"][:8]))
     print("  train n exp2 = %s" % (leaked or "empty - the guarantee, by construction"))
     for p in paths:
-        print("  wrote %s" % os.path.relpath(p, ROOT))
+        print("  wrote %s" % repo_relpath(p))
     return 0
 
 
@@ -250,7 +251,7 @@ def cmd_split(a):
     print("  bins with no val episode: %s  (8 val cannot cover 9 bins; at 150 "
           "episodes every bin draws ~3)" % (sp["bins_without_val"] or "none"))
     print("  val seeds: %s" % sp["val"])
-    print("  saved %s" % os.path.relpath(DS.SPLITS, ROOT))
+    print("  saved %s" % repo_relpath(DS.SPLITS))
     return 0
 
 
@@ -264,7 +265,7 @@ def cmd_norm(a):
                        seeds=rep["seeds"], split=rep["split"])
     print("fitted on %d TRAIN episodes (%d ticks), source=%s"
           % (rep["n_episodes"], rep["n_ticks"], rep["source"]))
-    print("saved %s" % os.path.relpath(DS.NORM_STATS, ROOT))
+    print("saved %s" % repo_relpath(DS.NORM_STATS))
 
     st2, ac2, meta = DS.load_norm_stats()
     print("reloaded: spec %s, split %s, source %s" % (meta["spec_version"],
