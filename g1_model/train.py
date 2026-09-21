@@ -375,6 +375,10 @@ class TrainConfig:
     stop_rule: Optional[StopRule] = None
     #: Optimizer steps per logged window in a step-budgeted run.
     window_steps: int = 1000
+    #: Write the resumable `state.pt` every this many windows. 1 = a kill costs
+    #: at most one window. The file holds weights plus AdamW's two moments, so
+    #: it is about 3x the weights on disk.
+    state_every_windows: int = 1
 
     def __post_init__(self):
         if (self.epochs is None) == (self.max_steps is None):
@@ -496,10 +500,160 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device,
     return total / max(n, 1)
 
 
+# ─── survivability: atomic writes, resumable state ────────────────────────────
+def _atomic_json(path: str, obj) -> None:
+    """Write-then-rename, so a kill mid-write leaves the PREVIOUS file intact
+    rather than a truncated one. `os.replace` is atomic on the same volume."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, indent=1, default=str)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _atomic_torch_save(obj, path: str) -> None:
+    tmp = path + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+#: Training settings that must be IDENTICAL between a run and its resumption.
+#: `max_steps` is deliberately absent: extending a cap is a legitimate resume.
+RESUME_MUST_MATCH = ("batch_size", "lr", "weight_decay", "optimizer", "grad_clip",
+                     "seed", "window_steps", "strict_determinism", "stop_rule")
+
+
+@dataclass(frozen=True)
+class Resume:
+    """Where a step-budgeted run continues from.
+
+    `path` is either a FULL STATE file (`state.pt`, written by this loop every
+    `state_every_windows` windows) or a WEIGHTS-ONLY checkpoint (`best.pt` /
+    `last.pt`). They are not equivalent, and the run's metadata records which
+    one was used and what that cost:
+
+      full state    model, optimizer (AdamW moments and step count), every RNG
+                    stream (torch CPU and CUDA, numpy, python), the data-order
+                    generator at the start of the current pass and how far into
+                    the pass the run had got, the history, the best value and the
+                    elapsed time. The continuation is BIT-EXACT: the resumed run
+                    produces the same numbers the uninterrupted run would have
+                    (`test_train.py::test_full_state_resume_is_bit_exact`).
+
+      weights only  model weights, plus - read from the prior run's own
+                    metrics.jsonl and metadata.json - the history, the step and
+                    the config. NOT restored: the optimizer's moments (AdamW
+                    restarts with zeroed m and v and a fresh bias correction, so
+                    its first steps are sign-like steps of size ~lr), the RNG
+                    streams, and the position within the data pass. The curve
+                    CONTINUES from where it was, but it is not the curve the
+                    uninterrupted run would have drawn, and a short transient
+                    after the resume point is expected.
+
+    `prior_run_dir` is the run directory a weights-only checkpoint came from;
+    defaults to the checkpoint's own directory.
+    """
+
+    path: str
+    prior_run_dir: Optional[str] = None
+
+
+def _norm(x):
+    """JSON round trip, so a tuple and a list, or a dataclass and its dict,
+    compare equal when they carry the same values."""
+    return json.loads(json.dumps(x, default=str))
+
+
+def _check_resume_config(saved: dict, cfg: TrainConfig, where: str) -> None:
+    now = asdict(cfg)
+    bad = {k: (saved.get(k), now.get(k)) for k in RESUME_MUST_MATCH
+           if _norm(saved.get(k)) != _norm(now.get(k))}
+    if bad:
+        raise TrainError(
+            "refusing to resume %s under a different training configuration - the "
+            "two segments would not be one run:\n" % where
+            + "\n".join("  %-18s saved %r, now %r" % (k, a, b)
+                        for k, (a, b) in sorted(bad.items())))
+
+
+def _load_resume(resume: Resume, model: nn.Module, opt, cfg: TrainConfig) -> tuple:
+    """(resume_info, state). Loads weights (and, for a full state, the optimizer)
+    into `model` / `opt`; everything else is returned for the loop to apply."""
+    ck = torch.load(resume.path, map_location="cpu", weights_only=False)
+    spec.assert_spec_version(ck["spec_version"], where=os.path.basename(resume.path))
+    if ck.get("model_cls") != type(model).__name__:
+        raise TrainError("checkpoint holds a %s, this run builds a %s"
+                         % (ck.get("model_cls"), type(model).__name__))
+    if _norm(ck.get("model_kwargs")) != _norm(getattr(model, "hparams", {})):
+        raise TrainError("checkpoint architecture %r differs from this run's %r"
+                         % (ck.get("model_kwargs"), getattr(model, "hparams", {})))
+    model.load_state_dict(ck["state_dict"])
+
+    if "optimizer" in ck:                                       # FULL STATE
+        _check_resume_config(ck["config"], cfg, resume.path)
+        opt.load_state_dict(ck["optimizer"])
+        state = dict(history=ck["history"], best=float(ck["best"]),
+                     step=int(ck["step"]), epoch=int(ck["epoch"]),
+                     batches_done=int(ck["batches_done"]),
+                     epoch_gen_state=ck["epoch_gen_state"], rng=ck["rng"],
+                     elapsed=float(ck["elapsed_seconds"]))
+        info = dict(kind="full_state", source=resume.path, resumed_at_step=state["step"],
+                    restored=["model weights", "optimizer state (AdamW moments, step)",
+                              "RNG: torch CPU, torch CUDA, numpy, python",
+                              "data-order generator and position within the pass",
+                              "history, best value, elapsed time"],
+                    not_restored=[], scheduler="none exists in this loop",
+                    prior_windows=len(state["history"]))
+        return info, state
+
+    # WEIGHTS ONLY: identify the step from the prior run's own records
+    prior = resume.prior_run_dir or os.path.dirname(os.path.abspath(resume.path))
+    with open(os.path.join(prior, "metadata.json"), encoding="utf-8") as fh:
+        prior_meta = json.load(fh)
+    _check_resume_config(prior_meta["config"], cfg, resume.path)
+    rows = [json.loads(L) for L in open(os.path.join(prior, "metrics.jsonl"),
+                                        encoding="utf-8") if L.strip()]
+    # save_checkpoint stores the window's total loss as a Python float; the metrics
+    # row stores the same float through JSON, which round-trips exactly. An EXACT
+    # match therefore identifies the window the weights are from.
+    match = [r for r in rows if r.get("train_loss") == ck.get("train_loss")]
+    if len(match) != 1 or "step" not in match[0]:
+        raise TrainError(
+            "cannot identify which step %s holds: %d metrics rows match its stored "
+            "loss %r. Resume from a full state file instead."
+            % (resume.path, len(match), ck.get("train_loss")))
+    at = match[0]
+    history = [dict(r) for r in rows if r["step"] <= at["step"]]
+    watch = [r["val_loss"] if r.get("val_loss") is not None else r["recon_l1"]
+             for r in history]
+    state = dict(history=history, best=float(min(watch)), step=int(at["step"]),
+                 epoch=int(at["epoch"]), batches_done=None, epoch_gen_state=None,
+                 rng=None, elapsed=float(at["elapsed_seconds"]))
+    info = dict(
+        kind="weights_only", source=resume.path, prior_run_dir=prior,
+        resumed_at_step=state["step"], prior_windows=len(history),
+        identified_by="exact match of the checkpoint's stored total loss to the "
+                      "step-%d metrics row" % at["step"],
+        restored=["model weights", "history (from the prior metrics.jsonl)",
+                  "step and best value", "training config (checked, must match)"],
+        not_restored=["optimizer state: AdamW m, v and step count restart at zero, "
+                      "so bias correction restarts and early steps are sign-like "
+                      "steps of size ~lr - expect a short transient",
+                      "RNG streams (dropout, reparameterization, shuffle): reseeded",
+                      "position within the data pass: a fresh shuffled pass begins"],
+        scheduler="none exists in this loop",
+        consequence="the curve continues from the resume point, but it is not the "
+                    "curve the uninterrupted run would have drawn")
+    return info, state
+
+
 def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
           val_ds: Optional[ChunkDataset] = None,
           run_dir: Optional[str] = None,
-          on_epoch: Optional[Callable[[dict], None]] = None) -> dict:
+          on_epoch: Optional[Callable[[dict], None]] = None,
+          gate_reference=None,
+          resume: Optional[Resume] = None) -> dict:
     """Train any model on any ChunkDataset. Knows nothing about BC or ACT.
 
     The model's contract is the whole interface: it takes `obs` of shape
@@ -510,6 +664,25 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
     happens here, at entry, which is too late to control the weight
     initialization the caller already did - see `seeded_build` for the 6.0e-3
     divergence that produced.
+
+    SURVIVABILITY. A 2 h 19 min ACT run was lost to an out-of-memory kill at step
+    113,000 with no verdict written, because result.json and gate.json were only
+    written at the very end. Now, in a step-budgeted run, every window:
+      - appends to metrics.jsonl,
+      - rewrites result.json with status "running" and the history so far,
+      - rewrites gate.json with the PROVISIONAL verdict at that step, if a
+        `gate_reference` was given,
+      - writes a full resumable `state.pt` every `cfg.state_every_windows`.
+    All writes are write-then-rename, so a kill mid-write never truncates them.
+    A Python-level failure (an out-of-memory error IS one) also records status
+    "crashed" and its reason before re-raising; a hard kill leaves the last
+    window's files, which is what a reader needs: the step the run was last alive.
+
+    RESUMING: pass `resume=Resume(path)`. Step-budgeted runs only. See `Resume`
+    for the difference between a full state file and a weights-only checkpoint.
+    The resumed run writes into its OWN run directory, with the prior segment's
+    history copied in first, so the curve is continuous and the killed run's
+    directory is left untouched as evidence.
     """
     det = set_determinism(cfg.seed, strict=cfg.strict_determinism)
     device = select_device(cfg.prefer_cuda)
@@ -550,6 +723,39 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
         val=dict(episodes=len(val_ds.lengths), seeds=list(val_ds.seeds),
                  samples=len(val_ds)) if val_ds is not None else None,
     )
+    step_mode = cfg.max_steps is not None
+    if resume is not None and not step_mode:
+        raise TrainError("resume is supported for step-budgeted runs (max_steps)")
+    if step_mode:
+        meta["budget"] = dict(unit="optimizer_steps", max_steps=int(cfg.max_steps),
+                              window_steps=int(cfg.window_steps),
+                              stop_rule=(cfg.stop_rule.describe(cfg.window_steps)
+                                         if cfg.stop_rule else None))
+
+    history: List[dict] = []
+    best = float("inf")
+    step, epoch, stop_info = 0, 0, None
+    elapsed0 = 0.0
+    skip_batches = 0
+    rng_to_restore = None
+    segment = 1
+    resumed_from_step = 0
+    if resume is not None:
+        info, st = _load_resume(resume, model, opt, cfg)
+        meta["resume"] = info
+        history, best, step = st["history"], st["best"], st["step"]
+        resumed_from_step = step
+        elapsed0 = st["elapsed"]
+        for r in history:
+            r.setdefault("segment", 1)
+        segment = max(int(r["segment"]) for r in history) + 1
+        if st["epoch_gen_state"] is not None:                   # full state
+            g.set_state(st["epoch_gen_state"])
+            epoch, skip_batches = st["epoch"] - 1, st["batches_done"]
+            rng_to_restore = st["rng"]
+        else:                                                   # weights only
+            epoch = st["epoch"]
+
     with open(os.path.join(run_dir, "metadata.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=1, default=str)
 
@@ -569,25 +775,81 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
     print("              %s" % prov["caveat"])
     print("baselines     zero %.6f   copy %.6f   (normalized L1, trainable dims)"
           % (base["zero"], base["copy"]))
-
-    metrics_path = os.path.join(run_dir, "metrics.jsonl")
-    history: List[dict] = []
-    best = float("inf")
-    t0 = time.perf_counter()
-
-    step_mode = cfg.max_steps is not None
     if step_mode:
-        meta["budget"] = dict(unit="optimizer_steps", max_steps=int(cfg.max_steps),
-                              window_steps=int(cfg.window_steps),
-                              stop_rule=(cfg.stop_rule.describe(cfg.window_steps)
-                                         if cfg.stop_rule else None))
-        with open(os.path.join(run_dir, "metadata.json"), "w", encoding="utf-8") as fh:
-            json.dump(meta, fh, indent=1, default=str)
         print("budget        %d optimizer steps (hard cap)%s"
               % (cfg.max_steps, "; " + meta["budget"]["stop_rule"]
                  if cfg.stop_rule else ""))
+    if resume is not None:
+        print("RESUME        %s from step %d (%s); %d prior windows copied in"
+              % (meta["resume"]["kind"], step, repo_relpath(resume.path),
+                 len(history)))
+        for s_ in meta["resume"]["not_restored"]:
+            print("              NOT restored: %s" % s_)
 
-    step, epoch, stop_info = 0, 0, None
+    metrics_path = os.path.join(run_dir, "metrics.jsonl")
+    if history:
+        with open(metrics_path, "w", encoding="utf-8") as fh:
+            for r in history:
+                fh.write(json.dumps(r) + "\n")
+    t0 = time.perf_counter()
+    status = {"value": "running"}
+    counters = {"windows_since_state": 0}
+
+    def _elapsed():
+        return elapsed0 + (time.perf_counter() - t0)
+
+    def _write_progress(final: bool = False, error: Optional[str] = None):
+        """result.json and gate.json as of NOW. Called every window, at the end,
+        and on a crash - so a kill costs at most one window, never the verdict."""
+        if not history:
+            return
+        from g1_model.ambiguity import Quantity, RECON_UNITS, gate as _gate
+        last = history[-1]
+        seg_s = time.perf_counter() - t0
+        doc = dict(status=status["value"], final=final, error=error,
+                   run_dir=run_dir, optimizer_steps=int(step), segment=segment,
+                   resume=meta.get("resume"), stop=stop_info,
+                   final_train_loss=last["train_loss"],
+                   final_recon_l1=last["recon_l1"],
+                   final_val_loss=last.get("val_loss"),
+                   best=best, baselines=base,
+                   segment_steps_per_second=round((step - resumed_from_step)
+                                                  / max(seg_s, 1e-9), 3),
+                   wall_seconds=round(_elapsed(), 3),
+                   written_utc=_dt.datetime.now(_dt.timezone.utc).isoformat(
+                       timespec="seconds"),
+                   history=history)
+        _atomic_json(os.path.join(run_dir, "result.json"), doc)
+        if gate_reference is not None:
+            v = _gate(Quantity(float(last["recon_l1"]), RECON_UNITS), gate_reference)
+            _atomic_json(os.path.join(run_dir, "gate.json"), dict(
+                status=status["value"], final=final, error=error,
+                note=(None if final else
+                      "PROVISIONAL: the verdict at the step the run was last "
+                      "alive, not a final verdict"),
+                passed=v.passed, train_error=v.train_error,
+                train_error_units=RECON_UNITS, total_loss=last["train_loss"],
+                reference=v.reference, ratio=v.ratio, at_step=int(step),
+                optimizer_steps=int(step), stop=stop_info,
+                steps_per_second=doc["segment_steps_per_second"],
+                detail=gate_reference.as_metadata()))
+
+    def _save_state(batches_done: int, epoch_gen_state):
+        rng = dict(torch=torch.get_rng_state(), numpy=np.random.get_state(),
+                   python=random.getstate(),
+                   cuda=(torch.cuda.get_rng_state_all()
+                         if torch.cuda.is_available() else None))
+        _atomic_torch_save(dict(
+            state_dict=model.state_dict(), optimizer=opt.state_dict(),
+            scheduler=None,          # no LR scheduler exists in this loop
+            config=asdict(cfg), model_cls=type(model).__name__,
+            model_kwargs=getattr(model, "hparams", {}),
+            spec_version=spec.SPEC_VERSION, git_commit=meta["git_commit"],
+            step=int(step), epoch=int(epoch), batches_done=int(batches_done),
+            epoch_gen_state=epoch_gen_state, rng=rng, history=history,
+            best=float(best), elapsed_seconds=float(_elapsed())),
+            os.path.join(run_dir, "state.pt"))
+
     w_tot, w_rec, w_n, w_ext, w_t0 = 0.0, 0.0, 0, {}, time.perf_counter()
 
     def _window_row():
@@ -601,8 +863,8 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
                    **{("train_" + k_): v_ / max(w_n, 1) for k_, v_ in w_ext.items()},
                    val_loss=val, lr=float(opt.param_groups[0]["lr"]),
                    window_seconds=round(secs, 3),
-                   elapsed_seconds=round(time.perf_counter() - t0, 3),
-                   git_commit=meta["git_commit"])
+                   elapsed_seconds=round(_elapsed(), 3),
+                   segment=segment, git_commit=meta["git_commit"])
         history.append(row)
         with open(metrics_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
@@ -610,7 +872,7 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
         if watch < best:
             best = watch
             save_checkpoint(os.path.join(run_dir, "best.pt"), model, cfg, meta,
-                            epoch, tl_, val)
+                            epoch, tl_, val, step=step)
         if cfg.log_every:
             kl = row.get("train_kl")
             print("  step %8d  recon %.6f  total %.6f%s  %.1fs"
@@ -618,91 +880,132 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
                      secs))
         w_tot, w_rec, w_n, w_ext, w_t0 = 0.0, 0.0, 0, {}, time.perf_counter()
 
-    while True:
-        if not step_mode and epoch >= int(cfg.epochs):
-            break
-        epoch += 1
-        model.train()
-        e0 = time.perf_counter()
-        total, recon, n = 0.0, 0.0, 0
-        extra_sums = {}
-        for batch in tl:
-            obs = batch["obs"].to(device, non_blocking=True)
-            target = batch["action"].to(device, non_blocking=True)
-            pad = batch["action_mask"].to(device, non_blocking=True)
-            loss, l1, count, extras = forward_loss(model, obs, target, pad, dim_mask)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if cfg.grad_clip:
-                nn.utils.clip_grad_norm_(model.parameters(), float(cfg.grad_clip))
-            opt.step()
-            total += float(loss.detach()) * int(count)
-            recon += float(l1.detach()) * int(count)
-            n += int(count)
-            for k_, v_ in extras.items():
-                extra_sums[k_] = extra_sums.get(k_, 0.0) + float(v_) * int(count)
-            step += 1
-            if not step_mode:
-                continue
-            # ---- step-budgeted: windows, the stop rule, the hard cap ----------
-            w_tot += float(loss.detach()) * int(count)
-            w_rec += float(l1.detach()) * int(count)
-            w_n += int(count)
-            for k_, v_ in extras.items():
-                w_ext[k_] = w_ext.get(k_, 0.0) + float(v_) * int(count)
-            if step % int(cfg.window_steps) == 0:
-                _window_row()
-                if cfg.stop_rule is not None:
-                    fired = cfg.stop_rule.check(history)
-                    if fired:
-                        stop_info = dict(reason="stop_rule", step=step, **fired)
-                        break
-            if step >= int(cfg.max_steps):
-                if w_n:
+    if rng_to_restore is not None:
+        # LAST thing before the first step, after every RNG-consuming setup call
+        # (baselines draws a loader seed from the global generator).
+        torch.set_rng_state(rng_to_restore["torch"])
+        np.random.set_state(rng_to_restore["numpy"])
+        random.setstate(rng_to_restore["python"])
+        if rng_to_restore.get("cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng_to_restore["cuda"])
+
+    try:
+        while True:
+            if not step_mode and epoch >= int(cfg.epochs):
+                break
+            epoch += 1
+            model.train()
+            e0 = time.perf_counter()
+            total, recon, n = 0.0, 0.0, 0
+            extra_sums = {}
+            epoch_gen_state = g.get_state()      # before the iterator draws from g
+            batches_done, skip = 0, skip_batches
+            skip_batches = 0
+            for batch in tl:
+                if skip:
+                    # Full-state resume: this pass's permutation is reproduced from
+                    # the saved generator state, and the batches the interrupted run
+                    # had already trained on are passed over without training.
+                    skip -= 1
+                    batches_done += 1
+                    continue
+                obs = batch["obs"].to(device, non_blocking=True)
+                target = batch["action"].to(device, non_blocking=True)
+                pad = batch["action_mask"].to(device, non_blocking=True)
+                loss, l1, count, extras = forward_loss(model, obs, target, pad, dim_mask)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                if cfg.grad_clip:
+                    nn.utils.clip_grad_norm_(model.parameters(), float(cfg.grad_clip))
+                opt.step()
+                total += float(loss.detach()) * int(count)
+                recon += float(l1.detach()) * int(count)
+                n += int(count)
+                for k_, v_ in extras.items():
+                    extra_sums[k_] = extra_sums.get(k_, 0.0) + float(v_) * int(count)
+                batches_done += 1
+                step += 1
+                if not step_mode:
+                    continue
+                # ---- step-budgeted: windows, the stop rule, the hard cap -------
+                w_tot += float(loss.detach()) * int(count)
+                w_rec += float(l1.detach()) * int(count)
+                w_n += int(count)
+                for k_, v_ in extras.items():
+                    w_ext[k_] = w_ext.get(k_, 0.0) + float(v_) * int(count)
+                if step % int(cfg.window_steps) == 0:
                     _window_row()
-                stop_info = dict(reason="hard_cap", step=step)
-                break
-        if step_mode:
-            if stop_info is not None:
-                break
-            continue
-        train_loss = total / max(n, 1)
-        recon_loss = recon / max(n, 1)
-        extra_means = {k_: v_ / max(n, 1) for k_, v_ in extra_sums.items()}
-        val_loss = evaluate(model, vl, device, dim_mask) if vl is not None else None
+                    if cfg.stop_rule is not None:
+                        fired = cfg.stop_rule.check(history)
+                        if fired:
+                            stop_info = dict(reason="stop_rule", step=step, **fired)
+                    counters["windows_since_state"] += 1
+                    if counters["windows_since_state"] >= int(cfg.state_every_windows):
+                        _save_state(batches_done, epoch_gen_state)
+                        counters["windows_since_state"] = 0
+                    _write_progress()
+                    if stop_info is not None:
+                        break
+                if step >= int(cfg.max_steps):
+                    if w_n:
+                        _window_row()
+                    stop_info = dict(reason="hard_cap", step=step)
+                    _save_state(batches_done, epoch_gen_state)
+                    break
+            if step_mode:
+                if stop_info is not None:
+                    break
+                continue
+            train_loss = total / max(n, 1)
+            recon_loss = recon / max(n, 1)
+            extra_means = {k_: v_ / max(n, 1) for k_, v_ in extra_sums.items()}
+            val_loss = evaluate(model, vl, device, dim_mask) if vl is not None else None
 
-        row = dict(epoch=epoch, train_loss=train_loss, recon_l1=recon_loss,
-                   **{("train_" + k_): v_ for k_, v_ in extra_means.items()},
-                   val_loss=val_loss,
-                   lr=float(opt.param_groups[0]["lr"]),
-                   epoch_seconds=round(time.perf_counter() - e0, 3),
-                   elapsed_seconds=round(time.perf_counter() - t0, 3),
-                   # TR29: baselines are reconstruction quantities.
-                   frac_of_zero_baseline=recon_loss / base["zero"] if base["zero"] else None,
-                   frac_of_copy_baseline=recon_loss / base["copy"] if base["copy"] else None,
-                   git_commit=meta["git_commit"])
-        history.append(row)
-        with open(metrics_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row) + "\n")
-        watch = val_loss if val_loss is not None else train_loss
-        if watch < best:
-            best = watch
-            save_checkpoint(os.path.join(run_dir, "best.pt"), model, cfg, meta,
-                            epoch, train_loss, val_loss)
-        if cfg.log_every and (epoch % cfg.log_every == 0 or epoch == cfg.epochs):
-            print("  epoch %4d  train %.6f%s  (%.3fx zero, %.3fx copy)  %.1fs"
-                  % (epoch, train_loss,
-                     "  val %.6f" % val_loss if val_loss is not None else "",
-                     row["frac_of_zero_baseline"], row["frac_of_copy_baseline"],
-                     row["epoch_seconds"]))
-        if on_epoch:
-            on_epoch(row)
+            row = dict(epoch=epoch, train_loss=train_loss, recon_l1=recon_loss,
+                       **{("train_" + k_): v_ for k_, v_ in extra_means.items()},
+                       val_loss=val_loss,
+                       lr=float(opt.param_groups[0]["lr"]),
+                       epoch_seconds=round(time.perf_counter() - e0, 3),
+                       elapsed_seconds=round(time.perf_counter() - t0, 3),
+                       # TR29: baselines are reconstruction quantities.
+                       frac_of_zero_baseline=recon_loss / base["zero"] if base["zero"] else None,
+                       frac_of_copy_baseline=recon_loss / base["copy"] if base["copy"] else None,
+                       git_commit=meta["git_commit"])
+            history.append(row)
+            with open(metrics_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + "\n")
+            watch = val_loss if val_loss is not None else train_loss
+            if watch < best:
+                best = watch
+                save_checkpoint(os.path.join(run_dir, "best.pt"), model, cfg, meta,
+                                epoch, train_loss, val_loss)
+            if cfg.log_every and (epoch % cfg.log_every == 0 or epoch == cfg.epochs):
+                print("  epoch %4d  train %.6f%s  (%.3fx zero, %.3fx copy)  %.1fs"
+                      % (epoch, train_loss,
+                         "  val %.6f" % val_loss if val_loss is not None else "",
+                         row["frac_of_zero_baseline"], row["frac_of_copy_baseline"],
+                         row["epoch_seconds"]))
+            _write_progress()
+            if on_epoch:
+                on_epoch(row)
+    except BaseException as e:                                  # noqa: BLE001
+        # An out-of-memory error, a KeyboardInterrupt, anything Python can see:
+        # record WHY and WHERE before dying, then die. A hard OS kill cannot be
+        # caught; for that, the last window's files are the record.
+        status["value"] = "crashed"
+        msg = str(e).splitlines()[0] if str(e) else ""
+        try:
+            _write_progress(final=False, error="%s: %s" % (type(e).__name__, msg))
+        finally:
+            raise
 
+    status["value"] = (stop_info["reason"] if stop_info else "finished")
     save_checkpoint(os.path.join(run_dir, "last.pt"), model, cfg, meta,
                     len(history), history[-1]["train_loss"],
-                    history[-1]["val_loss"])
+                    history[-1]["val_loss"], step=step if step_mode else None)
     from g1_model.ambiguity import Quantity, RECON_UNITS, TOTAL_LOSS_UNITS
     wall = round(time.perf_counter() - t0, 3)
+    seg_steps = step - resumed_from_step
     result = dict(run_dir=run_dir, history=history, baselines=base,
                   metadata=meta, best=best,
                   final_train_loss=history[-1]["train_loss"],
@@ -716,19 +1019,26 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
                       train_loss=Quantity(float(history[-1]["train_loss"]),
                                           TOTAL_LOSS_UNITS)),
                   optimizer_steps=int(step),
-                  steps_per_second=round(step / wall, 3) if wall else None,
+                  segment_steps=int(seg_steps),
+                  steps_per_second=round(seg_steps / wall, 3) if wall else None,
                   stop=stop_info,
-                  wall_seconds=wall)
-    with open(os.path.join(run_dir, "result.json"), "w", encoding="utf-8") as fh:
-        json.dump({k: v for k, v in result.items() if k != "metadata"}, fh,
-                  indent=1, default=str)
+                  wall_seconds=wall,
+                  total_wall_seconds=round(elapsed0 + wall, 3))
+    _write_progress(final=True)
+    # the richer final record, overwriting the progress version
+    _atomic_json(os.path.join(run_dir, "result.json"),
+                 dict({k: v for k, v in result.items() if k != "metadata"},
+                      status=status["value"], final=True))
     return result
 
 
 # ─── checkpoints ──────────────────────────────────────────────────────────────
 def save_checkpoint(path: str, model: nn.Module, cfg: TrainConfig, meta: dict,
                     epoch: int, train_loss: float,
-                    val_loss: Optional[float]) -> str:
+                    val_loss: Optional[float], step: Optional[int] = None) -> str:
+    """Weights and provenance - NOT a resumable state (no optimizer, no RNG).
+    `state.pt`, written by `train()`, is the resumable one. `step` is recorded
+    so a weights-only resume need not infer it."""
     torch.save(dict(state_dict=model.state_dict(), config=asdict(cfg),
                     model_cls=type(model).__name__,
                     model_kwargs=getattr(model, "hparams", {}),
@@ -736,7 +1046,8 @@ def save_checkpoint(path: str, model: nn.Module, cfg: TrainConfig, meta: dict,
                     git_commit=meta.get("git_commit"),
                     data=meta.get("data"), baselines=meta.get("baselines"),
                     epoch=int(epoch), train_loss=float(train_loss),
-                    val_loss=None if val_loss is None else float(val_loss)),
+                    val_loss=None if val_loss is None else float(val_loss),
+                    step=None if step is None else int(step)),
                path)
     return path
 

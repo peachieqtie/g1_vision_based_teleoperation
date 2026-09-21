@@ -528,6 +528,242 @@ def test_stop_rule_ends_a_run_before_the_cap_and_says_where():
         shutil.rmtree(out, ignore_errors=True)
 
 
+# ═══ Stage 4 A/D: resume, and a run that survives being killed ════════════════
+def _tiny_act(K=5):
+    """A small ACT WITH dropout, so resuming must restore the dropout RNG too."""
+    from g1_model.act import ACTConfig, build_act
+    return (ACTConfig(obs_window=1, chunk_size=K, lr=1e-3, weight_decay=0.0,
+                      hidden_dim=32, dim_feedforward=64, nheads=4, enc_layers=1,
+                      dec_layers=1, dropout=0.1), build_act)
+
+
+def _tiny_k(K, n_eps=2, n_ticks=40):
+    tmp = _tiny(n_eps=n_eps, n_ticks=n_ticks)
+    if tmp is None:
+        return None
+    tmp, _ = tmp
+    st, ac = (spec.NormStats.identity("state"), spec.NormStats.identity("action"))
+    ds = ChunkDataset.from_directory(
+        tmp, LoaderConfig(chunk_size=K, obs_window=1, tracking=TrackingPolicy()),
+        st, ac, None)
+    return tmp, ds
+
+
+def _act_run(ds, out, max_steps, window, resume=None, gate_reference=None):
+    mcfg, build = _tiny_act()
+    cfg = T.TrainConfig(epochs=None, batch_size=8, seed=3, max_steps=max_steps,
+                        window_steps=window, log_every=0, **mcfg.optimizer_config())
+    m = T.seeded_build(cfg, build, cfg=mcfg)
+    return T.train(m, ds, cfg, run_dir=out, resume=resume,
+                   gate_reference=gate_reference)
+
+
+def _losses(history):
+    return [(h["step"], h["train_loss"], h["recon_l1"], h.get("train_kl"))
+            for h in history]
+
+
+def test_full_state_resume_is_bit_exact():
+    """A: a resumed run CONTINUES the curve - it reproduces, to the bit, the
+    numbers the uninterrupted run produced after the resume point.
+
+    Built to be hard: ACT WITH dropout (so the dropout RNG must be restored), and
+    a window of 7 steps against a 10-step epoch (80 samples / batch 8), so the
+    kill lands MID-PASS and the resumed run must reproduce that pass's shuffled
+    order and skip the batches already trained on.
+    """
+    got = _tiny_k(K=5)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    a, b, c = tempfile.mkdtemp(), tempfile.mkdtemp(), tempfile.mkdtemp()
+    try:
+        whole = _act_run(ds, a, max_steps=28, window=7)          # never interrupted
+        first = _act_run(ds, b, max_steps=14, window=7)          # "killed" at 14
+        assert os.path.isfile(os.path.join(b, "state.pt"))
+        ck = torch.load(os.path.join(b, "state.pt"), map_location="cpu",
+                        weights_only=False)
+        assert ck["step"] == 14 and ck["batches_done"] == 4, (ck["step"], ck["batches_done"])
+        assert "optimizer" in ck and ck["optimizer"]["state"], "optimizer state missing"
+        assert ck["scheduler"] is None      # no scheduler exists; recorded as such
+        resumed = _act_run(ds, c, max_steps=28, window=7,
+                           resume=T.Resume(os.path.join(b, "state.pt")))
+        assert _losses(resumed["history"]) == _losses(whole["history"]), (
+            "resumed curve differs from the uninterrupted one:\n  whole   %s\n  resumed %s"
+            % (_losses(whole["history"]), _losses(resumed["history"])))
+        assert [h["segment"] for h in resumed["history"]] == [1, 1, 2, 2]
+        assert resumed["metadata"]["resume"]["kind"] == "full_state"
+        assert resumed["metadata"]["resume"]["not_restored"] == []
+        assert resumed["optimizer_steps"] == 28 and resumed["segment_steps"] == 14
+        rows = [json.loads(L) for L in open(os.path.join(c, "metrics.jsonl"),
+                                            encoding="utf-8") if L.strip()]
+        assert [r["step"] for r in rows] == [7, 14, 21, 28], "curve not continuous on disk"
+    finally:
+        for d in (tmp, a, b, c):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_resume_actually_depends_on_the_restored_state():
+    """The bit-exact test would pass vacuously if resuming ignored the file and
+    re-trained from scratch to the same numbers. Break the restored optimizer
+    state and the curve must change."""
+    got = _tiny_k(K=5)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    a, b, c = tempfile.mkdtemp(), tempfile.mkdtemp(), tempfile.mkdtemp()
+    try:
+        whole = _act_run(ds, a, max_steps=28, window=7)
+        _act_run(ds, b, max_steps=14, window=7)
+        p = os.path.join(b, "state.pt")
+        ck = torch.load(p, map_location="cpu", weights_only=False)
+        ck["optimizer"]["state"] = {}                 # wipe AdamW's moments
+        torch.save(ck, p)
+        broken = _act_run(ds, c, max_steps=28, window=7, resume=T.Resume(p))
+        assert _losses(broken["history"])[:2] == _losses(whole["history"])[:2]
+        assert _losses(broken["history"])[2:] != _losses(whole["history"])[2:], \
+            "wiping the optimizer state changed nothing: resume is not using it"
+    finally:
+        for d in (tmp, a, b, c):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_weights_only_resume_continues_the_curve_and_says_what_it_lost():
+    """A: best.pt carries weights and provenance but no optimizer, RNG or step.
+    Resuming from it must identify the step from the prior run's own records,
+    carry the history over, CONTINUE (not restart) the curve, and record exactly
+    what was not restored."""
+    got = _tiny_k(K=5)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    a, c = tempfile.mkdtemp(), tempfile.mkdtemp()
+    try:
+        prior = _act_run(ds, a, max_steps=40, window=10)
+        ck = torch.load(os.path.join(a, "best.pt"), map_location="cpu",
+                        weights_only=False)
+        assert "optimizer" not in ck and "rng" not in ck
+        best_row = min(prior["history"], key=lambda h: h["recon_l1"])
+        res = _act_run(ds, c, max_steps=60, window=10,
+                       resume=T.Resume(os.path.join(a, "best.pt")))
+        info = res["metadata"]["resume"]
+        assert info["kind"] == "weights_only"
+        assert info["resumed_at_step"] == best_row["step"], info
+        assert any("AdamW" in s for s in info["not_restored"])
+        assert any("RNG" in s for s in info["not_restored"])
+        n1 = sum(1 for h in res["history"] if h["segment"] == 1)
+        assert n1 == len([h for h in prior["history"] if h["step"] <= best_row["step"]])
+        first_new = [h for h in res["history"] if h["segment"] == 2][0]
+        first_old = prior["history"][0]
+        assert first_new["step"] == best_row["step"] + 10
+        # CONTINUES: the first new window sits near where the prior run left off,
+        # far below where a fresh model starts
+        assert first_new["recon_l1"] < first_old["recon_l1"], (first_new, first_old)
+    finally:
+        for d in (tmp, a, c):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_resume_refuses_a_different_training_config():
+    got = _tiny_k(K=5)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    a, c = tempfile.mkdtemp(), tempfile.mkdtemp()
+    try:
+        _act_run(ds, a, max_steps=10, window=5)
+        from g1_model.act import ACTConfig, build_act
+        mcfg = ACTConfig(obs_window=1, chunk_size=5, lr=5e-4, weight_decay=0.0,
+                         hidden_dim=32, dim_feedforward=64, nheads=4, enc_layers=1,
+                         dec_layers=1, dropout=0.1)                 # lr differs
+        cfg = T.TrainConfig(epochs=None, batch_size=8, seed=3, max_steps=20,
+                            window_steps=5, log_every=0, **mcfg.optimizer_config())
+        m = T.seeded_build(cfg, build_act, cfg=mcfg)
+        e = _raises(T.TrainError, T.train, m, ds, cfg, run_dir=c,
+                    resume=T.Resume(os.path.join(a, "state.pt")))
+        assert "lr" in str(e)
+    finally:
+        for d in (tmp, a, c):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_crash_leaves_the_verdict_and_a_resumable_state():
+    """D: the 2 h 19 min run died with no result.json and no gate.json because
+    both were written only at the end. Now: progress files every window, the
+    crash reason recorded, and a state.pt to resume from.
+
+    The crash is injected INSIDE a forward pass, the way the real out-of-memory
+    error struck (inside clip_grad_norm_, mid-step). Before raising, the injector
+    reads result.json from disk, proving the files existed WHILE the run was
+    alive and said so."""
+    got = _tiny_k(K=5)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    from g1_model import ambiguity as AMB
+    ref = AMB.neighbour_ambiguity(ds)
+    a, c = tempfile.mkdtemp(), tempfile.mkdtemp()
+    try:
+        mcfg, build = _tiny_act()
+        cfg = T.TrainConfig(epochs=None, batch_size=8, seed=3, max_steps=40,
+                            window_steps=5, log_every=0, **mcfg.optimizer_config())
+        m = T.seeded_build(cfg, build, cfg=mcfg)
+        seen, calls = {}, {"n": 0}
+        real_terms = m.loss_terms
+
+        def dying(*args, **kw):
+            calls["n"] += 1
+            if calls["n"] == 13:                   # mid-window, after 2 windows
+                with open(os.path.join(a, "result.json"), encoding="utf-8") as fh:
+                    seen["while_alive"] = json.load(fh)
+                raise RuntimeError("CUDA error: out of memory (simulated)")
+            return real_terms(*args, **kw)
+
+        m.loss_terms = dying
+        _raises(RuntimeError, T.train, m, ds, cfg, run_dir=a, gate_reference=ref)
+
+        alive = seen["while_alive"]
+        assert alive["status"] == "running" and alive["optimizer_steps"] == 10
+        res = json.load(open(os.path.join(a, "result.json"), encoding="utf-8"))
+        assert res["status"] == "crashed" and "out of memory" in res["error"]
+        assert [h["step"] for h in res["history"]] == [5, 10]
+        gate = json.load(open(os.path.join(a, "gate.json"), encoding="utf-8"))
+        assert gate["status"] == "crashed" and gate["at_step"] == 12, gate["at_step"]
+        assert gate["train_error_units"] == AMB.RECON_UNITS
+        assert gate["final"] is False and "PROVISIONAL" in gate["note"]
+        assert abs(gate["train_error"] - res["history"][-1]["recon_l1"]) < 1e-12
+
+        # and the state it left behind finishes the run
+        done = _act_run(ds, c, max_steps=40, window=5,
+                        resume=T.Resume(os.path.join(a, "state.pt")),
+                        gate_reference=ref)
+        assert done["optimizer_steps"] == 40
+        final = json.load(open(os.path.join(c, "gate.json"), encoding="utf-8"))
+        assert final["final"] is True and final["status"] == "hard_cap"
+        assert final["note"] is None
+    finally:
+        for d in (tmp, a, c):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_progress_files_are_written_atomically():
+    """A kill DURING a write must leave the previous complete file, not a
+    truncated one: write-then-rename, never write-in-place."""
+    import inspect
+    src = inspect.getsource(T._atomic_json)
+    assert "os.replace" in src and ".tmp" in src
+    assert "os.replace" in inspect.getsource(T._atomic_torch_save)
+    loop = inspect.getsource(T.train)
+    assert '_atomic_json(os.path.join(run_dir, "result.json")' in loop
+    assert '_atomic_json(os.path.join(run_dir, "gate.json")' in loop
+    assert "open(os.path.join(run_dir, \"result.json\"), \"w\"" not in loop
+
+
 def _tests():
     return [(n, f) for n, f in sorted(globals().items())
             if n.startswith("test_") and callable(f)]

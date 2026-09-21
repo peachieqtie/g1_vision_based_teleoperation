@@ -160,6 +160,23 @@ def _step_kwargs(a):
                 stop_rule=rule)
 
 
+def _resume_arg(a):
+    """A `train.Resume` from --resume-from, or None.
+
+    A `state.pt` (written by the loop every window) resumes BIT-EXACTLY. A
+    `best.pt` / `last.pt` is WEIGHTS ONLY - its run directory's metrics.jsonl and
+    metadata.json supply the history, the step and the config, and the optimizer
+    moments, RNG streams and data position restart. `train()` records which kind
+    it was in the new run's metadata, and refuses a config that does not match.
+    """
+    path = getattr(a, "resume_from", None)
+    if not path:
+        return None
+    if not os.path.isfile(path):
+        raise SystemExit("--resume-from: no such file %r" % path)
+    return T.Resume(path=path)
+
+
 def _splits():
     sp = DS.load_splits()
     return sorted(sp["train"]), sorted(sp["val"])
@@ -307,7 +324,7 @@ def cmd_overfit10(a):
                    data_caveat=T.dataset_provenance(ds)["caveat"],
                    regularization="NONE: dropout 0, weight_decay 0, no augmentation"))
     model = _make_model(mcfg, cfg)
-    res = T.train(model, ds, cfg)
+    res = T.train(model, ds, cfg, gate_reference=ref, resume=_resume_arg(a))
     _report(res, res["baselines"], "OVERFIT-10 RESULT (%s)" % name)
 
     # TR29: the reference is a RECONSTRUCTION quantity, so the gate scores the
@@ -317,16 +334,9 @@ def cmd_overfit10(a):
     print("")
     print("GATE (neighbour-ambiguity criterion)")
     print(verdict.render())
-    with open(os.path.join(res["run_dir"], "gate.json"), "w",
-              encoding="utf-8") as fh:
-        json.dump(dict(passed=verdict.passed, train_error=verdict.train_error,
-                       train_error_units=res["quantities"]["recon_l1"].units,
-                       total_loss=res["final_train_loss"],
-                       optimizer_steps=res["optimizer_steps"],
-                       steps_per_second=res["steps_per_second"],
-                       stop=res["stop"],
-                       reference=verdict.reference, ratio=verdict.ratio,
-                       detail=ref.as_metadata()), fh, indent=1, default=str)
+    # gate.json was written by train() itself - every window while running, and
+    # finally here - so a kill can no longer destroy the verdict (Stage 4 D).
+    print("  gate.json    %s" % repo_relpath(os.path.join(res["run_dir"], "gate.json")))
     print("  This gate ran on SCRIPTED data and must be re-run on piloted data "
           "before it is cited.")
     return 0 if verdict.passed else 1
@@ -376,7 +386,7 @@ def cmd_full(a):
                    provisional_hyperparameters=PROVISIONAL,
                    data_caveat=T.dataset_provenance(tds)["caveat"]))
     model = _make_model(mcfg, cfg)
-    res = T.train(model, tds, cfg, val_ds=vds)
+    res = T.train(model, tds, cfg, val_ds=vds, resume=_resume_arg(a))
     _report(res, res["baselines"], "FULL-SPLIT RESULT (plumbing only)")
     print("  against the neighbour-ambiguity references:")
     print("    train %.6f / %.6f = %.4f   (reconstruction; TR29)"
@@ -468,6 +478,9 @@ def main():
                                 "(0 = no stop rule; run to the cap)")
             p.add_argument("--stop-rel", type=float, default=0.01,
                            help="minimum relative improvement over the span")
+            p.add_argument("--resume-from", default=None,
+                           help="continue a step-budgeted run from a state.pt "
+                                "(bit-exact) or a best.pt/last.pt (weights only)")
             p.add_argument("--budget-reason", required=True,
                            help="REQUIRED. Why this many epochs - e.g. 'identical "
                                 "to the run being compared' or a wall-clock cap. "

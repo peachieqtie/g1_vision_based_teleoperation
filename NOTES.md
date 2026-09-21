@@ -6662,3 +6662,54 @@ RTX 3050 Laptop at any dataset size - 40 days at the smallest. Twelve runs at th
 reference's own step budget ARE feasible - under a day even at 150 episodes. Which
 of the two the thesis means by "2000 epochs" is the decision that sets the
 schedule; the architecture is secondary to it.
+
+
+---
+
+## 2026-09-21 — Resumable, survivable training; the killed ACT run
+
+The step-budgeted ACT convergence run started 16:14 (`runs/20260921-161407_act_overfit10_K100`)
+was killed at **step 113,000** (epoch 119) by a CUDA out-of-memory error raised inside
+`clip_grad_norm_` - another process took GPU memory; the model itself needs 927 MiB. Window
+times had risen from ~73 s to 80-92 s over the preceding five windows, the same shared-memory
+pressure signature measured earlier. It was NOT stopped by the stopping rule (relative
+improvement over the trailing 10k steps was still 4.68%) and did NOT reach the 200,000-step
+cap. Because result.json and gate.json were written only at the end, the 2 h 19 min run left
+no verdict. At the kill: recon_l1 0.060190, reference 0.044657, ratio 1.348, still falling;
+KL 5.23e-05.
+
+### What best.pt holds (measured)
+Weights (40,226,006 parameters plus the 52,224-element fixed `pos_table` buffer), the model
+config, and run provenance. **No optimizer state, no RNG state, no step counter.** Its stored
+total loss (0.060713131691638535) matches the step-113,000 metrics row EXACTLY, and that row is
+the run's global minimum reconstruction - so best.pt is the last window before the kill.
+
+### Resume (`train.Resume`, `--resume-from`)
+- **Full state** - `state.pt`, written every window: weights, AdamW state (both moments and
+  its step count), every RNG stream (torch CPU and CUDA, numpy, python), the data-order
+  generator at the start of the current pass and how many batches of it were done, the
+  history, best value and elapsed time. Continuation is **bit-exact**:
+  `test_full_state_resume_is_bit_exact` stops a dropout-bearing ACT mid-pass and shows the
+  resumed curve equals the uninterrupted one to the bit, and
+  `test_resume_actually_depends_on_the_restored_state` shows wiping the optimizer state
+  changes it (so the first test is not vacuous). There is no LR scheduler in this loop;
+  `scheduler=None` is recorded rather than implied.
+- **Weights only** - `best.pt` / `last.pt`. The step is identified by the exact loss match;
+  history and config come from the prior run's own files. NOT restored: AdamW's moments (they
+  restart at zero with fresh bias correction, so the first steps are sign-like steps of size
+  ~lr and a short transient is expected), the RNG streams, and the position within the data
+  pass. The curve continues from the resume point but is not the curve the uninterrupted run
+  would have drawn. The resumed run's metadata records the kind and each loss.
+- Both refuse a resume whose training config (lr, weight decay, optimizer, batch, clip, seed,
+  window, stop rule, determinism) or architecture differs. A resumed run writes to its own
+  directory with the prior segment's history copied in (tagged `segment`), leaving the killed
+  run's directory untouched as evidence.
+- Cost: state.pt is 461 MiB and takes ~1.2 s to write, 1.5% of a 73 s window.
+
+### Survivable runs
+Every window now appends metrics.jsonl and rewrites result.json (status "running") and
+gate.json (the PROVISIONAL verdict at that step) with write-then-rename, so a kill mid-write
+cannot truncate them. A Python-level failure - an out-of-memory error is one - writes status
+"crashed" and the reason before re-raising (`test_a_crash_leaves_the_verdict_and_a_resumable_state`
+injects one mid-step and reads result.json from disk while the run is still alive). A hard OS
+kill cannot be caught; the last window's files then say the step at which the run was last alive.
