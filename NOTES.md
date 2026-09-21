@@ -6513,3 +6513,152 @@ The next session's first experiment is a re-run at lr 1e-5, unchanged in every
 other respect. If the KL survives and the reconstruction falls, the cause was the
 learning rate; if the KL still collapses, beta needs a schedule or a floor and
 that is a Chapter 3 disclosure, not a tuning choice.
+
+---
+
+## 2026-09-21 — ACT at lr 1e-5: the collapse was the learning rate; the gate still fails
+
+ONE variable changed from the lr-1e-3 run: `lr` 1e-3 -> 1e-5. Proven by diffing
+the two runs' `metadata.json`: the only differing `TrainConfig` field is `lr`;
+model (72,534,998 params), loader, data seeds, baselines and seed are identical.
+Runs: `runs/20260921-121515_act_overfit10_K100` (1e-3) and
+`runs/20260921-151816_act_overfit10_K100` (1e-5). Batch 8, beta 10, weight decay
+0.0, 12 epochs = 11,448 optimizer steps, both.
+
+### The KL trajectory, reported on its own
+
+| epoch | recon (1e-3) | KL (1e-3) | recon (1e-5) | KL (1e-5) |
+|---|---|---|---|---|
+| 1 | 0.494427 | 0.193 | 0.375246 | 0.50008 |
+| 2 | 0.468553 | 0.001 | 0.283309 | 0.22377 |
+| 3 | 0.467091 | 0.001 | 0.235370 | 0.14713 |
+| 6 | 0.466541 | 0.0003 | 0.181994 | 0.04733 |
+| 9 | 0.466338 | 0.00001 | 0.153455 | 0.02411 |
+| 12 | 0.466174 | 0.00000 | 0.138119 | 0.01509 |
+
+**At lr 1e-3 the latent collapsed within two epochs and reconstruction froze. At
+lr 1e-5 it did not collapse** - KL is 0.01509 at epoch 12 against 0.00000 - and
+reconstruction fell 63% (0.375 -> 0.138) and was still falling (-2.8% in the last
+epoch). So the lr-1e-3 failure was the learning rate.
+
+**But the latent is weakly used, and its use is declining.** KL falls
+monotonically and roughly geometrically late in the run (~x0.85 per epoch), and
+0.015 nats summed over 32 latent dims is very little information. At epoch 12
+the weighted term beta*KL = 0.151 is LARGER than the reconstruction term (0.138):
+the KL penalty still dominates the objective, which is why the optimizer keeps
+spending the latent. This is reported as a finding about a state-only CVAE, not
+as a failure to fix. No annealing, free bits, or other collapse remedy was
+applied.
+
+### THE GATE SCORED THE WRONG QUANTITY FOR ACT
+
+`tools/train_bc.py` scores `res["final_train_loss"]`, which for ACT is the TOTAL
+loss, reconstruction PLUS beta*KL. The neighbour-ambiguity reference is a
+reconstruction quantity - mean |action difference| over trainable dims - so the
+comparison put KL nats into an action-unit test. BC and chunked BC have no KL, so
+there it made no difference; at lr 1e-3 it was right by accident, because KL had
+collapsed to zero.
+
+| | value | ratio vs 0.044657 |
+|---|---|---|
+| reported by the gate (total loss) | 0.289004 | 6.47 |
+| correct: reconstruction only | 0.138119 | **3.09** |
+
+**FAIL either way.** The gate code was NOT changed in this session (the session
+was scoped to one variable); the fix - score `recon_l1`, which `train()` already
+logs, exactly as `evaluate()` already does for validation - is recommended and
+awaits Charles. `gate.json` for the 1e-5 run therefore records ratio 6.47; this
+entry is the correction.
+
+### TR28 closed structurally, and the second leak it exposed
+
+ACT now states its own optimizer config: `ACTConfig.lr` has NO default (an
+unstated lr is a `TypeError`), and `train.assert_optimizer_source` compares what
+a model DECLARES (`optimizer_config()`) against the `TrainConfig` it is handed and
+raises before a single step on any disagreement. The runner builds each model's
+own config and derives the `TrainConfig` from it.
+
+Running the guard against the old wiring found a SECOND leak: `weight_decay`. ACT
+declares the reference's 1e-4 (`main.py:17`); the runner had been handing it 0.0.
+Every value that reached ACT from outside, enumerated:
+
+| value | came from | reference | status |
+|---|---|---|---|
+| lr | `BCConfig` default 1e-3 | 1e-5 | LEAKED, now stated |
+| weight_decay | runner hardcode 0.0 | 1e-4 | LEAKED, now stated (0.0 at the gate, by design) |
+| optimizer | `BCConfig` default | AdamW | same value, now stated |
+| batch_size | CLI via `BCConfig` | 8 | routed, stated on CLI |
+| obs_window, chunk_size | `BCConfig` | - | shared by design (D1, D2) |
+| grad_clip | `TrainConfig` default 1.0 | none | NOT a model declaration; row 40, unresolved |
+| seed, determinism, workers | `TrainConfig` defaults | - | loop settings, correctly shared |
+
+`grad_clip` is the one still arriving by default. It is a loop setting rather
+than a model declaration, so the guard does not cover it; the reference applies
+none. Row 40, unresolved, identical across models.
+
+### The epoch budget had no recorded reason (TR28's family)
+
+BC's gate ran 300 epochs because 300 was the argparse default; ACT's ran 12
+because a wall-clock cap was typed on the command line. No run recorded why.
+`--epochs` and `--budget-reason` are now both REQUIRED, and each run's metadata
+records `epoch_budget`, `steps_per_epoch`, `optimizer_steps` and the reason.
+
+### What "2000 epochs" means - the two codebases disagree by ~760x
+
+ACT's published recipe is 2000 epochs at batch 8 (`README.md:76-77`). The
+reference's epoch is NOT ours:
+
+- ours: every tick of every episode - 7,628 samples, 954 steps at batch 8, on 10
+  episodes;
+- theirs: `__len__` is the number of EPISODES (`utils.py:21`) and each item draws
+  ONE random start tick (`utils.py:35`). With 50 episodes x 0.8 train = 40
+  (`constants.py:8`, `utils.py:114`), an epoch is 40 samples = 5 steps, and 2000
+  epochs = **10,000 optimizer steps in total**.
+
+**The lr-1e-5 run took 11,448 steps - 1.14x the reference's ENTIRE training - and
+reconstruction is still 3.09x the ambiguity reference.** So "we did not train
+long enough" is weaker than it looks: we have already given ACT more updates than
+its authors did. Against that, the reference's task is different (50 episodes,
+a 2 s horizon at 50 Hz, 1,200 image tokens), and reconstruction was still
+falling here. Both readings are recorded; neither is settled.
+
+### Compute cost (Part D), measured at batch 8, idle GPU, strict determinism
+
+| variant | params | ms/step | peak VRAM |
+|---|---|---|---|
+| as built (h512, ff3200, 7 dec) | 72.5M | 140.9 | 1752 MiB |
+| decoder layers 2-7 removed | 40.2M | 71.1 | 927 MiB |
+| h256, ff1024, 1 dec | 7.5M | 48.4 | 291 MiB |
+| h128, ff512, 1 dec | 1.9M | 47.2 | 165 MiB |
+
+The gate epoch measured 143.0 s = 149.95 ms/step effective, i.e. 9.1 ms/step of
+loader overhead over the pure-compute figure.
+
+**Decoder layers 2-7 are 44.5% of parameters and 49.5% of step time, and removing
+them is BIT-IDENTICAL**: with layer 1's weights shared, a 7-layer model read at
+`hs[0]` and a 1-layer model give max |difference| exactly 0.0 in inference output,
+training output, loss, and every gradient over the shared parameters. It is a
+pure compute saving, not an architectural change in any behavioural sense.
+
+Reducing width barely helps below that: 71.1 -> 48.4 -> 47.2 ms/step. The floor
+near 47 ms is not width - it is the K=100 decoder sequence, the 102-token CVAE
+encoder, kernel-launch overhead and strict determinism. No rule for "proportionate
+to a two-token input" exists in the source; the two reduced sizes are measurement
+points, not a recommendation derived from it.
+
+Wall time, as built:
+
+| | 10 eps | 32 eps | 150 eps |
+|---|---|---|---|
+| 2000 OUR epochs, one run | 3.3 days | 10.5 days | 49.3 days |
+| 2000 OUR epochs, twelve runs | 39.7 days | 126.2 days | 591.7 days |
+| 2000 REFERENCE epochs, one run | 6.2 min | 20.0 min | 1.6 h |
+| 2000 REFERENCE epochs, twelve runs | 1.2 h | 4.0 h | 18.7 h |
+
+With decoder layers 2-7 removed, every figure roughly halves.
+
+**Feasibility, plainly:** twelve runs of 2000 of OUR epochs are NOT feasible on an
+RTX 3050 Laptop at any dataset size - 40 days at the smallest. Twelve runs at the
+reference's own step budget ARE feasible - under a day even at 150 episodes. Which
+of the two the thesis means by "2000 epochs" is the decision that sets the
+schedule; the architecture is secondary to it.

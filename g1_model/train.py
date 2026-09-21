@@ -313,7 +313,49 @@ class TrainConfig:
     notes: Dict[str, object] = field(default_factory=dict)
 
 
+class OptimizerSourceError(TrainError):
+    """A TrainConfig whose optimizer settings are not the model's own (TR28)."""
+
+
+def assert_optimizer_source(model: nn.Module, cfg: TrainConfig) -> None:
+    """The model's DECLARED optimizer settings must be the ones being used.
+
+    TR28, made structural. The Stage-4 ACT gate ran at lr 1e-3 because the shared
+    runner built its `TrainConfig` from `BCConfig` - ACT's published 1e-5 never
+    reached it and nothing raised, because nothing compared. Sharing a training
+    LOOP is correct; sharing a hyperparameter SOURCE is the bug.
+
+    Any model that declares `optimizer_config()` is checked here, so a mismatch
+    stops the run before a single step. A model that declares nothing is not
+    checked - it has made no claim to contradict - which keeps the loop
+    model-agnostic while making silence impossible for anything that does.
+    """
+    declared = getattr(model, "optimizer_config", None)
+    if declared is None:
+        return
+    want = declared()
+    got = dict(lr=float(cfg.lr), weight_decay=float(cfg.weight_decay),
+               optimizer=str(cfg.optimizer))
+    bad = {}
+    for k, w in want.items():
+        g = got[k]
+        differs = (abs(float(w) - float(g)) > 1e-12 if isinstance(w, float)
+                   else w != g)
+        if differs:
+            bad[k] = (w, g)
+    if bad:
+        lines = ["  %-13s model declares %r, TrainConfig has %r" % (k, w, g)
+                 for k, (w, g) in sorted(bad.items())]
+        raise OptimizerSourceError(
+            "%s declares optimizer settings the TrainConfig does not carry, so "
+            "the run would use another model's hyperparameters:" % type(model).__name__
+            + "".join("\n" + L for L in lines)
+            + "\n  Build the TrainConfig from THIS model's config. The loop is "
+              "shared; the hyperparameter source is not (TR28).")
+
+
 def make_optimizer(model: nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
+    assert_optimizer_source(model, cfg)
     if cfg.optimizer.lower() == "adamw":
         return torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                                  weight_decay=cfg.weight_decay)

@@ -44,7 +44,16 @@ def _raises(exc, fn, *a, **k):
                                                   exc.__name__))
 
 
+#: The small test model's optimizer settings, STATED rather than inherited
+#: (TR28). They match the TrainConfigs the training tests below construct, which
+#: is exactly what `train.assert_optimizer_source` now enforces.
+TEST_LR = 1e-4
+TEST_WD = 0.0
+
+
 def _cfg(K=8, W=1, **kw):
+    kw.setdefault("lr", TEST_LR)
+    kw.setdefault("weight_decay", TEST_WD)
     return ACTConfig(obs_window=W, chunk_size=K, hidden_dim=64,
                      dim_feedforward=128, nheads=4, enc_layers=2, dec_layers=3,
                      **kw)
@@ -365,9 +374,10 @@ def test_shape_contract_and_rejections():
     _raises(ValueError, m, torch.randn(3, 1, 46))                   # wrong state dim
     obs, a, p = _batch(2, K=7)
     _raises(ValueError, m, obs, a, p)                               # wrong K
-    _raises(ValueError, ACTConfig, obs_window=0, chunk_size=1)
-    _raises(ValueError, ACTConfig, obs_window=1, chunk_size=0)
-    _raises(ValueError, ACTConfig, obs_window=1, chunk_size=1, hidden_dim=10, nheads=4)
+    _raises(ValueError, ACTConfig, obs_window=0, chunk_size=1, lr=TEST_LR)
+    _raises(ValueError, ACTConfig, obs_window=1, chunk_size=0, lr=TEST_LR)
+    _raises(ValueError, ACTConfig, obs_window=1, chunk_size=1, hidden_dim=10, nheads=4,
+            lr=TEST_LR)
 
 
 # ═══ B5: the loss reuses Stage 2's, masks apply ══════════════════════════════
@@ -567,6 +577,90 @@ def test_there_is_no_dead_use_lstm_flag():
     assert "use_lstm" not in {f for f in ACTConfig.__dataclass_fields__}
     assert not any(isinstance(mod, (torch.nn.LSTM, torch.nn.GRU, torch.nn.RNN))
                    for mod in _model().modules())
+
+
+# ═══ TR28: ACT states its own optimizer config, and a borrowed one RAISES ═══════
+def test_unstated_learning_rate_is_an_error_not_an_inheritance():
+    """TR28. The Stage-4 gate ran ACT at lr 1e-3 because the shared runner drew
+    `lr` from `BCConfig`. An ACTConfig with no lr must not construct at all."""
+    import inspect
+    p = inspect.signature(ACTConfig).parameters["lr"]
+    assert p.default is inspect.Parameter.empty, "ACTConfig.lr must have no default"
+    _raises(TypeError, ACTConfig, obs_window=1, chunk_size=4)
+
+
+def test_act_config_cannot_be_satisfied_by_bc_config_values():
+    """The exact leak, reproduced and refused: a TrainConfig assembled from
+    BCConfig's optimizer values must be rejected for an ACT model."""
+    from g1_model.models import BCConfig
+    bc = BCConfig(obs_window=1, chunk_size=4)
+    m = ACTPolicy(_cfg(K=4, lr=A.LR, weight_decay=A.WEIGHT_DECAY))
+    leaked = T.TrainConfig(epochs=1, batch_size=8, lr=bc.lr,
+                           weight_decay=bc.weight_decay, optimizer=bc.optimizer)
+    assert bc.lr != A.LR, "the test is vacuous if the two lrs happen to agree"
+    e = _raises(T.OptimizerSourceError, T.make_optimizer, m, leaked)
+    assert "lr" in str(e) and "TR28" in str(e)
+    ok = T.TrainConfig(epochs=1, batch_size=8, **m.optimizer_config())
+    T.make_optimizer(m, ok)                           # its own values: accepted
+
+
+def test_every_declared_optimizer_value_is_checked_not_just_lr():
+    """If lr leaked, others could. weight_decay DID - the old runner handed ACT
+    0.0 while the reference is 1e-4 - so the guard compares every declared value."""
+    m = ACTPolicy(_cfg(K=4, lr=A.LR, weight_decay=A.WEIGHT_DECAY))
+    good = m.optimizer_config()
+    for field_, bad in (("lr", 1e-3), ("weight_decay", 0.0), ("optimizer", "sgd")):
+        cfg = dict(good); cfg[field_] = bad
+        e = _raises(T.OptimizerSourceError, T.make_optimizer, m,
+                    T.TrainConfig(epochs=1, batch_size=8, **cfg))
+        assert field_ in str(e), (field_, str(e))
+
+
+def test_reference_optimizer_values_are_cited_constants():
+    """README.md:77 --lr 1e-5; main.py:17 --weight_decay 1e-4; main.py:87 AdamW."""
+    assert A.LR == 1e-5 and A.WEIGHT_DECAY == 1e-4 and A.OPTIMIZER == "adamw"
+    c = ACTConfig(obs_window=1, chunk_size=4, lr=A.LR)
+    assert c.optimizer_config() == dict(lr=1e-5, weight_decay=1e-4, optimizer="adamw")
+
+
+def test_the_runner_takes_act_lr_from_act_not_from_bc():
+    """The runner is where the leak happened, so the runner is tested directly."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "tools"))
+    import importlib
+    tb = importlib.import_module("train_bc")
+    gate = tb._model_config("act", 100, 8, gate=True)
+    assert isinstance(gate, ACTConfig)
+    assert gate.lr == A.LR, "the runner must use ACT's own lr"
+    assert gate.weight_decay == 0.0, "the gate is unregularised for every model"
+    full = tb._model_config("act", 100, 8, gate=False)
+    assert full.weight_decay == A.WEIGHT_DECAY, "outside the gate: the reference's"
+    tc = tb._train_config(gate, 12, 8, seed=0)
+    assert (tc.lr, tc.weight_decay, tc.optimizer) == (A.LR, 0.0, "adamw")
+    m = ACTPolicy(_cfg(K=4, lr=gate.lr, weight_decay=gate.weight_decay))
+    T.assert_optimizer_source(m, tc)                  # consistent: no raise
+
+
+def test_epoch_budget_must_be_stated_with_a_reason():
+    """TR28's family (A2). BC's gate ran 300 epochs because 300 was the argparse
+    default; ACT's ran 12 because a wall-clock cap was typed on the command line.
+    Neither run recorded why. Both --epochs and --budget-reason are now REQUIRED
+    and go into metadata beside the optimizer steps they amount to."""
+    import subprocess
+    tool = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "tools", "train_bc.py")
+    for extra in ([], ["--epochs", "3"]):
+        r = subprocess.run([sys.executable, tool, "overfit10", "--model", "act"] + extra,
+                           capture_output=True, text=True, timeout=120)
+        assert r.returncode != 0, extra
+        assert "--budget-reason" in r.stderr, r.stderr
+    sys.path.insert(0, os.path.dirname(tool))
+    import importlib, types
+    tb = importlib.import_module("train_bc")
+    ns = types.SimpleNamespace(epochs=12, batch=8, budget_reason="identical to the run compared")
+    b = tb._budget(ns, list(range(7628)))
+    assert b == dict(epoch_budget=12, steps_per_epoch=954, optimizer_steps=11448,
+                     epoch_budget_reason="identical to the run compared"), b
 
 
 def _tests():

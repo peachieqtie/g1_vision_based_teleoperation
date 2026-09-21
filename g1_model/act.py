@@ -95,6 +95,17 @@ KL_WEIGHT: float = 10.0
 #: the paper's `k` for chunk size; renamed `m` here to match the paper's symbol.
 TEMPORAL_ENSEMBLE_M: float = 0.01
 
+#: reference/act/README.md:77 `--lr 1e-5`; paper Table III "learning rate 1e-5".
+#: NOT `detr/main.py:14`'s default of 1e-4, which the published command overrides.
+#: TR28: this value must be STATED by ACT, never inherited from another model's
+#: config. The Stage-4 gate ran at 1e-3 because the shared runner drew `lr` from
+#: `BCConfig`, and nothing raised.
+LR: float = 1e-5
+#: reference/act/detr/main.py:17 `--weight_decay 1e-4`, not overridden by README.md:76.
+WEIGHT_DECAY: float = 1e-4
+#: reference/act/detr/main.py:87 `torch.optim.AdamW`.
+OPTIMIZER: str = "adamw"
+
 #: MEASURED on the pinned commit, 2026-09-21. `detr_vae.py:131` reads `hs[0]`, and
 #: `transformer.py:76` returns (num_dec_layers, bs, num_queries, d), so index 0 is
 #: the FIRST decoder layer's output. Backward through `hs[0]` on a 7-layer decoder
@@ -314,6 +325,11 @@ class ACTConfig:
 
     obs_window: int                 # required; 1 to match the reference
     chunk_size: int                 # required; K = number of decoder queries
+    #: REQUIRED, no default (TR28). ACT's published value is `LR` = 1e-5; the
+    #: field is left unset so that a caller who does not think about it gets a
+    #: TypeError instead of somebody else's learning rate. The Stage-4 gate at
+    #: lr 1e-3 is what this field exists to prevent.
+    lr: float
 
     hidden_dim: int = HIDDEN_DIM
     dim_feedforward: int = DIM_FEEDFORWARD
@@ -325,6 +341,8 @@ class ACTConfig:
     pre_norm: bool = PRE_NORM
     latent_dim: int = LATENT_DIM
     kl_weight: float = KL_WEIGHT
+    weight_decay: float = WEIGHT_DECAY
+    optimizer: str = OPTIMIZER
 
     #: OURS, PROVISIONAL. The reference's action head is `Linear(hidden, 14)`
     #: (`detr_vae.py:52`, `state_dim = 14` hardcoded at `:230`). Our action is
@@ -341,10 +359,22 @@ class ACTConfig:
             raise ValueError("hidden_dim %d must be divisible by nheads %d"
                              % (self.hidden_dim, self.nheads))
 
+    def optimizer_config(self) -> dict:
+        """The optimizer settings ACT declares for itself (TR28).
+
+        `train.make_optimizer` compares this against the `TrainConfig` it was
+        handed and RAISES on any disagreement, so a runner that assembles the
+        TrainConfig from another model's config cannot start. The Stage-4 leak
+        was silent precisely because no such comparison existed.
+        """
+        return dict(lr=float(self.lr), weight_decay=float(self.weight_decay),
+                    optimizer=str(self.optimizer))
+
     def as_metadata(self) -> dict:
         d = asdict(self)
         d.update(reference_commit=REF_COMMIT, reference_paper=REF_PAPER,
-                 decoder_layer_read=DECODER_LAYER_READ)
+                 decoder_layer_read=DECODER_LAYER_READ,
+                 reference_lr=LR, reference_weight_decay=WEIGHT_DECAY)
         return d
 
 
@@ -424,6 +454,10 @@ class ACTPolicy(nn.Module):
         # parameters that receive no gradient.
 
         self._reset_parameters()
+
+    def optimizer_config(self) -> dict:
+        """Hook read by `train.make_optimizer`. See `ACTConfig.optimizer_config`."""
+        return self.cfg.optimizer_config()
 
     def _reset_parameters(self):
         """reference/act/detr/models/transformer.py:44-47 — xavier_uniform_ on

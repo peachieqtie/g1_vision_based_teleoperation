@@ -35,6 +35,7 @@ report is a caveat that gets lost.
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import os
 import sys
@@ -75,17 +76,68 @@ def _load(seeds, bc: BCConfig, norm_meta, norm_fit_seeds=None) -> ChunkDataset:
         norm_fit_seeds=norm_fit_seeds)
 
 
-def _make_model(kind, bc, tcfg):
-    """The ONE place a model is chosen. Every model is built through
-    `seeded_build` (D10): seeding happens inside `train()` at entry, which is
-    already too late to control weight initialisation."""
+def _model_config(kind, K, batch, gate):
+    """Each model STATES its own optimizer settings (TR28).
+
+    The runner shares the training LOOP. It never shares a hyperparameter source:
+    the Stage-4 ACT gate ran at lr 1e-3 because this function used to build ACT
+    from a `BCConfig`, and `lr` came along silently. Now each branch constructs
+    the model's own config, and `train.assert_optimizer_source` raises if the
+    TrainConfig disagrees with what the model declares.
+
+    `gate=True` means the overfit-10 gate, which is UNREGULARISED BY DESIGN for
+    every model: weight decay 0 and dropout 0 for BC, weight decay 0 for ACT.
+    That is stated here for each model rather than forced from outside.
+    """
     if kind == "bc":
-        return T.seeded_build(tcfg, build_bc, cfg=bc)
+        return BCConfig(obs_window=1, chunk_size=K, batch_size=int(batch),
+                        **(dict(dropout=0.0, weight_decay=0.0) if gate else {}))
     if kind == "act":
-        return T.seeded_build(tcfg, build_act,
-                              cfg=ACTConfig(obs_window=bc.obs_window,
-                                            chunk_size=bc.chunk_size))
+        from g1_model.act import LR as ACT_LR, WEIGHT_DECAY as ACT_WD
+        # lr is ACT's published 1e-5 (README.md:77). weight_decay is the
+        # reference's 1e-4 (main.py:17) EXCEPT at the gate, which is unregularised
+        # for every model. Dropout stays at ACT's 0.1 (main.py:43): it is part of
+        # the architecture and was 0.1 in the lr-1e-3 run too, so changing it
+        # would change a second variable.
+        return ACTConfig(obs_window=1, chunk_size=K, lr=ACT_LR,
+                         weight_decay=0.0 if gate else ACT_WD)
     raise SystemExit("unknown --model %r (bc|act)" % kind)
+
+
+def _train_config(mcfg, epochs, batch, **kw):
+    """A TrainConfig whose optimizer values come from THE MODEL'S OWN config.
+
+    `_budget`, if given, is the stated epoch budget and is merged into `notes`
+    so that it is written into the run's metadata.json beside everything else.
+    """
+    budget = kw.pop("_budget", None)
+    if budget:
+        kw["notes"] = dict(kw.get("notes") or {}, **budget)
+    if isinstance(mcfg, ACTConfig):
+        opt = mcfg.optimizer_config()
+    else:
+        opt = dict(lr=mcfg.lr, weight_decay=mcfg.weight_decay,
+                   optimizer=mcfg.optimizer)
+    return T.TrainConfig(epochs=int(epochs), batch_size=int(batch), **opt, **kw)
+
+
+def _make_model(mcfg, tcfg):
+    """Build through `seeded_build` (D10): seeding inside `train()` is already
+    too late to control weight initialisation."""
+    if isinstance(mcfg, ACTConfig):
+        return T.seeded_build(tcfg, build_act, cfg=mcfg)
+    return T.seeded_build(tcfg, build_bc, cfg=mcfg)
+
+
+def _budget(a, ds):
+    """The epoch budget, stated: epochs, the optimizer steps they amount to, and
+    why. Steps are recorded because they - not epochs - are what compares across
+    batch sizes: at batch 8 an epoch of 7,628 samples is 954 steps, at batch 256
+    it is 30, so "300 epochs" and "12 epochs" are 9,000 and 11,448 steps."""
+    spe = int(math.ceil(len(ds) / float(a.batch)))
+    return dict(epoch_budget=int(a.epochs), steps_per_epoch=spe,
+                optimizer_steps=spe * int(a.epochs),
+                epoch_budget_reason=str(a.budget_reason))
 
 
 def _splits():
@@ -178,8 +230,8 @@ def cmd_overfit10(a):
     prediction target changed.
     """
     K = int(a.chunk)
-    bc = BCConfig(obs_window=1, chunk_size=K, dropout=0.0, weight_decay=0.0,
-                  batch_size=int(a.batch))
+    mcfg = _model_config(a.model, K, a.batch, gate=True)
+    bc = BCConfig(obs_window=1, chunk_size=K)       # loader shape only; W_o, K
     tr, _ = _splits()
     seeds = tr[:10]
     st, ac, meta = DS.load_norm_stats()
@@ -200,10 +252,10 @@ def cmd_overfit10(a):
     ref = AMB.neighbour_ambiguity(ds, device=T.select_device())
     print("  %s" % ref.cite())
 
-    cfg = T.TrainConfig(
-        epochs=int(a.epochs), batch_size=bc.batch_size, lr=bc.lr,
-        weight_decay=0.0, optimizer=bc.optimizer, seed=0,
+    cfg = _train_config(
+        mcfg, a.epochs, a.batch, seed=0,
         run_name="%s_overfit10_K%d" % (a.model, K), log_every=max(1, int(a.epochs) // 20),
+        _budget=_budget(a, ds),
         notes=dict(gate="overfit-10", chunk_size=K, model=a.model,
                    **(dict(
                        kl_weight_used=10.0,
@@ -226,7 +278,7 @@ def cmd_overfit10(a):
                    provisional_hyperparameters=PROVISIONAL,
                    data_caveat=T.dataset_provenance(ds)["caveat"],
                    regularization="NONE: dropout 0, weight_decay 0, no augmentation"))
-    model = _make_model(a.model, bc, cfg)
+    model = _make_model(mcfg, cfg)
     res = T.train(model, ds, cfg)
     _report(res, res["baselines"], "OVERFIT-10 RESULT (%s)" % name)
 
@@ -247,7 +299,8 @@ def cmd_overfit10(a):
 def cmd_full(a):
     """Part B: the 32/8 split, deferred from Stage 2. A PLUMBING CHECK."""
     K = int(a.chunk)
-    bc = BCConfig(obs_window=1, chunk_size=K, batch_size=int(a.batch))
+    mcfg = _model_config(a.model, K, a.batch, gate=False)
+    bc = BCConfig(obs_window=1, chunk_size=K)       # loader shape only; W_o, K
     tr, va = _splits()
     st, ac, meta = DS.load_norm_stats()
     tds = _load(tr, bc, meta)
@@ -270,10 +323,10 @@ def cmd_full(a):
     print("    (the two differ because the reference depends on data DENSITY - "
           "32 episodes vs 8 - so they are not interchangeable.)")
 
-    cfg = T.TrainConfig(
-        epochs=int(a.epochs), batch_size=bc.batch_size, lr=bc.lr,
-        weight_decay=bc.weight_decay, optimizer=bc.optimizer, seed=0,
+    cfg = _train_config(
+        mcfg, a.epochs, a.batch, seed=0,
         run_name="%s_full_K%d" % (a.model, K), log_every=max(1, int(a.epochs) // 20),
+        _budget=_budget(a, tds),
         notes=dict(gate="full-split plumbing check",
                    is_a_result=False,
                    chunk_size=K,
@@ -285,7 +338,7 @@ def cmd_full(a):
                    ambiguity_reference_val=ref_va.as_metadata(),
                    provisional_hyperparameters=PROVISIONAL,
                    data_caveat=T.dataset_provenance(tds)["caveat"]))
-    model = _make_model(a.model, bc, cfg)
+    model = _make_model(mcfg, cfg)
     res = T.train(model, tds, cfg, val_ds=vds)
     _report(res, res["baselines"], "FULL-SPLIT RESULT (plumbing only)")
     print("  against the neighbour-ambiguity references:")
@@ -361,7 +414,17 @@ def main():
         p = sub.add_parser(name)
         p.set_defaults(fn=fn)
         if ep:
-            p.add_argument("--epochs", type=int, default=ep)
+            # TR28's family: an epoch budget that differs across stages for an
+            # UNSTATED reason. BC's gate ran 300 because 300 was the default here;
+            # ACT's ran 12 because a wall-clock limit was typed on the command
+            # line; neither run recorded why. So the budget has no default and
+            # must come with a reason, and both go into the run's metadata.
+            p.add_argument("--epochs", type=int, required=True,
+                           help="REQUIRED. No default: see --budget-reason")
+            p.add_argument("--budget-reason", required=True,
+                           help="REQUIRED. Why this many epochs - e.g. 'identical "
+                                "to the run being compared' or a wall-clock cap. "
+                                "Written into metadata.json.")
         if name in ("overfit10", "full"):
             p.add_argument("--chunk", type=int, default=1,
                            help="K. 1 = BC, >1 = chunked BC (same class)")
