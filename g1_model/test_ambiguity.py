@@ -315,8 +315,8 @@ def test_gate_reports_both_numbers_and_the_ratio():
         print("      (skipped: nothing staged in data/synthetic)")
         return
     r = AMB.neighbour_ambiguity(ds)
-    good = AMB.gate(r.mean * 0.5, r)
-    bad = AMB.gate(r.mean * 2.0, r)
+    good = AMB.gate(AMB.Quantity(r.mean * 0.5, AMB.RECON_UNITS), r)
+    bad = AMB.gate(AMB.Quantity(r.mean * 2.0, AMB.RECON_UNITS), r)
     assert good.passed is True and bad.passed is False
     assert abs(good.ratio - 0.5) < 1e-9 and abs(bad.ratio - 2.0) < 1e-9
     for v in (good, bad):
@@ -325,7 +325,7 @@ def test_gate_reports_both_numbers_and_the_ratio():
         assert v.detail.cite() in txt
     assert "PASS" in good.render() and "FAIL" in bad.render()
     # a boundary case is a fail, not a pass: strictly below
-    assert AMB.gate(r.mean, r).passed is False
+    assert AMB.gate(AMB.Quantity(r.mean, AMB.RECON_UNITS), r).passed is False
 
 
 def test_gate_refuses_a_degenerate_reference():
@@ -335,7 +335,7 @@ def test_gate_refuses_a_degenerate_reference():
         return
     r = AMB.neighbour_ambiguity(ds)
     r.mean = 0.0
-    _raises(AMB.AmbiguityError, AMB.gate, 0.001, r)
+    _raises(AMB.AmbiguityError, AMB.gate, AMB.Quantity(0.001, AMB.RECON_UNITS), r)
 
 
 def test_one_sample_has_no_neighbour_and_says_so():
@@ -368,6 +368,37 @@ def test_curve_requires_an_explicit_tracking_policy():
     st, ac = (spec.NormStats.identity("state"), spec.NormStats.identity("action"))
     _raises(AMB.AmbiguityError, AMB.ambiguity_curve, DS.SYNTHETIC, [0, 1],
             [1, 2], 1, st, ac)
+
+
+def test_gate_refuses_a_quantity_in_other_units():
+    """TR29. The gate compared ACT's TOTAL loss (reconstruction + beta*KL, 0.289)
+    against a reconstruction reference and reported ratio 6.47 where the right
+    answer was 3.09. It was silent, and right by accident twice (no KL for BC;
+    KL collapsed to 0 for ACT at lr 1e-3). A bare float and a total loss are both
+    refused now; only a reconstruction-unit Quantity is scored."""
+    ds = _staged(K=1, W=1, seeds=[0, 1])
+    if ds is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    r = AMB.neighbour_ambiguity(ds)
+    assert r.units == AMB.RECON_UNITS
+    e = _raises(AMB.UnitsError, AMB.gate, r.mean * 0.5, r)          # bare float
+    assert "Quantity" in str(e) and "TR29" in str(e)
+    e = _raises(AMB.UnitsError, AMB.gate,
+                AMB.Quantity(r.mean * 0.5, AMB.TOTAL_LOSS_UNITS), r)  # total loss
+    assert AMB.TOTAL_LOSS_UNITS in str(e) and AMB.RECON_UNITS in str(e)
+    ok = AMB.gate(AMB.Quantity(r.mean * 0.5, AMB.RECON_UNITS), r)
+    assert ok.passed and abs(ok.ratio - 0.5) < 1e-9
+
+
+def test_train_labels_its_quantities_at_the_source():
+    """The labels are only as honest as where they are attached, so they are
+    attached in train(), the one place that knows which number is which."""
+    import inspect
+    from g1_model import train as T
+    src = inspect.getsource(T.train)
+    assert "Quantity(float(history[-1][\"recon_l1\"]), RECON_UNITS)" in src, src
+    assert "TOTAL_LOSS_UNITS" in src
 
 
 def _tests():

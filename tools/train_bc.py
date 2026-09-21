@@ -118,7 +118,8 @@ def _train_config(mcfg, epochs, batch, **kw):
     else:
         opt = dict(lr=mcfg.lr, weight_decay=mcfg.weight_decay,
                    optimizer=mcfg.optimizer)
-    return T.TrainConfig(epochs=int(epochs), batch_size=int(batch), **opt, **kw)
+    return T.TrainConfig(epochs=None if epochs is None else int(epochs),
+                         batch_size=int(batch), **opt, **kw)
 
 
 def _make_model(mcfg, tcfg):
@@ -135,9 +136,28 @@ def _budget(a, ds):
     batch sizes: at batch 8 an epoch of 7,628 samples is 954 steps, at batch 256
     it is 30, so "300 epochs" and "12 epochs" are 9,000 and 11,448 steps."""
     spe = int(math.ceil(len(ds) / float(a.batch)))
+    if getattr(a, "max_steps", None):
+        # Step-budgeted: the comparable unit. The epoch count is reported only as
+        # a derived, dataset-dependent figure.
+        return dict(budget_unit="optimizer_steps", max_steps=int(a.max_steps),
+                    steps_per_epoch=spe,
+                    max_steps_in_epochs=round(int(a.max_steps) / spe, 2),
+                    budget_reason=str(a.budget_reason))
     return dict(epoch_budget=int(a.epochs), steps_per_epoch=spe,
                 optimizer_steps=spe * int(a.epochs),
                 epoch_budget_reason=str(a.budget_reason))
+
+
+def _step_kwargs(a):
+    """TrainConfig fields for a step-budgeted run, or {} for an epoch run."""
+    if not getattr(a, "max_steps", None):
+        return {}
+    rule = None
+    if a.stop_patience:
+        rule = T.StopRule(patience_windows=int(a.stop_patience),
+                          min_rel_improvement=float(a.stop_rel))
+    return dict(max_steps=int(a.max_steps), window_steps=int(a.window_steps),
+                stop_rule=rule)
 
 
 def _splits():
@@ -204,19 +224,26 @@ def cmd_determinism(a):
 
 def _report(res, base, label):
     h = res["history"]
+    rec = res["final_recon_l1"]
     print("\n%s" % label)
-    print("  epochs            %d" % len(h))
+    print("  optimizer steps   %d   (%.2f steps/s)" % (res["optimizer_steps"],
+                                                      res["steps_per_second"] or 0))
     print("  wall              %.1f s" % res["wall_seconds"])
-    print("  final train loss  %.6f" % res["final_train_loss"])
+    if res.get("stop"):
+        print("  stopped by        %s at step %d" % (res["stop"]["reason"],
+                                                     res["stop"]["step"]))
+    print("  final recon_l1    %.6f   (the gated quantity)" % rec)
+    print("  final total loss  %.6f   (recon + any KL term; NOT gated)"
+          % res["final_train_loss"])
     if res["final_val_loss"] is not None:
         print("  final val loss    %.6f" % res["final_val_loss"])
-    print("  as a FRACTION of the baselines:")
+    # TR29: the baselines are reconstruction quantities, so they are compared
+    # against the reconstruction error, never the total loss.
+    print("  reconstruction as a FRACTION of the baselines:")
     print("    of ZERO  %.5f  (%.1fx better)"
-          % (res["final_train_loss"] / base["zero"],
-             base["zero"] / max(res["final_train_loss"], 1e-12)))
+          % (rec / base["zero"], base["zero"] / max(rec, 1e-12)))
     print("    of COPY  %.5f  (%.1fx better)"
-          % (res["final_train_loss"] / base["copy"],
-             base["copy"] / max(res["final_train_loss"], 1e-12)))
+          % (rec / base["copy"], base["copy"] / max(rec, 1e-12)))
     print("  run dir           %s" % repo_relpath(res["run_dir"]))
 
 
@@ -254,8 +281,9 @@ def cmd_overfit10(a):
 
     cfg = _train_config(
         mcfg, a.epochs, a.batch, seed=0,
-        run_name="%s_overfit10_K%d" % (a.model, K), log_every=max(1, int(a.epochs) // 20),
-        _budget=_budget(a, ds),
+        run_name="%s_overfit10_K%d" % (a.model, K),
+        log_every=max(1, int(a.epochs) // 20) if a.epochs else 1,
+        _budget=_budget(a, ds), **_step_kwargs(a),
         notes=dict(gate="overfit-10", chunk_size=K, model=a.model,
                    **(dict(
                        kl_weight_used=10.0,
@@ -282,13 +310,21 @@ def cmd_overfit10(a):
     res = T.train(model, ds, cfg)
     _report(res, res["baselines"], "OVERFIT-10 RESULT (%s)" % name)
 
-    verdict = AMB.gate(res["final_train_loss"], ref)
+    # TR29: the reference is a RECONSTRUCTION quantity, so the gate scores the
+    # reconstruction error train() labelled at the source - never the total loss,
+    # which for ACT includes beta*KL. gate() refuses anything else.
+    verdict = AMB.gate(res["quantities"]["recon_l1"], ref)
     print("")
     print("GATE (neighbour-ambiguity criterion)")
     print(verdict.render())
     with open(os.path.join(res["run_dir"], "gate.json"), "w",
               encoding="utf-8") as fh:
         json.dump(dict(passed=verdict.passed, train_error=verdict.train_error,
+                       train_error_units=res["quantities"]["recon_l1"].units,
+                       total_loss=res["final_train_loss"],
+                       optimizer_steps=res["optimizer_steps"],
+                       steps_per_second=res["steps_per_second"],
+                       stop=res["stop"],
                        reference=verdict.reference, ratio=verdict.ratio,
                        detail=ref.as_metadata()), fh, indent=1, default=str)
     print("  This gate ran on SCRIPTED data and must be re-run on piloted data "
@@ -325,8 +361,9 @@ def cmd_full(a):
 
     cfg = _train_config(
         mcfg, a.epochs, a.batch, seed=0,
-        run_name="%s_full_K%d" % (a.model, K), log_every=max(1, int(a.epochs) // 20),
-        _budget=_budget(a, tds),
+        run_name="%s_full_K%d" % (a.model, K),
+        log_every=max(1, int(a.epochs) // 20) if a.epochs else 1,
+        _budget=_budget(a, tds), **_step_kwargs(a),
         notes=dict(gate="full-split plumbing check",
                    is_a_result=False,
                    chunk_size=K,
@@ -342,9 +379,9 @@ def cmd_full(a):
     res = T.train(model, tds, cfg, val_ds=vds)
     _report(res, res["baselines"], "FULL-SPLIT RESULT (plumbing only)")
     print("  against the neighbour-ambiguity references:")
-    print("    train %.6f / %.6f = %.4f"
-          % (res["final_train_loss"], ref_tr.mean,
-             res["final_train_loss"] / ref_tr.mean))
+    print("    train %.6f / %.6f = %.4f   (reconstruction; TR29)"
+          % (res["final_recon_l1"], ref_tr.mean,
+             res["final_recon_l1"] / ref_tr.mean))
     print("    val   %.6f / %.6f = %.4f"
           % (res["final_val_loss"], ref_va.mean,
              res["final_val_loss"] / ref_va.mean))
@@ -419,8 +456,18 @@ def main():
             # ACT's ran 12 because a wall-clock limit was typed on the command
             # line; neither run recorded why. So the budget has no default and
             # must come with a reason, and both go into the run's metadata.
-            p.add_argument("--epochs", type=int, required=True,
-                           help="REQUIRED. No default: see --budget-reason")
+            grp = p.add_mutually_exclusive_group(required=True)
+            grp.add_argument("--epochs", type=int,
+                             help="an epoch budget (dataset-dependent unit)")
+            grp.add_argument("--max-steps", type=int,
+                             help="an OPTIMIZER-STEP budget: the hard cap")
+            p.add_argument("--window-steps", type=int, default=1000,
+                           help="optimizer steps per logged window")
+            p.add_argument("--stop-patience", type=int, default=0,
+                           help="windows in the trailing span of the stop rule "
+                                "(0 = no stop rule; run to the cap)")
+            p.add_argument("--stop-rel", type=float, default=0.01,
+                           help="minimum relative improvement over the span")
             p.add_argument("--budget-reason", required=True,
                            help="REQUIRED. Why this many epochs - e.g. 'identical "
                                 "to the run being compared' or a wall-clock cap. "

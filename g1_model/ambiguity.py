@@ -104,6 +104,38 @@ class AmbiguityError(AssertionError):
     """A reference that would be quoted without the provenance to check it."""
 
 
+# ─── units: the gate compares like with like, or refuses ─────────────────────
+#: The reference's unit: mean |action difference| over trainable dims and real
+#: timesteps, in NORMALIZED action units - exactly what `train.masked_l1`
+#: computes. A model's reconstruction error is in these units.
+RECON_UNITS = "masked_l1_reconstruction"
+#: A model's TOTAL training loss. For BC it happens to equal the reconstruction;
+#: for ACT it adds beta*KL, which is in nats times a weight, not action units.
+TOTAL_LOSS_UNITS = "total_training_loss"
+
+
+class UnitsError(AmbiguityError):
+    """A quantity whose units differ from the reference's (TR29)."""
+
+
+@dataclass(frozen=True)
+class Quantity:
+    """A number that carries what it measures.
+
+    TR29, made structural. The Stage-4 ACT gate compared TOTAL loss (0.289,
+    reconstruction plus beta*KL) against the ambiguity reference, a
+    reconstruction quantity, and reported a ratio of 6.47 where the right
+    comparison gives 3.09. It was silent, and it was right by accident twice -
+    for BC and chunked BC, which have no KL term, and for ACT at lr 1e-3, whose
+    KL had collapsed to zero. A bare float cannot say which it is, so the gate
+    accepts only a `Quantity`, labelled where it is COMPUTED (`train.train`), and
+    refuses one whose units are not the reference's.
+    """
+
+    value: float
+    units: str
+
+
 @dataclass
 class AmbiguityResult:
     """The reference, and everything needed to cite it honestly."""
@@ -122,6 +154,8 @@ class AmbiguityResult:
     exclude_same_episode: bool
     subsampled_to: Optional[int] = None
     metric: str = "euclidean on normalized observation window"
+    #: What `mean` measures. A gate refuses any train error not in these units.
+    units: str = RECON_UNITS
 
     def cite(self) -> str:
         """The figure WITH its provenance. Quote this, never `.mean` alone."""
@@ -297,7 +331,7 @@ class GateVerdict:
                self.detail.cite()))
 
 
-def gate(train_error: float, reference: AmbiguityResult) -> GateVerdict:
+def gate(train_error: Quantity, reference: AmbiguityResult) -> GateVerdict:
     """A stage passes when its training error on 10 episodes falls BELOW the
     neighbour-ambiguity reference computed for its own loader configuration.
 
@@ -305,7 +339,24 @@ def gate(train_error: float, reference: AmbiguityResult) -> GateVerdict:
     and which the Stage 2 BC gate failed while being at the resolution the input
     supports (NOTES.md, 2026-09-21). Both numbers and the ratio are reported at
     every gate, always: a verdict without them is not checkable.
+
+    `train_error` MUST be a `Quantity` in the reference's units. A bare float is
+    refused, because a bare float is how TR29 happened: nothing about 0.289
+    said it was reconstruction plus beta*KL.
     """
+    if not isinstance(train_error, Quantity):
+        raise UnitsError(
+            "gate() needs a Quantity, not a bare %s (%r). A bare number cannot say "
+            "what it measures; that is how ACT's total loss was once scored against "
+            "a reconstruction reference (TR29)." % (type(train_error).__name__,
+                                                   train_error))
+    if train_error.units != reference.units:
+        raise UnitsError(
+            "gate() refuses to compare %r (%s) against a reference in %s. Score the "
+            "model's reconstruction error - train() reports it as "
+            "result['quantities']['recon_l1'] - not its total loss (TR29)."
+            % (train_error.value, train_error.units, reference.units))
+    train_error = float(train_error.value)
     ref = float(reference.mean)
     if ref <= 0:
         raise AmbiguityError(

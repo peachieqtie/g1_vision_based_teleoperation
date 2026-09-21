@@ -430,6 +430,104 @@ def test_run_metadata_states_which_data_it_ran_on():
         shutil.rmtree(out, ignore_errors=True)
 
 
+# ═══ step budgets and the stopping rule (Stage 4, part C) ═════════════════════
+def _w(recon, total=None):
+    return dict(recon_l1=recon, train_loss=recon if total is None else total)
+
+
+def test_stop_rule_fires_only_when_every_monitored_quantity_stalls():
+    rule = T.StopRule(patience_windows=3, min_rel_improvement=0.01)
+    improving = [_w(1.0 - 0.05 * i) for i in range(8)]
+    assert rule.check(improving) is None, "a steadily improving run must not stop"
+    flat = [_w(1.0)] * 3 + [_w(0.999)] * 5
+    fired = rule.check(flat)
+    assert fired and all(v < 0.01 for v in fired["rel_improvement_over_span"].values())
+    # recon flat but total still falling (a CVAE spending its KL): keep going
+    mixed = [_w(0.5, 1.0 - 0.05 * i) for i in range(8)]
+    assert rule.check(mixed) is None, "stop only when EVERY monitored quantity stalls"
+    assert rule.check(improving[:3]) is None, "needs more windows than the span"
+
+
+def test_stop_rule_uses_best_of_span_so_one_noisy_window_cannot_decide():
+    rule = T.StopRule(patience_windows=2, min_rel_improvement=0.01)
+    # a noisy spike in the recent span must not look like a stall...
+    noisy = [_w(1.0), _w(0.9), _w(0.8), _w(0.95), _w(0.70)]
+    assert rule.check(noisy) is None
+    # ...and one lucky window must not keep a flat run alive forever
+    flat = [_w(0.5)] * 4 + [_w(0.499)] * 2
+    assert rule.check(flat) is not None
+
+
+def test_budget_must_be_exactly_one_of_epochs_or_steps():
+    _raises(T.TrainError, T.TrainConfig, epochs=None, batch_size=8, lr=1e-3)
+    _raises(T.TrainError, T.TrainConfig, epochs=3, batch_size=8, lr=1e-3, max_steps=10)
+    rule = T.StopRule(patience_windows=2, min_rel_improvement=0.01)
+    _raises(T.TrainError, T.TrainConfig, epochs=3, batch_size=8, lr=1e-3, stop_rule=rule)
+    T.TrainConfig(epochs=None, batch_size=8, lr=1e-3, max_steps=10, stop_rule=rule)
+    _raises(T.TrainError, T.StopRule, patience_windows=0, min_rel_improvement=0.01)
+    _raises(T.TrainError, T.StopRule, patience_windows=2, min_rel_improvement=1.5)
+
+
+def test_step_budgeted_run_logs_windows_records_budget_and_labels_quantities():
+    tmp = _tiny(n_eps=2, n_ticks=40)
+    if tmp is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = tmp
+    out = tempfile.mkdtemp()
+    try:
+        from g1_model.ambiguity import RECON_UNITS, TOTAL_LOSS_UNITS
+        cfg = T.TrainConfig(epochs=None, batch_size=8, lr=1e-3, seed=0,
+                            max_steps=25, window_steps=5, log_every=0)
+        m = T.seeded_build(cfg, build_bc, cfg=BCConfig(obs_window=1, chunk_size=1))
+        r = T.train(m, ds, cfg, run_dir=out)
+        assert r["optimizer_steps"] == 25, r["optimizer_steps"]
+        assert r["stop"] == dict(reason="hard_cap", step=25), r["stop"]
+        assert [h["step"] for h in r["history"]] == [5, 10, 15, 20, 25]
+        assert r["quantities"]["recon_l1"].units == RECON_UNITS
+        assert r["quantities"]["train_loss"].units == TOTAL_LOSS_UNITS
+        assert r["steps_per_second"] > 0
+        meta = json.load(open(os.path.join(out, "metadata.json"), encoding="utf-8"))
+        assert meta["budget"]["unit"] == "optimizer_steps"
+        assert meta["budget"]["max_steps"] == 25
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_stop_rule_ends_a_run_before_the_cap_and_says_where():
+    tmp = _tiny(n_eps=2, n_ticks=40)
+    if tmp is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = tmp
+    out = tempfile.mkdtemp()
+    try:
+        # lr 0 freezes the weights. The window is ONE EPOCH (80 samples / batch 8
+        # = 10 steps), so every window scores the whole dataset and its mean is
+        # the same number - which makes the firing step exact. With a window
+        # SMALLER than the dataset the mean moves with which samples happened to
+        # land in it even when nothing is learning (measured: a 5-step window of
+        # 40 samples moved 0.49% on frozen weights and delayed the rule by one
+        # window). The real run's 1000-step window is 8,000 samples, ~1.05 epochs
+        # of the 10-episode gate set, for exactly this reason.
+        rule = T.StopRule(patience_windows=2, min_rel_improvement=0.01)
+        spe = (len(ds) + 7) // 8
+        cfg = T.TrainConfig(epochs=None, batch_size=8, lr=0.0, seed=0,
+                            max_steps=1000, window_steps=spe, stop_rule=rule,
+                            log_every=0)
+        m = T.seeded_build(cfg, build_bc, cfg=BCConfig(obs_window=1, chunk_size=1))
+        r = T.train(m, ds, cfg, run_dir=out)
+        assert r["stop"]["reason"] == "stop_rule", r["stop"]
+        assert r["stop"]["step"] == 3 * spe,             "a 2-window span needs 3 windows: %s" % r["stop"]
+        assert r["optimizer_steps"] == 3 * spe
+        meta = json.load(open(os.path.join(out, "metadata.json"), encoding="utf-8"))
+        assert "1.00% relative" in meta["budget"]["stop_rule"], meta["budget"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def _tests():
     return [(n, f) for n, f in sorted(globals().items())
             if n.startswith("test_") and callable(f)]

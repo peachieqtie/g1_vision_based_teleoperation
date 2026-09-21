@@ -324,11 +324,13 @@ def test_two_encoder_tokens_and_a_two_entry_position_embedding():
     assert seen["shape"] == (2, 5, m.cfg.hidden_dim), seen
 
 
-def test_decoder_builds_the_reference_depth_and_reads_index_zero():
-    """D4: build seven, read `hs[0]` - what `detr_vae.py:131` does. Fidelity by
-    construction. The measured consequence (layers 2..n get no gradient) is
-    recorded descriptively in NOTES.md, not silently corrected here."""
-    assert A.DEC_LAYERS == 7 and A.ENC_LAYERS == 4
+def test_decoder_reads_index_zero_and_deeper_layers_get_no_gradient():
+    """The reference builds seven decoder layers and reads `hs[0]`
+    (`detr_vae.py:131`). We build ONE (superseding D4) because layers 2..n get no
+    gradient - reproduced here on a multi-layer model, measured not assumed - and
+    removing them is bit-identical (next test)."""
+    assert A.REF_DEC_LAYERS == 7, "the reference's own depth stays on record"
+    assert A.DEC_LAYERS == 1 and A.ENC_LAYERS == 4
     assert A.DECODER_LAYER_READ == 0
     m = _model(K=4)
     assert len(m.t_decoder.layers) == m.cfg.dec_layers
@@ -661,6 +663,96 @@ def test_epoch_budget_must_be_stated_with_a_reason():
     b = tb._budget(ns, list(range(7628)))
     assert b == dict(epoch_budget=12, steps_per_epoch=954, optimizer_steps=11448,
                      epoch_budget_reason="identical to the run compared"), b
+
+
+# ═══ B: one decoder layer is the reference's seven, minus dead computation ════
+def _pair(dropout):
+    """7-layer and 1-layer models built from the SAME seed, NO weight copying."""
+    kw = dict(obs_window=1, chunk_size=10, lr=TEST_LR, weight_decay=TEST_WD,
+              hidden_dim=64, dim_feedforward=128, nheads=4, enc_layers=2,
+              dropout=dropout)
+    torch.manual_seed(0)
+    m7 = ACTPolicy(ACTConfig(dec_layers=7, **kw))
+    torch.manual_seed(0)
+    m1 = ACTPolicy(ACTConfig(dec_layers=1, **kw))
+    return m7, m1
+
+
+def test_one_decoder_layer_is_bit_identical_to_the_references_seven():
+    """What lets Chapter 3 state the equivalence as MEASURED.
+
+    Same seed, no weight copying. Every parameter the 1-layer model has is
+    identical to its namesake in the 7-layer model - construction consumes the
+    RNG identically up to the point the dead layers begin - and then the forward
+    output, the loss and every gradient over the shared parameters are equal to
+    the bit. This runs in TRAIN mode with ACT's real dropout (0.1), not in a
+    sanitised setting: for a given random state, layers 2-7 change nothing.
+    """
+    m7, m1 = _pair(dropout=A.DROPOUT)
+    sd7 = m7.state_dict()
+    for k, v in m1.state_dict().items():
+        assert torch.equal(v, sd7[k]), "shared tensor %s differs at construction" % k
+    extra = set(sd7) - set(m1.state_dict())
+    assert extra and all(".layers." in k and not k.split(".layers.")[1].startswith("0.")
+                         for k in extra if k.startswith("t_decoder.")),         "the 7-layer model may differ ONLY by decoder layers 2-7"
+
+    obs = torch.randn(4, 1, spec.STATE_DIM)
+    tgt = torch.randn(4, 10, spec.ACTION_DIM)
+    pad = torch.ones(4, 10, dtype=torch.bool)
+    pad[1, 6:] = False
+    m7.train(); m1.train()
+    torch.manual_seed(7); p7, mu7, lv7 = m7(obs, tgt, pad)
+    torch.manual_seed(7); p1, mu1, lv1 = m1(obs, tgt, pad)
+    assert torch.equal(p7, p1), "forward output differs"
+    assert torch.equal(mu7, mu1) and torch.equal(lv7, lv1), "latent differs"
+    l7 = act_loss(p7, tgt, pad, mu7, lv7, A.KL_WEIGHT)[0]
+    l1 = act_loss(p1, tgt, pad, mu1, lv1, A.KL_WEIGHT)[0]
+    assert torch.equal(l7, l1), "loss differs"
+    l7.backward(); l1.backward()
+    g7 = dict(m7.named_parameters())
+    for name, p in m1.named_parameters():
+        a, b = p.grad, g7[name].grad
+        assert (a is None) == (b is None), name
+        if a is not None:
+            assert torch.equal(a, b), "gradient differs for %s" % name
+    m7.eval(); m1.eval()
+    with torch.no_grad():
+        assert torch.equal(m7(obs), m1(obs)), "inference output differs"
+
+
+def test_dropout_rng_makes_multistep_training_differ_not_the_function():
+    """The honest limit of the claim above - pinned so Chapter 3 cannot overstate it.
+
+    Layers 2-7 compute nothing the output reads, but they still RUN, and their
+    dropout draws random numbers. That shifts every LATER dropout mask. So:
+      dropout 0.0 -> training is bit-identical at every step;
+      dropout 0.1 -> identical at step 1, different from step 2 on.
+    The two models compute the same function; training them with dropout does
+    not produce the same weights step for step. Statistically equivalent, not
+    bit-identical over training - and that is the sentence the thesis may use.
+    """
+    def losses(dropout, dec, steps=4):
+        m7, m1 = _pair(dropout)
+        m = m7 if dec == 7 else m1
+        m.train()
+        opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
+        g = torch.Generator().manual_seed(1)
+        torch.manual_seed(42)
+        out = []
+        for _ in range(steps):
+            obs = torch.randn(4, 1, spec.STATE_DIM, generator=g)
+            tgt = torch.randn(4, 10, spec.ACTION_DIM, generator=g)
+            pad = torch.ones(4, 10, dtype=torch.bool)
+            p, mu, lv = m(obs, tgt, pad)
+            loss = act_loss(p, tgt, pad, mu, lv, A.KL_WEIGHT)[0]
+            opt.zero_grad(); loss.backward(); opt.step()
+            out.append(float(loss.detach()))
+        return out
+    assert losses(0.0, 7) == losses(0.0, 1), "without dropout, every step must match"
+    a, b = losses(0.1, 7), losses(0.1, 1)
+    assert a[0] == b[0], "step 1 must match even with dropout"
+    assert a[1:] != b[1:], ("with dropout the runs must diverge after step 1 - if "
+                            "they do not, this test no longer describes the code")
 
 
 def _tests():

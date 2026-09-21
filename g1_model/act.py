@@ -78,7 +78,19 @@ NHEADS: int = 8
 #: `args.enc_layers` ("# TODO shared with VAE decoder"). Separate modules, same depth.
 ENC_LAYERS: int = 4
 #: reference/act/imitate_episodes.py:55 `dec_layers = 7`; paper Table III.
-DEC_LAYERS: int = 7
+#: What the REFERENCE builds. Kept, cited, so the divergence below is visible.
+REF_DEC_LAYERS: int = 7
+#: What WE build: ONE decoder layer. This supersedes the earlier decision (D4) to
+#: build all seven for fidelity. The reference reads `hs[0]` (`detr_vae.py:131`),
+#: the FIRST decoder layer's output, so layers 2-7 compute values nothing reads
+#: and receive exactly zero gradient. MEASURED 2026-09-21: a 7-layer model read at
+#: hs[0] and a 1-layer model built from the same seed give bit-identical forward
+#: output, loss and every gradient - `test_act.py::
+#: test_one_decoder_layer_is_bit_identical_to_the_references_seven`. There is no
+#: fidelity to preserve in weights no computation depends on, and they cost 49.5%
+#: of step time. The observation about layers 2-7 stands as a DESCRIPTIVE note
+#: about the reference, not a criticism of it (NOTES.md 2026-09-21).
+DEC_LAYERS: int = 1
 #: reference/act/detr/main.py:43 `--dropout 0.1`, not overridden by README.md:76.
 DROPOUT: float = 0.1
 #: reference/act/detr/models/detr_vae.py:219 — hardcoded "relu".
@@ -109,11 +121,11 @@ OPTIMIZER: str = "adamw"
 #: MEASURED on the pinned commit, 2026-09-21. `detr_vae.py:131` reads `hs[0]`, and
 #: `transformer.py:76` returns (num_dec_layers, bs, num_queries, d), so index 0 is
 #: the FIRST decoder layer's output. Backward through `hs[0]` on a 7-layer decoder
-#: gives layer 1 a gradient of L1 7.41e-05 and layers 2-7 exactly 0.0. We build the
-#: reference's seven layers and read the same index it reads: fidelity by
-#: construction. Recorded descriptively in NOTES.md 2026-09-21; not "fixed" here,
-#: because reading hs[-1] would be a deeper, different model and any RQ2/RQ3 result
-#: obtained with it could not be attributed to ACT's design.
+#: gives layer 1 a gradient of L1 7.41e-05 and layers 2-7 exactly 0.0. We read the
+#: same index the reference reads, and build only the one layer that index depends
+#: on (see DEC_LAYERS). NOT "fixed" to hs[-1]: reading the last of seven layers
+#: would be a deeper, different model, and an RQ2/RQ3 result obtained with it could
+#: not be attributed to ACT's design.
 DECODER_LAYER_READ: int = 0
 
 

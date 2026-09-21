@@ -48,7 +48,7 @@ import platform
 import random
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -286,6 +286,58 @@ def baselines(ds: ChunkDataset, device: Optional[torch.device] = None,
 
 
 # ─── B1/B5: the loop ──────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class StopRule:
+    """When a step-budgeted run counts as CONVERGED. Decided before running.
+
+    Training is logged in windows of `TrainConfig.window_steps` optimizer steps;
+    each window records its element-weighted mean of every monitored quantity.
+    After each window: for each monitored quantity, compare the best value in the
+    trailing `patience_windows` against the best value BEFORE them. If the
+    relative improvement is below `min_rel_improvement` for EVERY monitored
+    quantity, the run has stopped improving.
+
+    Best-of-span rather than last-value, because a single noisy window at batch 8
+    must neither end a run that is still improving nor keep alive one that is not.
+    Every monitored quantity must stall, because a model can trade them: a CVAE's
+    total loss keeps falling while its KL is spent even after reconstruction has
+    flattened, and the reverse.
+    """
+
+    patience_windows: int
+    min_rel_improvement: float
+    monitor: Tuple[str, ...] = ("recon_l1", "train_loss")
+
+    def __post_init__(self):
+        if int(self.patience_windows) < 1:
+            raise TrainError("patience_windows must be >= 1")
+        if not (0.0 < float(self.min_rel_improvement) < 1.0):
+            raise TrainError("min_rel_improvement must be a fraction in (0, 1)")
+
+    def check(self, windows: Sequence[dict]) -> Optional[dict]:
+        """None while improving; otherwise the per-quantity relative improvement
+        over the trailing span, which is below threshold for every one."""
+        P = int(self.patience_windows)
+        if len(windows) <= P:
+            return None
+        rel = {}
+        for key in self.monitor:
+            vals = [float(w[key]) for w in windows]
+            prior, recent = min(vals[:-P]), min(vals[-P:])
+            rel[key] = (prior - recent) / prior if prior > 0 else 0.0
+        if all(r < float(self.min_rel_improvement) for r in rel.values()):
+            return dict(rel_improvement_over_span=rel)
+        return None
+
+    def describe(self, window_steps: int) -> str:
+        return ("stop when, for EVERY one of %s, the best windowed mean over the "
+                "last %d windows (%d optimizer steps) improves on the best before "
+                "them by less than %.2f%% relative; windows of %d steps"
+                % (list(self.monitor), self.patience_windows,
+                   self.patience_windows * window_steps,
+                   100 * self.min_rel_improvement, window_steps))
+
+
 @dataclass
 class TrainConfig:
     """Everything a run needs that is not the model or the data.
@@ -293,9 +345,15 @@ class TrainConfig:
     Every field is written verbatim into the run directory, so a run can be
     reproduced from its own metadata rather than from someone's memory of which
     flags they passed.
+
+    BUDGET: exactly one of `epochs` or `max_steps`. `epochs` is a DATASET-dependent
+    unit - an epoch here is every tick of every episode, in the ACT reference it
+    is one random tick per episode, and that difference is ~760x in optimizer
+    steps (NOTES.md 2026-09-21). Step-budgeted runs are the ones to compare.
+    `epochs` has no default and may be passed as None, so the choice is explicit.
     """
 
-    epochs: int
+    epochs: Optional[int]
     batch_size: int
     lr: float
     weight_decay: float = 0.0
@@ -311,6 +369,23 @@ class TrainConfig:
     #: Free-form. The gate runner puts its data-provenance statement here, and
     #: it ends up in metadata.json (C5).
     notes: Dict[str, object] = field(default_factory=dict)
+    #: Step budget. When set, `epochs` must be None and the run ends at the first
+    #: of: the stop rule firing, or this HARD CAP.
+    max_steps: Optional[int] = None
+    stop_rule: Optional[StopRule] = None
+    #: Optimizer steps per logged window in a step-budgeted run.
+    window_steps: int = 1000
+
+    def __post_init__(self):
+        if (self.epochs is None) == (self.max_steps is None):
+            raise TrainError(
+                "state exactly ONE budget: epochs=%r, max_steps=%r. An epoch is a "
+                "dataset-dependent unit; a step budget is the comparable one."
+                % (self.epochs, self.max_steps))
+        if self.stop_rule is not None and self.max_steps is None:
+            raise TrainError("a stop rule needs a step budget (max_steps) as its cap")
+        if int(self.window_steps) < 1:
+            raise TrainError("window_steps must be >= 1")
 
 
 class OptimizerSourceError(TrainError):
@@ -500,7 +575,53 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
     best = float("inf")
     t0 = time.perf_counter()
 
-    for epoch in range(1, int(cfg.epochs) + 1):
+    step_mode = cfg.max_steps is not None
+    if step_mode:
+        meta["budget"] = dict(unit="optimizer_steps", max_steps=int(cfg.max_steps),
+                              window_steps=int(cfg.window_steps),
+                              stop_rule=(cfg.stop_rule.describe(cfg.window_steps)
+                                         if cfg.stop_rule else None))
+        with open(os.path.join(run_dir, "metadata.json"), "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, indent=1, default=str)
+        print("budget        %d optimizer steps (hard cap)%s"
+              % (cfg.max_steps, "; " + meta["budget"]["stop_rule"]
+                 if cfg.stop_rule else ""))
+
+    step, epoch, stop_info = 0, 0, None
+    w_tot, w_rec, w_n, w_ext, w_t0 = 0.0, 0.0, 0, {}, time.perf_counter()
+
+    def _window_row():
+        """Close the current window of optimizer steps into one logged row."""
+        nonlocal w_tot, w_rec, w_n, w_ext, w_t0, best
+        secs = time.perf_counter() - w_t0
+        tl_, rl_ = w_tot / max(w_n, 1), w_rec / max(w_n, 1)
+        val = evaluate(model, vl, device, dim_mask) if vl is not None else None
+        model.train()
+        row = dict(step=step, epoch=epoch, train_loss=tl_, recon_l1=rl_,
+                   **{("train_" + k_): v_ / max(w_n, 1) for k_, v_ in w_ext.items()},
+                   val_loss=val, lr=float(opt.param_groups[0]["lr"]),
+                   window_seconds=round(secs, 3),
+                   elapsed_seconds=round(time.perf_counter() - t0, 3),
+                   git_commit=meta["git_commit"])
+        history.append(row)
+        with open(metrics_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+        watch = val if val is not None else rl_
+        if watch < best:
+            best = watch
+            save_checkpoint(os.path.join(run_dir, "best.pt"), model, cfg, meta,
+                            epoch, tl_, val)
+        if cfg.log_every:
+            kl = row.get("train_kl")
+            print("  step %8d  recon %.6f  total %.6f%s  %.1fs"
+                  % (step, rl_, tl_, ("  kl %.5f" % kl) if kl is not None else "",
+                     secs))
+        w_tot, w_rec, w_n, w_ext, w_t0 = 0.0, 0.0, 0, {}, time.perf_counter()
+
+    while True:
+        if not step_mode and epoch >= int(cfg.epochs):
+            break
+        epoch += 1
         model.train()
         e0 = time.perf_counter()
         total, recon, n = 0.0, 0.0, 0
@@ -520,6 +641,31 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
             n += int(count)
             for k_, v_ in extras.items():
                 extra_sums[k_] = extra_sums.get(k_, 0.0) + float(v_) * int(count)
+            step += 1
+            if not step_mode:
+                continue
+            # ---- step-budgeted: windows, the stop rule, the hard cap ----------
+            w_tot += float(loss.detach()) * int(count)
+            w_rec += float(l1.detach()) * int(count)
+            w_n += int(count)
+            for k_, v_ in extras.items():
+                w_ext[k_] = w_ext.get(k_, 0.0) + float(v_) * int(count)
+            if step % int(cfg.window_steps) == 0:
+                _window_row()
+                if cfg.stop_rule is not None:
+                    fired = cfg.stop_rule.check(history)
+                    if fired:
+                        stop_info = dict(reason="stop_rule", step=step, **fired)
+                        break
+            if step >= int(cfg.max_steps):
+                if w_n:
+                    _window_row()
+                stop_info = dict(reason="hard_cap", step=step)
+                break
+        if step_mode:
+            if stop_info is not None:
+                break
+            continue
         train_loss = total / max(n, 1)
         recon_loss = recon / max(n, 1)
         extra_means = {k_: v_ / max(n, 1) for k_, v_ in extra_sums.items()}
@@ -531,8 +677,9 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
                    lr=float(opt.param_groups[0]["lr"]),
                    epoch_seconds=round(time.perf_counter() - e0, 3),
                    elapsed_seconds=round(time.perf_counter() - t0, 3),
-                   frac_of_zero_baseline=train_loss / base["zero"] if base["zero"] else None,
-                   frac_of_copy_baseline=train_loss / base["copy"] if base["copy"] else None,
+                   # TR29: baselines are reconstruction quantities.
+                   frac_of_zero_baseline=recon_loss / base["zero"] if base["zero"] else None,
+                   frac_of_copy_baseline=recon_loss / base["copy"] if base["copy"] else None,
                    git_commit=meta["git_commit"])
         history.append(row)
         with open(metrics_path, "a", encoding="utf-8") as fh:
@@ -554,11 +701,24 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
     save_checkpoint(os.path.join(run_dir, "last.pt"), model, cfg, meta,
                     len(history), history[-1]["train_loss"],
                     history[-1]["val_loss"])
+    from g1_model.ambiguity import Quantity, RECON_UNITS, TOTAL_LOSS_UNITS
+    wall = round(time.perf_counter() - t0, 3)
     result = dict(run_dir=run_dir, history=history, baselines=base,
                   metadata=meta, best=best,
                   final_train_loss=history[-1]["train_loss"],
+                  final_recon_l1=history[-1]["recon_l1"],
                   final_val_loss=history[-1]["val_loss"],
-                  wall_seconds=round(time.perf_counter() - t0, 3))
+                  # Labelled AT THE SOURCE (TR29): the gate accepts only a
+                  # Quantity in the reference's units, and only this loop knows
+                  # which of these numbers is which.
+                  quantities=dict(
+                      recon_l1=Quantity(float(history[-1]["recon_l1"]), RECON_UNITS),
+                      train_loss=Quantity(float(history[-1]["train_loss"]),
+                                          TOTAL_LOSS_UNITS)),
+                  optimizer_steps=int(step),
+                  steps_per_second=round(step / wall, 3) if wall else None,
+                  stop=stop_info,
+                  wall_seconds=wall)
     with open(os.path.join(run_dir, "result.json"), "w", encoding="utf-8") as fh:
         json.dump({k: v for k, v in result.items() if k != "metadata"}, fh,
                   indent=1, default=str)
