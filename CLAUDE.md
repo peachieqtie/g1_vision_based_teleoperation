@@ -36,47 +36,26 @@ demonstrator (§8) — resolving it before collection would drop the project's l
 [EXISTS] ZED (30 Hz, BODY_38) -> One-Euro -> scaling -> DLS IK -> arms; waist pinned | KeyboardCommand -> LSTM policy -> legs; 500 Hz physics
 [EXISTS] WELD grasp (D11) + base lock (D12) + B-prime exclusion (D18) + seeded spawn; teleop under stepped physics, full task by a live operator
 [EXISTS] scripted demonstrator (g1_data/scripted_demo.py) 12/12 and 40/40; g1_data/spec.py frozen at g1-spec-1.1.0
-[MISSING] recorder @25 Hz -> success detection -> dataset -> BC | ACT | ACT-LSTM
-[MISSING] autonomous deployment -> Exp 1 in-distribution, Exp 2 held-out patch
+[EXISTS] recorder @25 Hz -> success detection -> offline phase labels -> dataset -> loader -> shared train loop + masked-L1 loss -> neighbour-ambiguity gate -> BC and chunked BC (ONE class, K=1 vs K>1): g1_data/{recorder,success,phase_label,dataset}.py + g1_model/{loader,train,ambiguity,models}.py
+[MISSING] ACT | ACT-LSTM (ONE class behind a `use_lstm` flag) -> autonomous deployment -> Exp 1 in-distribution, Exp 2 held-out patch
 ```
 
-## 4. Current state (verified against files)
+## 4. Current state — the measurements a fresh session cannot re-derive
 
-- **`g1_data/spec.py` — the single source of truth**, `SPEC_VERSION = g1-spec-1.1.0`: 47-D state, 22-D action, phase vocabulary, normalization
-  contract, clip limits, timing convention. The permutation is DERIVED from joint-name lists and asserted a bijection at load; constant-dim
-  mask, `NormStats`, 43 tests, validated bit-identical against a real episode. **No other file may hardcode a dimension index, mask, clip or
-  normalization rule.**
-- **Scripted demonstrator** (`g1_data/scripted_demo.py`): staged raise, `lift_h` 0.12, `goal_standoff_bias` 0.03, `grasp_s` 1.6 s, standoff
-  0.32, `lock_predicate=True`. **12/12 phase-lock, 40/40 predicate.** Episode length **694–846 samples, mean 757, sd 41**, spawn-dependent.
-- **`run_integrated_combined.py` AT PARITY**: base lock from the state predicate (same thresholds, 25 Hz), TR17 pad fix, B-prime on by default
-  (`b` toggles), NaN-confidence fix in `ZEDSource`, operator overlay MINIMAL/FULL (`o`, MINIMAL default). Headless fixtures
-  `--synthetic grasp|none`, `--headless`, `--start-standoff`, `--profile`.
-- **Teleop keypoint recorder**: `tools/record_keypoints.py` (raw BODY_38, per-frame selector status, NaNs preserved),
-  `tools/analyze_keypoints.py` (confidence, dropout runs vs `max_coast_frames`, jitter, limb stability), replay through
-  `g1_teleop/synthetic_source.py`. Round trip **bit-identical on a real ZED take**.
-- **IK performance**: `solve_arm_ik` uses `mj_kinematics` + `mj_comPos`, not `mj_forward`, inside the solver loop. Jacobians/`xpos`/`site_xpos`
-  bit-identical over 25 poses; arm trajectories bit-identical on replay. Sim-to-wall with a body detected **37.4% → 128.2% of real time**.
-- **IK convergence, measured**: the solver **NEVER converges** — mean **30.00** iterations, `max_iter` hit on **100%** of solves, because 4
-  joints/arm cannot satisfy the 6-D elbow+wrist task (D2, D3). 26 of 30 iterations buy 0.1 mm (p50 achieved 56.0 vs 55.9 mm at `max_iter` 4).
-  Headroom exists via a SEPARATE teleop `IKConfig`; `IKConfig` is shared with the demonstrator, so lowering it globally breaks the
-  byte-identical gates.
-- **Kinematic path**: `teleop.py` / `run_teleop*.py` never `mj_step`; preview tools only. **Locomotion**: `motion.pt` is an **LSTM** (`hidden_state`/`cell_state`, mutated in place every forward pass — reset per episode); 47-D obs, 12 actions, decimation 10 → 50 Hz, `GAIT_PERIOD=0.8`; legs `<motor>` + PD, waist+arms `<position>` kp=500; `KeyboardCommand` (D6).
-- **Scene**: tops at 0.75 m — pickup (1.5, 0) half-extent **0.19 × 0.32** (Q6), goal (1.5, −1.5) half 0.18; `box1` 0.18 m cube, 0.4 kg.
-  **nq=45, nv=43, nu=31**, one keyframe `stand`; `<contact><exclude>` carries D18. **Gripper**: **weld** (D11), `scene.xml`
-  `<equality><weld box_grasp>` + `g1_teleop/grasp.py`; geometric trigger gates the 0–1 command; carry drift ≤0.26 mm since TR17; pads
-  detection-only.
-- **Box spawn** (`g1_teleop/box_reset.py`): seeded, stepped model, x [1.44, 1.56] × y [−0.21, 0.21]; held-out patch x [1.47, 1.53] ×
-  y [0.04, 0.16], **14.25% measured** over 2000 draws. **Episode reset** (`g1_data/reset.py`): physics, locomotion carryover, policy LSTM,
-  teleop filters, and the D18 contact contract (raises on mismatch).
-- **Figure**: `docs/figures/platform_regions.pdf` (+PNG, caption) from `tools/plot_platform_regions.py` — Phase 2's third exit criterion, MET.
-  **Absent entirely:** demonstration logging, success detection, dataset, training, policy, evaluation code.
+**Re-derive status from artifacts; never inherit it from a checklist** (§14). Anything readable off the code, a passing test or a gate output
+is deliberately NOT repeated here — `NOTES.md`, the suites and the run directories carry it. Only what cost an instrumented run survives:
 
-## 5. Planned components (none built)
+- **The arm IK NEVER converges**: mean **30.00** iterations, `max_iter` hit on **100%** of solves, and 26 of those 30 buy 0.1 mm — 4 joints/arm
+  cannot satisfy the 6-D elbow+wrist task (D2, D3; the achieved error is retargeting loss, not iteration count — O27). **`IKConfig` is SHARED
+  with the scripted demonstrator, so lowering iterations globally breaks the byte-identical gates** — teleop needs a separate config.
+- **`motion.pt` is an LSTM** whose `hidden_state`/`cell_state` are mutated IN PLACE on every forward pass and MUST be reset per episode
+  (`g1_data/reset.py`) — the one locomotion fact not readable from the code itself.
+- **The held-out patch is 14.25% of the spawn region**, measured over 2000 draws (`g1_teleop/box_reset.py`) — the Objective 4 split.
 
-Learning code goes at the **repo root**, siblings to `g1_teleop/`, so the recorder imports the teleop stack unchanged. Tree in `NOTES.md`.
-Hard requirement: **ACT and ACT-LSTM are ONE model class behind a flag** — two implementations would stop the gap isolating the LSTM.
-Dataset/evaluation design (150 episodes, splits, fixed eval seeds, nested scaling subsets, episode-file contents, the statistical limit) is in
-`NOTES.md` "PHASE 2 CLOSEOUT" and PLAN.md.
+## 5. Not yet built
+
+**ACT and ACT-LSTM — ONE model class behind a `use_lstm` flag** (two implementations would stop the gap isolating the LSTM), plus autonomous deployment and the Exp 1 / Exp 2 evaluation harness. Everything else in the learning stack is built (§3, `g1_model/`).
+Dataset and evaluation design — 150 episodes, splits, fixed eval seeds, nested scaling subsets, the statistical limit — is in PLAN.md and `NOTES.md` "PHASE 2 CLOSEOUT".
 
 ## 6. State and action vectors
 
@@ -121,6 +100,19 @@ D6, D7, **D12** and **D18** touch **objectives**, not just methods. D6/D7 are re
 
 Older entries are one line; detail is in `NOTES.md` under the same date.
 
+- 2026-09-21 — **THE GATE CRITERION IS THE NEIGHBOUR-AMBIGUITY REFERENCE**, computed per loader configuration, not "loss near
+  zero" (`g1_model/ambiguity.py`). A stage passes when 10-episode training error falls below it; report both numbers and the ratio,
+  always. BC 0.009200/0.012764 = 0.721 PASS; chunked BC 0.042763/0.044657 = 0.958 PASS. Quote `AmbiguityResult.cite()`, never
+  `.mean`. Revision record, and why the old criterion failed a working model: `NOTES.md` 2026-09-21.
+- 2026-09-21 — **BC's residual is PARTIAL OBSERVABILITY, not capacity.** The 3 velocity dims are 18.8% of trainable dims and 48.5%
+  of the loss, 11.5× worse while the base lock is DISENGAGED — and the lock state is deliberately not in the 47-D state (2026-09-11),
+  so no policy can see what drives its largest error. Fixing it is a schema question and a `SPEC_VERSION` bump. `NOTES.md` 2026-09-21.
+- 2026-09-21 — **Chunked BC is the SAME CLASS as BC** (`BCPolicy` at K>1); a separate class would hide incidental differences inside
+  the measured effect of chunking. `K_PROVISIONAL = 100` (4.0 s), ACT's published value, NOT swept — settle on piloted data. **No
+  temporal ensembling until ACT** (Stage 4); deployment takes `models.first_action`. `NOTES.md` 2026-09-21.
+- 2026-09-21 — **The W_o instrument cannot choose W_o** (`ambiguity_curve`, `train_bc.py wo-curve`). Model-free by design, but on
+  scripted data it RISES with W_o (0.009608 at W=1 → 0.011850 at W=32) because the space grows faster than the data fills it — a
+  dimensionality confound, NOT evidence against longer windows. Real run is on piloted data. `NOTES.md` 2026-09-21.
 - 2026-09-15 — **OBJECTIVE 1 DEMONSTRATED.** Live operator, ZED, stepped physics, full task. Difficulties reported and the response to each:
   piloting into the lock window is hard (overlay rewritten to give ACTIONS, not measurements); walking/turning felt slow (`KeyboardCommand`
   runs well under the validated envelope); sim ran below real time with tracking active (measured 37.4%, fixed below).
@@ -221,6 +213,10 @@ Older entries are one line; detail is in `NOTES.md` under the same date.
 - **TR26.** Unpinning the wrists (candidate A, 2026-09-14). No twist at the grasp, but it fails at RELEASE — pitching to −0.69/−0.82 rad and
   tipping the released box, 9/12 and 36/40 — and it still hooks the slab in 10/10 teleop runs, so it does **not** make D18 unnecessary. Adoption
   would also need a `SPEC_VERSION` bump (dims 6, 13 leave the mask).
+- **TR27.** Gating a learning stage on "training loss near zero" without first measuring whether the observation DETERMINES the
+  action. BC was called a failure while sitting BELOW the 1-NN action spread. Two related traps: the COPY baseline is handed
+  `action[t-1]`, which a W_o=1 model does not have, so it is an oracle not a peer; and neighbour ambiguity itself rises with
+  `obs_window` for dimensionality reasons (O31), so a rising region is the estimator, never a finding. `NOTES.md` 2026-09-21.
 
 ## 10. Known open issues
 
@@ -243,6 +239,10 @@ Older entries are one line; detail is in `NOTES.md` under the same date.
 - **O30. NEW, FIXED, kept as a caveat.** `ZEDSource._select_best_body` scored by `mean(arm confidences)` against −1.0, so ONE NaN confidence
   discarded a body whose KEYPOINTS were valid — found on the first real take, 160/160 frames. Fixed with `nanmean`. Kept because it is a caveat
   for any earlier session, and because confidence can be NaN at range.
+- **O31. NEW — the ambiguity reference is density-dependent and dimensionality-confounded.** It FALLS as episodes are added
+  (3/10/32 episodes → 0.002779/0.002386/0.002077), so a stage can fail a denser reference without having changed; across
+  `obs_window` it RISES for geometric reasons. A density-matched estimator is the fix and is **NOT built**. Every Phase 4 gate is
+  provisional on scripted data until re-run on piloted. `NOTES.md` 2026-09-21.
 - **The Phase 1 exit gate was INCOMPLETE.** It scored grasp, placement, resting, tilt and falls and never scored CLEARANCE, so the box scraped
   the pickup platform (−1.4 mm at the shipping `lift_h`) and the hand penetrated it, every episode, invisibly. "Phase 1 closed 12/12" is true on
   the criteria as written, and the criteria had a hole. Under free lock timing the honest figure was **24/40 before the mitigation, 40/40 after**.
