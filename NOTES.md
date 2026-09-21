@@ -6363,3 +6363,153 @@ one thing — chunking, then the CVAE, then recurrence. A window would give the 
 the history the LSTM is meant to supply and would confound RQ3 with the very mechanism it
 is testing. The Stage 3 ambiguity curve is consistent with this: on scripted data a longer
 window bought no measurable reduction in action ambiguity at all.
+
+---
+
+## 2026-09-21 — ACT implemented, state-only, against the pinned reference
+
+`g1_model/act.py`, 29 tests in `g1_model/test_act.py`. The row-by-row table is
+`docs/ACT_CORRESPONDENCE.md`; this entry records what reading the reference cost
+us in practice and the two numbers a later session must not re-derive.
+
+### The decoder-layer observation, stated descriptively
+
+`detr_vae.py:131` reads `hs[0]`. `transformer.py:76` returns
+`(num_dec_layers, bs, num_queries, d)`, so index 0 is the FIRST decoder layer's
+output, while `dec_layers = 7` (`imitate_episodes.py:55`, paper Table III).
+Measured on commit 742c753: backward through `hs[0]` gives decoder layer 1 a
+gradient of L1 7.41e-05 and layers 2-7 exactly 0.0.
+
+**We build seven and read index 0, exactly as the reference does.** That is
+fidelity by construction: reading `hs[-1]` would be a deeper, different model,
+and an RQ2/RQ3 result obtained with it could not be attributed to ACT's design.
+The consequence is on the record rather than corrected: **44.5% of ACT's
+72,534,998 parameters sit in decoder layers 2-7 and receive no gradient.** This
+is an observation about the published implementation, not a claim that it is a
+defect - only that our parameter count and VRAM figures include weights that do
+not train, and any "ACT has 72.5M parameters" statement must carry it.
+
+### beta: the reduction mismatch, measured, and DEFERRED
+
+The reference reduces with `(all_l1 * ~is_pad).mean()` (`policy.py:31`) - padded
+entries zeroed, then divided by the FULL element count including padding and all
+14 dims. Ours divides by contributing elements (real timesteps x 16 trainable
+dims). The scales differ, so the reference's beta does not carry the same L1:KL
+balance in our model.
+
+Measured 2026-09-21, 7,628 real samples at K=100 with the trained chunked-BC
+checkpoint, decomposed because a single ratio is misleading:
+
+| | L1 |
+|---|---|
+| ours (16 dims, real timesteps) | 0.042570 |
+| reference reduction, applied as-is | 0.073598 |
+| reference reduction, **fair** | 0.028951 |
+
+Applied as-is the ratio is 0.578 (implying beta'=5.78), but that is an artifact:
+our model emits 22 dims and is never penalised on 6 of them, so their error is
+unconstrained and the reference's reduction averages it in. A model actually
+trained under the reference's reduction would learn those dims - five are
+exactly constant (std 0.0) and `a_gR` is bit-identical to `a_gL` - so the fair
+comparison gives them for free:
+
+    ours / reference (fair) = 1.4704   ->   beta' = 14.70
+
+Cross-checked against the pure reduction arithmetic, which is model-independent:
+`(n_real x 16) / (B x K x 22) = 0.6801`, and `1/0.6801 = 1.470`. The two agree.
+
+**beta = 10 (the reference's value) is used, and 14.70 is recorded beside it in
+every run's metadata.** The choice is deferred because the overfit-10 gate cannot
+discriminate between them - on ten episodes the KL term is small and either value
+overfits - so it waits for a validation signal that can. NOT rescaled silently.
+
+### The 4 GB ceiling is not a number, it is a range that depends on the desktop
+
+A4, and the finding is sharper than expected. ACT at K=100, hidden 512, ff 3200
+does not OOM when it exceeds VRAM on this Windows machine - it spills to shared
+system memory and **collapses in throughput**, which is far harder to notice than
+a crash. Measured on the RTX 3050 Laptop (4096 MiB):
+
+| batch | GPU nearly idle | GPU with 3355 MiB used by other apps |
+|---|---|---|
+| 8 | 132.6 ms/step, 60.3 samples/s | 332.6 ms/step, 24.1 samples/s |
+| 16 | 206.8 ms/step, 77.4 samples/s | 790.0 ms/step, 20.3 samples/s |
+| 32 | 362.7 ms/step, **88.2 samples/s** | 19398 ms/step, **1.6 samples/s** |
+| 48 | 2322.8 ms/step, 20.7 samples/s | - |
+| 64 | 7115.3 ms/step, 9.0 samples/s | - |
+
+So the honest answer to "largest batch that fits in 4 GB" is **32 on an idle GPU
+(3366 MiB peak allocated), 8 under a realistic desktop load**, and the failure
+mode in between is a silent 12x slowdown rather than an error. Strict determinism
+(`use_deterministic_algorithms(True)`) costs a further ~15% (21.8 s vs 19.0 s per
+step under memory pressure) and is kept.
+
+**Chunked BC used batch 256.** ACT cannot. Since the final comparison requires an
+identical training configuration across all four models, a batch size forced by
+ACT becomes the batch size for BC and chunked BC too, and both would need
+re-running at it. Nothing was re-run; this is a decision for Charles.
+
+### What the gate was run under, and what it does not license
+
+The gate ran at **batch 8** and **lr 1e-3**. The lr is BC's provisional value,
+inherited through `BCConfig` by the shared runner - it is NOT ACT's published
+1e-5 (`README.md:77`, paper Table III). That is correspondence row 36, which is
+marked gate-blind and UNRESOLVED. A re-run at 1e-5 is the obvious next step and
+was deliberately not done in the same session as seeing the gate result, because
+changing a hyperparameter after seeing a gate outcome is what the protocol
+forbids.
+
+Note also that at batch 8 an epoch is 954 optimizer steps against chunked BC's 30
+at batch 256, so epoch counts are NOT comparable between the two runs and only
+step counts are.
+
+### THE GATE FAILED, and the diagnosis is posterior collapse
+
+Overfit-10, K=100, W_o=1, batch 8, lr 1e-3, beta 10, 12 epochs (11,448 optimizer
+steps), 2350.9 s:
+
+    train error   0.466184
+    reference     0.044657   (W_o=1, K=100, 10 episodes)
+    ratio         10.4393    -> FAIL
+
+**The reference is bit-identical to chunked BC's 0.044657**, which is the correct
+outcome: W_o and K are unchanged, so the observation space and the prediction
+target did not move when the architecture did. That much of the plumbing is right.
+
+The KL term tells the story, and it is only visible because the loop logs `l1`
+and `kl` separately:
+
+| epoch | recon | KL |
+|---|---|---|
+| 1 | 0.494427 | 0.193 |
+| 2 | 0.468553 | 0.001 |
+| 3 | 0.467091 | 0.001 |
+| 9 | 0.466338 | 0.00001 |
+| 12 | 0.466184 | 0.00000 |
+
+**The KL collapsed to zero within two epochs and the reconstruction then froze.**
+That is textbook posterior collapse: the encoder is driven to the prior, z carries
+no information, and what remains is chunked BC with 51x the parameters and a dead
+encoder. The final reconstruction, 0.4662, sits between the ZERO baseline (0.6402)
+and the COPY baseline (0.4098) - the model learned approximately the mean pose and
+stopped.
+
+NOTHING WAS CHANGED TO FORCE A PASS. Two hyperparameters are the obvious
+suspects, and both are correspondence rows already marked UNRESOLVED, so neither
+was touched after seeing the result:
+
+- **lr = 1e-3** was inherited from `BCConfig` by the shared runner. ACT's
+  published value is **1e-5** (`README.md:77`, paper Table III) - 100x lower.
+  A post-norm transformer of 72.5M parameters at 1e-3 with no warmup is the
+  likeliest root cause of a model that barely trains at all. Row 36.
+- **beta = 10** at our reconstruction scale. The D5 measurement compared balances
+  at CONVERGED loss (~0.029); at initialisation the reconstruction is ~0.5, so
+  the weighted KL (1.93) is roughly 4x the reconstruction term and the optimizer
+  kills the KL first. That the measured beta'=14.70 points HIGHER makes this
+  worth stating plainly: the 1.4704 ratio is a statement about balance at
+  convergence and says nothing about collapse dynamics at initialisation. Row 32.
+
+The next session's first experiment is a re-run at lr 1e-5, unchanged in every
+other respect. If the KL survives and the reconstruction falls, the cause was the
+learning rate; if the KL still collapses, beta needs a schedule or a floor and
+that is a Chapter 3 disclosure, not a tuning choice.

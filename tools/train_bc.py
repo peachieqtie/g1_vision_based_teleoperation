@@ -52,6 +52,7 @@ from g1_model.loader import ChunkDataset, LoaderConfig, TrackingPolicy
 from g1_model.models import (K_PROVISIONAL, PROVISIONAL, BCConfig,
                              BCPolicy, build_bc)
 from g1_model import ambiguity as AMB
+from g1_model.act import ACTConfig, build_act
 from g1_model import train as T
 
 
@@ -72,6 +73,19 @@ def _load(seeds, bc: BCConfig, norm_meta, norm_fit_seeds=None) -> ChunkDataset:
                      tracking=_tracking_policy()),
         st, ac, norm_meta if norm_meta else None, seeds=seeds,
         norm_fit_seeds=norm_fit_seeds)
+
+
+def _make_model(kind, bc, tcfg):
+    """The ONE place a model is chosen. Every model is built through
+    `seeded_build` (D10): seeding happens inside `train()` at entry, which is
+    already too late to control weight initialisation."""
+    if kind == "bc":
+        return T.seeded_build(tcfg, build_bc, cfg=bc)
+    if kind == "act":
+        return T.seeded_build(tcfg, build_act,
+                              cfg=ACTConfig(obs_window=bc.obs_window,
+                                            chunk_size=bc.chunk_size))
+    raise SystemExit("unknown --model %r (bc|act)" % kind)
 
 
 def _splits():
@@ -164,12 +178,14 @@ def cmd_overfit10(a):
     prediction target changed.
     """
     K = int(a.chunk)
-    bc = BCConfig(obs_window=1, chunk_size=K, dropout=0.0, weight_decay=0.0)
+    bc = BCConfig(obs_window=1, chunk_size=K, dropout=0.0, weight_decay=0.0,
+                  batch_size=int(a.batch))
     tr, _ = _splits()
     seeds = tr[:10]
     st, ac, meta = DS.load_norm_stats()
     ds = _load(seeds, bc, meta, norm_fit_seeds=tr)
-    name = "BC" if K == 1 else "CHUNKED BC (K=%d)" % K
+    name = ("ACT (K=%d)" % K if a.model == "act"
+            else "BC" if K == 1 else "CHUNKED BC (K=%d)" % K)
     _banner(ds, "OVERFIT-10 GATE: %s on %d episodes, seeds %s"
             % (name, len(seeds), seeds))
     if K > 1:
@@ -187,15 +203,30 @@ def cmd_overfit10(a):
     cfg = T.TrainConfig(
         epochs=int(a.epochs), batch_size=bc.batch_size, lr=bc.lr,
         weight_decay=0.0, optimizer=bc.optimizer, seed=0,
-        run_name="bc_overfit10_K%d" % K, log_every=max(1, int(a.epochs) // 20),
-        notes=dict(gate="overfit-10", chunk_size=K,
+        run_name="%s_overfit10_K%d" % (a.model, K), log_every=max(1, int(a.epochs) // 20),
+        notes=dict(gate="overfit-10", chunk_size=K, model=a.model,
+                   **(dict(
+                       kl_weight_used=10.0,
+                       kl_weight_reference="reference/act README.md:76 --kl_weight 10; "
+                                           "paper Table III beta 10",
+                       kl_weight_balance_matched=14.70,
+                       kl_weight_note=(
+                           "Our masked_l1 reduces over CONTRIBUTING elements (16 of 22 "
+                           "dims, padding excluded); the reference divides by the full "
+                           "element count (policy.py:31). MEASURED 2026-09-21 on 7,628 "
+                           "real samples at K=100: our reconstruction term is 1.4704x "
+                           "the reference's scale, so preserving the reference's L1:KL "
+                           "balance needs beta'=14.70. beta=10 is used here because the "
+                           "overfit-10 gate cannot discriminate between them; the choice "
+                           "is DEFERRED to a validation signal. NOT rescaled silently."),
+                   ) if a.model == "act" else {}),
                    criterion="train error < neighbour-ambiguity reference for "
                              "this loader configuration (NOTES.md 2026-09-21)",
                    ambiguity_reference=ref.as_metadata(),
                    provisional_hyperparameters=PROVISIONAL,
                    data_caveat=T.dataset_provenance(ds)["caveat"],
                    regularization="NONE: dropout 0, weight_decay 0, no augmentation"))
-    model = T.seeded_build(cfg, build_bc, cfg=bc)
+    model = _make_model(a.model, bc, cfg)
     res = T.train(model, ds, cfg)
     _report(res, res["baselines"], "OVERFIT-10 RESULT (%s)" % name)
 
@@ -216,7 +247,7 @@ def cmd_overfit10(a):
 def cmd_full(a):
     """Part B: the 32/8 split, deferred from Stage 2. A PLUMBING CHECK."""
     K = int(a.chunk)
-    bc = BCConfig(obs_window=1, chunk_size=K)
+    bc = BCConfig(obs_window=1, chunk_size=K, batch_size=int(a.batch))
     tr, va = _splits()
     st, ac, meta = DS.load_norm_stats()
     tds = _load(tr, bc, meta)
@@ -242,7 +273,7 @@ def cmd_full(a):
     cfg = T.TrainConfig(
         epochs=int(a.epochs), batch_size=bc.batch_size, lr=bc.lr,
         weight_decay=bc.weight_decay, optimizer=bc.optimizer, seed=0,
-        run_name="bc_full_K%d" % K, log_every=max(1, int(a.epochs) // 20),
+        run_name="%s_full_K%d" % (a.model, K), log_every=max(1, int(a.epochs) // 20),
         notes=dict(gate="full-split plumbing check",
                    is_a_result=False,
                    chunk_size=K,
@@ -254,7 +285,7 @@ def cmd_full(a):
                    ambiguity_reference_val=ref_va.as_metadata(),
                    provisional_hyperparameters=PROVISIONAL,
                    data_caveat=T.dataset_provenance(tds)["caveat"]))
-    model = T.seeded_build(cfg, build_bc, cfg=bc)
+    model = _make_model(a.model, bc, cfg)
     res = T.train(model, tds, cfg, val_ds=vds)
     _report(res, res["baselines"], "FULL-SPLIT RESULT (plumbing only)")
     print("  against the neighbour-ambiguity references:")
@@ -334,6 +365,9 @@ def main():
         if name in ("overfit10", "full"):
             p.add_argument("--chunk", type=int, default=1,
                            help="K. 1 = BC, >1 = chunked BC (same class)")
+            p.add_argument("--model", default="bc", choices=("bc", "act"))
+            p.add_argument("--batch", type=int, default=256,
+                           help="batch size. ACT's 4 GB ceiling is 32 (measured)")
         if name == "wo-curve":
             p.add_argument("--windows", default="1,2,4,8,16,32")
             p.add_argument("--chunk", type=int, default=1)

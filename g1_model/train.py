@@ -209,6 +209,30 @@ def masked_l1(pred: torch.Tensor, target: torch.Tensor,
     return total / n.clamp(min=1), n
 
 
+# ─── the optional extra-loss hook ─────────────────────────────────────────────
+def forward_loss(model: nn.Module, obs, target, pad, dim_mask):
+    """(loss, reconstruction_l1, n_elements, extras) for ANY model in the ladder.
+
+    The loop stays model-agnostic. BC and chunked BC are plain feedforward maps,
+    so the default path is `pred = model(obs)` and the loss IS `masked_l1`. A
+    model that needs more than its own prediction to score itself - ACT, whose
+    CVAE encoder must see the action chunk, and which adds a KL term - declares
+    `loss_terms` and the loop delegates to it.
+
+    This is a hook, not a branch on a class name: nothing here imports ACT, and
+    adding ACT-LSTM later requires no change to this function. What it must NOT
+    become is a second reconstruction loss - `loss_terms` implementations are
+    required to build their reconstruction term from `masked_l1`, because one
+    reconstruction term across every stage is what the comparison rests on (D6).
+    """
+    fn = getattr(model, "loss_terms", None)
+    if fn is not None:
+        return fn(obs, target, pad, dim_mask)
+    pred = model(obs)
+    loss, n = masked_l1(pred, target, pad, dim_mask)
+    return loss, loss, n, {}
+
+
 # ─── B6: the baselines ────────────────────────────────────────────────────────
 def baselines(ds: ChunkDataset, device: Optional[torch.device] = None,
               batch_size: int = 512) -> dict:
@@ -346,10 +370,12 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device,
         obs = batch["obs"].to(device, non_blocking=True)
         target = batch["action"].to(device, non_blocking=True)
         pad = batch["action_mask"].to(device, non_blocking=True)
-        pred = model(obs)
-        err, m = masked_l1(pred, target, pad, dim_mask, reduce=False)
-        total += float(err.sum())
-        n += int(m.sum())
+        # Scored on the RECONSTRUCTION term only, identically for every model: a
+        # validation number that included ACT's KL would not be comparable with
+        # BC's, and model selection would then choose on a different quantity.
+        _, l1, count, _ = forward_loss(model, obs, target, pad, dim_mask)
+        total += float(l1) * int(count)
+        n += int(count)
     return total / max(n, 1)
 
 
@@ -435,24 +461,31 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
     for epoch in range(1, int(cfg.epochs) + 1):
         model.train()
         e0 = time.perf_counter()
-        total, n = 0.0, 0
+        total, recon, n = 0.0, 0.0, 0
+        extra_sums = {}
         for batch in tl:
             obs = batch["obs"].to(device, non_blocking=True)
             target = batch["action"].to(device, non_blocking=True)
             pad = batch["action_mask"].to(device, non_blocking=True)
-            pred = model(obs)
-            loss, count = masked_l1(pred, target, pad, dim_mask)
+            loss, l1, count, extras = forward_loss(model, obs, target, pad, dim_mask)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if cfg.grad_clip:
                 nn.utils.clip_grad_norm_(model.parameters(), float(cfg.grad_clip))
             opt.step()
             total += float(loss.detach()) * int(count)
+            recon += float(l1.detach()) * int(count)
             n += int(count)
+            for k_, v_ in extras.items():
+                extra_sums[k_] = extra_sums.get(k_, 0.0) + float(v_) * int(count)
         train_loss = total / max(n, 1)
+        recon_loss = recon / max(n, 1)
+        extra_means = {k_: v_ / max(n, 1) for k_, v_ in extra_sums.items()}
         val_loss = evaluate(model, vl, device, dim_mask) if vl is not None else None
 
-        row = dict(epoch=epoch, train_loss=train_loss, val_loss=val_loss,
+        row = dict(epoch=epoch, train_loss=train_loss, recon_l1=recon_loss,
+                   **{("train_" + k_): v_ for k_, v_ in extra_means.items()},
+                   val_loss=val_loss,
                    lr=float(opt.param_groups[0]["lr"]),
                    epoch_seconds=round(time.perf_counter() - e0, 3),
                    elapsed_seconds=round(time.perf_counter() - t0, 3),
