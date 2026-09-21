@@ -27,3 +27,7 @@ recordings/
 # Training run directories: metrics, checkpoints and metadata. Artifacts of a
 # run, not source. Each run's metadata.json records its own data provenance.
 runs/
+
+# Cloned upstream references (e.g. tonyzhaozh/act). Read-only, never vendored
+# into the tracked tree; the commit hash in NOTES.md is what makes them citable.
+reference/

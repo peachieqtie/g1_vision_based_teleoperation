@@ -6267,3 +6267,99 @@ scripted demonstrator that never changes its mind. **Settle it on piloted data.*
 belongs to Stage 4. Folding it in here would mean Stage 3 measured chunking *and*
 ensembling with no way to separate them. A chunked policy commits to its first
 prediction and re-plans on the next tick.
+
+---
+
+## 2026-09-21 — The ACT reference: what was pinned, and what reading it found
+
+Phase 4 Stage 4 session 1 wrote no model code. It established what ACT actually is, from
+the source, so that sessions 2 and 3 implement against a citable artefact rather than
+against recollection. Full detail in `docs/ACT_CORRESPONDENCE.md` and
+`docs/ACT_AUDIT.md`; this entry records the pin and the findings that change decisions.
+
+### The pin
+
+| | |
+|---|---|
+| repository | `https://github.com/tonyzhaozh/act` — resolved, not moved or renamed |
+| commit | **`742c753c0d4a5d87076c8f69e5628c79a8cc5488`** |
+| commit date | 2024-01-28 12:18:07 -0800, branch `main` |
+| clone | `reference/act/` — **gitignored**, never vendored into the tracked tree |
+| paper | Zhao, Kumar, Levine, Finn, *Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware* |
+| arXiv | **2304.13705v1**, 23 Apr 2023 — v1 is the only version |
+
+That hash is what makes every `file:line` citation in the two documents checkable. Against
+any other commit the line numbers are meaningless.
+
+### Five findings that change what we build
+
+**1. The reference's state-only path is unreachable dead code, and it drops the CVAE.**
+`DETRVAE.forward` has a `backbones is None` branch (`detr_vae.py:132-136`) that looks like
+exactly what a state-only adaptation wants. It is never reached: `build()` constructs
+backbones unconditionally (`:235-237`). Worse, that branch calls
+`self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)` with
+four arguments and **never passes `latent_input`** — the vision path passes seven
+(`:131`). Copying the obvious-looking branch would produce an "ACT" with no CVAE
+conditioning at all, i.e. chunked BC with an unused encoder, and RQ2/RQ3 would compare a
+model against itself. **Take the vision branch's wiring and delete only the image tokens.**
+
+**2. ACT builds seven decoder layers and trains one. MEASURED.**
+`dec_layers = 7` (`imitate_episodes.py:55`, paper Table III), but `detr_vae.py:131` reads
+`hs[0]`, and `transformer.py:76` returns `(num_dec_layers, bs, num_queries, d)` — so `[0]`
+is the **first** layer, not the last. Measured on this commit with a 7-layer decoder:
+output shape `(7, 3, 11, 16)`; backward through `hs[0]` gives decoder layer 1 a gradient
+of L1 `7.41e-05` and layers 2–7 **exactly `0.0`**. This was reasoned about first and got
+the wrong answer; the gradient measurement settled it (TR18's rule, again).
+Consequence: we cannot both replicate faithfully and report "7 decoder layers" honestly.
+Options and a recommendation are in `ACT_CORRESPONDENCE.md` §5 — recommendation is to
+build **one** layer and state in Chapter 3 that the reference builds seven and trains one.
+
+**3. The paper contradicts itself on the loss.** Algorithm 1 line 9 says
+`Lreconst = MSE(...)`; §IV-C prose says "We use L1 loss for reconstruction instead of the
+more common L2 loss"; the code uses `F.l1_loss` (`policy.py:30`). Two sources against one:
+**L1**. Our Stage 2 loss is already L1, chosen for the same reason, so the ladder is
+consistent by luck rather than by checking — now checked.
+
+**4. The reference's loss reduction is not K-invariant, and its normalisation leaks.**
+`l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()` (`policy.py:31`) zeroes padded entries and
+then divides by the **full** element count, so the loss depends on how much padding a
+batch happened to contain. Our `masked_l1` divides by contributing elements, which is
+required for the K=1 vs K=100 comparison to mean anything. Separately,
+`get_norm_stats` is computed over **all** episodes before the split (`utils.py:115-120`),
+leaking validation statistics into the normaliser — the exact failure our Stage 1 A3 work
+exists to prevent. **We are deliberately stricter than the reference in both places, and
+both divergences must be disclosed rather than presented as fidelity.**
+
+**5. Paper/code disagreements, collected.** Decoder queries are `nn.Embedding` — learned
+(`detr_vae.py:54`) — while paper §IV-C calls them "a fixed position embedding". One
+ResNet18 is shared across all cameras (`:121`, `:235-237`) while Figure 11 shows one per
+camera. The temporal-ensembling weight has **no numeric value in the paper**; the only
+number is `k = 0.01` (`imitate_episodes.py:255`), and that variable name collides with the
+paper's `k` for chunk size. Any `m` attributed to the paper would be fabricated.
+
+### Chunk size and horizon (D4)
+
+`DT = 0.02` (`constants.py:36`) → ACT runs at **50 Hz**; chunk size 100 → **2.0 s**. We run
+at 25 Hz (D4), so K=100 is **4.0 s** and K=50 is 2.0 s. Their episodes are 400 steps = 8 s
+and a chunk is 25% of one; ours are 694–846 ticks = 27.8–33.8 s and K=100 is ~13%.
+**Matching the number** keeps the methods table identical to the paper; **matching the
+horizon** (K=50) predicts the same physical span, which is the quantity that plausibly
+transfers, since a chunk is a unit of intent and intent has a duration in seconds. Stage 3
+used K=100 provisionally because it is ACT's published number and for no other reason.
+Neither can be settled on scripted data.
+
+### W_o is an ADDITION to ACT, not an adaptation of it
+
+ACT's observation is a **single timestep**: `qpos = root['/observations/qpos'][start_ts]`
+(`utils.py:37`), `forward(self, qpos, ...)` with `qpos: batch, qpos_dim`
+(`detr_vae.py:80`). There is no observation window anywhere in the reference. So any
+`W_o > 1` is something we added, and it lands in the same place the LSTM would: it gives
+the model history.
+
+**Recommendation, and the reasoning is in the session report: set W_o = 1 for every
+condition in the ladder.** BC and chunked BC already use it; keeping it at 1 for ACT and
+ACT-LSTM makes ACT faithful to the reference and makes each rung of the ladder add exactly
+one thing — chunking, then the CVAE, then recurrence. A window would give the transformer
+the history the LSTM is meant to supply and would confound RQ3 with the very mechanism it
+is testing. The Stage 3 ambiguity curve is consistent with this: on scripted data a longer
+window bought no measurable reduction in action ambiguity at all.
