@@ -6817,3 +6817,66 @@ above zero and the z = 0 vs posterior-mean gap to open. If it collapses on pilot
 that is the finding, and beta (10; balance-matched 14.70, which points further toward collapse)
 becomes the live suspect. NOT tested; no beta change made. Consequence for RQ2: on scripted data,
 ACT vs chunked BC cannot isolate the CVAE, because there is nothing for the CVAE to do.
+
+## 2026-09-22 — CLAUDE.md §8 ARCHIVE: retired Phase 1–3 decisions and resolved §10 issues
+
+Retired under the CLAUDE.md §14 retirement policy, adopted today with the cap raised 300 → 400. Each entry is
+reproduced VERBATIM as it stood in CLAUDE.md, followed by where its content still lives. A pointer line stays in
+CLAUDE.md §8 (or §10) for each. Kept in CLAUDE.md, with the reasons reported to Charles: 2026-09-15 grasp without
+the base lock (open question); 2026-09-11 schema, phase vocabulary, WALK_IN and dataset design (do-not-re-open
+items and plans for work not yet done); 2026-09-09 walking place (the +28 to +31 mm x-bias disclosure is still
+owed); 2026-09-09 O20/O21 ("rotating the offset alone scored 10/10 → 3/10" has no other home); 2026-09-08 D11 + Q6
+(Q6 is cited by §1 and is a do-not-re-open item).
+
+### 1.
+
+- 2026-09-15 — **OBJECTIVE 1 DEMONSTRATED.** Live operator, ZED, stepped physics, full task. Difficulties reported and the response to each:
+  piloting into the lock window is hard (overlay rewritten to give ACTIONS, not measurements); walking/turning felt slow (`KeyboardCommand`
+  runs well under the validated envelope); sim ran below real time with tracking active (measured 37.4%, fixed below).
+
+**Still lives in:** §3 (`teleop under stepped physics, full task by a live operator`) and §13 carry the fact; the three operator-reported difficulties were each answered in code (overlay, `KeyboardCommand`, the IK throughput fix).
+
+### 2.
+
+- 2026-09-15 — **IK throughput.** `mj_forward` in the solver loop → `mj_kinematics` + `mj_comPos`; everything the solver reads is
+  bit-identical, arm trajectories bit-identical on a real ZED take, sim-to-wall 37.4% → 128.2%. Before the fix the IK was 97.4% of
+  `controller.step` (34.33 ms) against retargeting 0.14 ms and smoothing 0.57 ms. Next bottleneck: renderer (31–42% of wall), camera (~21 Hz).
+
+**Still lives in:** `g1_teleop/ik.py` carries the rationale and the measured bit-identity (`tools/teleop_throughput.py --verify`).
+
+### 3.
+
+- 2026-09-15 — **D18 adopted** (B-prime) after a measured A/B and one revert; `<contact><exclude>` pairs, not contype bits, so hand↔hand survives.
+
+**Still lives in:** §7 D18 carries the decision; `g1_teleop/contact_contract.py` explains exclude pairs versus contype bits.
+
+### 4.
+
+- 2026-09-11 — **O26 MITIGATED** by the staged raise: wedge gone, wrist error 1.418 → 0.001 rad, predicate gate 24/40 → 40/40. **The collision
+  is not fixed** (§10).
+
+**Still lives in:** §10 O26 carries the status (wedge gone, collision not); the 24/40 → 40/40 figures are in §10's Phase 1 gate item.
+
+### 5.
+
+- 2026-09-10 — **Constant-dim mask measured**: 6 of 22 action dims excluded, 16 trainable; no state dim is constant. **Base-lock predicate**
+  defined from the 47-D state, measured, validated closed-loop, enabled: settled test is one full `GAIT_PERIOD`, debounced 5 ticks, latching
+  edge trigger, with a `to_goal` guard separating lock from release.
+
+**Still lives in:** §6 and `g1_data/spec.py` carry the mask; the `g1_data/phases.py` docstring carries the predicate (one `GAIT_PERIOD`, 5-tick debounce, `to_goal` guard); TR20 stays in §9.
+
+### 6.
+
+- 2026-08-23 — Q1–Q5: palm-pad gripper; `KeyboardCommand` over the pelvis trigger (TR1); 25 Hz recording with a 50 Hz locomotion loop;
+  `d_place = 0.10 m` plus a resting clause; waist pinned (D10); learning code at the repo root; plain ACT as a third condition (D8).
+
+**Still lives in:** §7 D4/D6/D8/D10 and TR1 carry them; `d_place` is `g1_data/success.py` `place_radius` (Q4).
+
+### 7.
+
+- **O12. CLOSED** — Q7 is answered: the robot DOES walk during demonstrations (12/12 scripted walking place, and a live operator walked in), so the
+  arm's-reach fallback is off the table and loco-manipulation stays in the contribution (PLAN.md).
+  **O10, O14–O16, O18, O20–O24. RESOLVED** — see §8 and `NOTES.md`; O10's cap now comes from the measured 694–846 distribution, spawn-dependent
+  rather than schedule-derived.
+
+**Still lives in:** §10 item, resolved. §14 permits removing resolved issues; archived rather than deleted. O12's answer also lives in PLAN.md and in §3 (the robot walks in every episode).

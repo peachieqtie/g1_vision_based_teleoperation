@@ -20,15 +20,15 @@ record the divergence and ask Charles. A drift from an OBJECTIVE, not a method, 
 
 ## 2. CURRENT BLOCKER
 
-**None. PHASE 2 IS CLOSED.** Schema frozen at **`g1-spec-1.1.0`**, `lock_predicate=True` is the default, O26 is mitigated, and
-`run_integrated_combined.py` is at parity with the demonstrator's physics (base lock, pad fix, B-prime, overlay). **Objective 1 is demonstrated
-end to end:** on 2026-09-15 a **live operator completed the full task** — walk in, grasp, transport, place — with the ZED under stepped physics
-(`NOTES.md` "2026-09-15 PHASE 2 CLOSEOUT"). **Next: Phase 3 — recorder plus open-loop replay test. Awaiting Charles's signal.**
+**None. Phase numbers are PLAN.md's** (P3 recorder, P4 pilot, P5 model code); commits and `NOTES.md` since 2026-09-21 call the P5 work
+"Phase 4 stages". **P1–P3 CLOSED.** P3's open-loop replay reproduces the manipulation channel on 5 scripted episodes; the locomotion channel
+cannot be replayed open loop by any recorder (`NOTES.md` 2026-09-16). **P5 in progress:** BC, chunked BC and state-only ACT all pass the
+overfit-10 gate (§8 2026-09-22). **Next: ACT-LSTM, the `use_lstm` flag on the SAME class** (`g1_model/act.py`). **Every model result so far
+is on SCRIPTED data — no piloted episode exists** (`data/raw/` is empty), so O31 and O32 stay open until P4.
 
-**Two things to settle while Phase 3 starts.** (a) **The grasp worked WITHOUT the base lock** in that session, so D12 may bind only the scripted
-demonstrator (§8) — resolving it before collection would drop the project's largest limitation and hand Objective 4 free standoff variation.
-(b) D18 must reach collection AND evaluation identically or every result is invalid; the mechanism exists
-(`g1_teleop/contact_contract.py`), the recorder has to use it.
+**P4 pilot has not started.** It must settle D12: the grasp worked free-based on 2026-09-15, so D12 may bind only the scripted demonstrator
+(§8). D18 is enforced at every reset (`g1_data/reset.py` raises on a contract mismatch; the recorder stores it per episode) — the
+evaluation harness, not yet built, must start its episodes through the same reset.
 
 ## 3. Full pipeline (end to end)
 
@@ -37,7 +37,8 @@ demonstrator (§8) — resolving it before collection would drop the project's l
 [EXISTS] WELD grasp (D11) + base lock (D12) + B-prime exclusion (D18) + seeded spawn; teleop under stepped physics, full task by a live operator
 [EXISTS] scripted demonstrator (g1_data/scripted_demo.py) 12/12 and 40/40; g1_data/spec.py frozen at g1-spec-1.1.0
 [EXISTS] recorder @25 Hz -> success detection -> offline phase labels -> dataset -> loader -> shared train loop + masked-L1 loss -> neighbour-ambiguity gate -> BC and chunked BC (ONE class, K=1 vs K>1): g1_data/{recorder,success,phase_label,dataset}.py + g1_model/{loader,train,ambiguity,models}.py
-[MISSING] ACT | ACT-LSTM (ONE class behind a `use_lstm` flag) -> autonomous deployment -> Exp 1 in-distribution, Exp 2 held-out patch
+[EXISTS] ACT, state-only, one decoder layer; overfit-10 PASS 0.920 on scripted data: g1_model/act.py
+[MISSING] ACT-LSTM (the `use_lstm` flag on the SAME class) -> autonomous deployment -> Exp 1 in-distribution, Exp 2 held-out patch
 ```
 
 ## 4. Current state — the measurements a fresh session cannot re-derive
@@ -54,7 +55,7 @@ is deliberately NOT repeated here — `NOTES.md`, the suites and the run directo
 
 ## 5. Not yet built
 
-**ACT and ACT-LSTM — ONE model class behind a `use_lstm` flag** (two implementations would stop the gap isolating the LSTM), plus autonomous deployment and the Exp 1 / Exp 2 evaluation harness. Everything else in the learning stack is built (§3, `g1_model/`).
+**ACT-LSTM — the `use_lstm` flag on the SAME class as ACT** (`g1_model/act.py`; two implementations would stop the gap isolating the LSTM), plus autonomous deployment and the Exp 1 / Exp 2 evaluation harness. Everything else in the learning stack is built (§3, `g1_model/`).
 Dataset and evaluation design — 150 episodes, splits, fixed eval seeds, nested scaling subsets, the statistical limit — is in PLAN.md and `NOTES.md` "PHASE 2 CLOSEOUT".
 
 ## 6. State and action vectors
@@ -98,11 +99,19 @@ D6, D7, **D12** and **D18** touch **objectives**, not just methods. D6/D7 are re
 
 ## 8. Decision log
 
-Older entries are one line; detail is in `NOTES.md` under the same date.
+Older entries are one line; detail is in `NOTES.md` under the same date. Retired entries (§14) keep a one-line pointer.
 
+- 2026-09-22 — **ACT PASSES the overfit-10 gate: 0.041081 / 0.044657 = 0.920** (converged, 195k steps, lr 1e-5, beta 10, one decoder
+  layer). It had "failed" at 1.140 because the gate scored a TRAIN-MODE window mean, with dropout 0.1 on and the weights moving; ALL of the
+  gap is dropout (z = posterior vs 0 moves < 2e-4). **The gate AND best.pt now use ONE quantity, `train.score_deployment`**: final weights,
+  eval mode enforced by hooks, `model(obs)` only, so the CVAE encoder is unreachable by construction. Every gate.json rewritten; no other
+  verdict changed (TR30). `NOTES.md` 2026-09-22.
+- 2026-09-22 — **ACT's latent COLLAPSED (KL 1e-05; z = 0 equals the posterior mean) — EXPECTED on scripted data**: a deterministic
+  demonstrator has no style variation for z to encode, so on scripted data ACT vs chunked BC cannot isolate the CVAE (RQ2). A PREDICTION to
+  test on piloted data (O32), NOT a defect: do not tune beta for it.
 - 2026-09-21 — **THE GATE CRITERION IS THE NEIGHBOUR-AMBIGUITY REFERENCE**, computed per loader configuration, not "loss near
   zero" (`g1_model/ambiguity.py`). A stage passes when 10-episode training error falls below it; report both numbers and the ratio,
-  always. BC 0.009200/0.012764 = 0.721 PASS; chunked BC 0.042763/0.044657 = 0.958 PASS. Quote `AmbiguityResult.cite()`, never
+  always. BC 0.009512/0.012764 = 0.745 PASS; chunked BC 0.042570/0.044657 = 0.953 PASS (deployed function, 2026-09-22). Quote `AmbiguityResult.cite()`, never
   `.mean`. Revision record, and why the old criterion failed a working model: `NOTES.md` 2026-09-21.
 - 2026-09-21 — **BC's residual is PARTIAL OBSERVABILITY, not capacity.** The 3 velocity dims are 18.8% of trainable dims and 48.5%
   of the loss, 11.5× worse while the base lock is DISENGAGED — and the lock state is deliberately not in the 47-D state (2026-09-11),
@@ -113,18 +122,14 @@ Older entries are one line; detail is in `NOTES.md` under the same date.
 - 2026-09-21 — **The W_o instrument cannot choose W_o** (`ambiguity_curve`, `train_bc.py wo-curve`). Model-free by design, but on
   scripted data it RISES with W_o (0.009608 at W=1 → 0.011850 at W=32) because the space grows faster than the data fills it — a
   dimensionality confound, NOT evidence against longer windows. Real run is on piloted data. `NOTES.md` 2026-09-21.
-- 2026-09-15 — **OBJECTIVE 1 DEMONSTRATED.** Live operator, ZED, stepped physics, full task. Difficulties reported and the response to each:
-  piloting into the lock window is hard (overlay rewritten to give ACTIONS, not measurements); walking/turning felt slow (`KeyboardCommand`
-  runs well under the validated envelope); sim ran below real time with tracking active (measured 37.4%, fixed below).
+- 2026-09-15 — Objective 1 demonstrated: live operator, full task, stepped physics. Archived: `NOTES.md` "2026-09-22 — CLAUDE.md §8 ARCHIVE".
 - 2026-09-15 — **THE GRASP WORKED WITHOUT THE BASE LOCK.** O17's attractor was measured with the scripted station-keeper, whose corrective
   speed is capped; a human at full forward command pushes against the recession. The box welded, lifted, stayed held and the task completed
   free-based. **D12 may therefore bind only the SCRIPTED demonstrator.** Unmeasured: standoff spread at grasp without the lock, and whether a
   learned policy can fight the attractor as a human does. Worth resolving before collection — it removes a major limitation AND gives
   Objective 4 natural standoff variation.
-- 2026-09-15 — **IK throughput.** `mj_forward` in the solver loop → `mj_kinematics` + `mj_comPos`; everything the solver reads is
-  bit-identical, arm trajectories bit-identical on a real ZED take, sim-to-wall 37.4% → 128.2%. Before the fix the IK was 97.4% of
-  `controller.step` (34.33 ms) against retargeting 0.14 ms and smoothing 0.57 ms. Next bottleneck: renderer (31–42% of wall), camera (~21 Hz).
-- 2026-09-15 — **D18 adopted** (B-prime) after a measured A/B and one revert; `<contact><exclude>` pairs, not contype bits, so hand↔hand survives.
+- 2026-09-15 — IK throughput: `mj_kinematics` + `mj_comPos` in the solver, 37.4% → 128.2% of real time. Archived: `NOTES.md` "2026-09-22 — CLAUDE.md §8 ARCHIVE".
+- 2026-09-15 — D18 adopted as `<contact><exclude>` pairs. Archived: `NOTES.md` "2026-09-22 — CLAUDE.md §8 ARCHIVE".
 - 2026-09-11 — **Schema frozen** at `g1-spec-1.1.0`. Four decisions: (a) box position stored WORLD frame, base-relative derived in the loader;
   (b) **gait phase EXCLUDED** from the state, logged as per-timestep metadata — it is a clock, and giving every policy a clock hands BC the
   temporal capability ACT-LSTM is meant to supply, collapsing the RQ2/RQ3 gap; (c) the base lock is neither a state nor an action dim —
@@ -143,11 +148,8 @@ Older entries are one line; detail is in `NOTES.md` under the same date.
   pinned to mean 0 / std 1; ~50 MB. **Collect 25 FIRST and train BC on them** — if BC saturates at 25 the task does not discriminate and the
   comparison cannot answer RQ2/RQ3. **State up front: 100 evaluation episodes give SE ≈ 5% near a 50% rate, so policies are separable at
   roughly 15 points.** Episode-file contents: `NOTES.md` "PHASE 2 CLOSEOUT".
-- 2026-09-11 — **O26 MITIGATED** by the staged raise: wedge gone, wrist error 1.418 → 0.001 rad, predicate gate 24/40 → 40/40. **The collision
-  is not fixed** (§10).
-- 2026-09-10 — **Constant-dim mask measured**: 6 of 22 action dims excluded, 16 trainable; no state dim is constant. **Base-lock predicate**
-  defined from the 47-D state, measured, validated closed-loop, enabled: settled test is one full `GAIT_PERIOD`, debounced 5 ticks, latching
-  edge trigger, with a `to_goal` guard separating lock from release.
+- 2026-09-11 — O26 mitigated by the staged raise. Archived: `NOTES.md` "2026-09-22 — CLAUDE.md §8 ARCHIVE".
+- 2026-09-10 — Constant-dim mask measured; base-lock predicate enabled. Archived: `NOTES.md` "2026-09-22 — CLAUDE.md §8 ARCHIVE".
 - 2026-09-09 — **Walking place adopted; the 0.20 m lateral sweep retired** (O23/O24 closed), 12/12 at both settle durations. **Disclose:
   placement carries a systematic +28 to +31 mm x bias.** O22 closed by trimming the sample region (`pickup_half[0]` 0.06), not the standoff.
 - 2026-09-09 — O20/O21 closed: heading closed-loop on `act[2]` (−15.4° → +0.76°) and `PoseBook.solve` takes a separation DIRECTION so offset
@@ -156,8 +158,7 @@ Older entries are one line; detail is in `NOTES.md` under the same date.
 - 2026-09-08 — **D11 weld replaces the friction pinch** (friction 0/60, weld 60/60); the trigger is geometric, so a policy must bring the hands
   to the box. **Q6 closed:** randomize box position only; Objective 4 held out as a 2-D interior patch, so both marginals stay
   in-distribution and only the COMBINATION is unseen; adds the data-scaling curve and the per-phase taxonomy.
-- 2026-08-23 — Q1–Q5: palm-pad gripper; `KeyboardCommand` over the pelvis trigger (TR1); 25 Hz recording with a 50 Hz locomotion loop;
-  `d_place = 0.10 m` plus a resting clause; waist pinned (D10); learning code at the repo root; plain ACT as a third condition (D8).
+- 2026-08-23 — Q1–Q5 answered. Archived: `NOTES.md` "2026-09-22 — CLAUDE.md §8 ARCHIVE".
 
 ## 9. Tried and rejected — NEVER retry these
 
@@ -217,6 +218,15 @@ Older entries are one line; detail is in `NOTES.md` under the same date.
   action. BC was called a failure while sitting BELOW the 1-NN action spread. Two related traps: the COPY baseline is handed
   `action[t-1]`, which a W_o=1 model does not have, so it is an oracle not a peer; and neighbour ambiguity itself rises with
   `obs_window` for dimensionality reasons (O31), so a rising region is the estimator, never a finding. `NOTES.md` 2026-09-21.
+- **TR28.** Letting a model inherit a hyperparameter from ANOTHER model's config. ACT ran at BC's lr 1e-3 (the reference's is 1e-5) and
+  its latent collapsed; the guard then caught `weight_decay` leaking too. Each model STATES its optimizer config (`ACTConfig.lr` has no
+  default) and `train.assert_optimizer_source` raises on a mismatch. Same family: a training budget with no recorded reason. `NOTES.md` 2026-09-21.
+- **TR29.** Gating on a number in the wrong UNITS. ACT's TOTAL loss (reconstruction + beta*KL, 0.289) was scored against a reconstruction
+  reference: ratio 6.47 where the right answer was 3.09 — silent, and right by accident for BC (no KL term). `gate()` takes only a
+  `Quantity` and refuses other units. `NOTES.md` 2026-09-21.
+- **TR30.** Gating on a TRAIN-MODE number. The window mean of per-step losses carries dropout, a posterior z that read the target, and
+  moving weights: right units, wrong measurement (TR29's family). Converged ACT read 1.140 FAIL, deployed 0.920 PASS. Score only through
+  `train.score_deployment`; `gate()` refuses anything else. Eval-mode `loss_terms` was NOT enough: it still fed the encoder the target.
 
 ## 10. Known open issues
 
@@ -248,12 +258,11 @@ Older entries are one line; detail is in `NOTES.md` under the same date.
   the criteria as written, and the criteria had a hole. Under free lock timing the honest figure was **24/40 before the mitigation, 40/40 after**.
 - **O17.** Permanent fact: a free-standing robot's equilibrium standoff never coincides with the standoff its arms can serve, at any lever swept
   (TR16). **Qualified 2026-09-15:** measured with the capped scripted station-keeper; a human at full command overcame it (§8).
-- **O12. CLOSED** — Q7 is answered: the robot DOES walk during demonstrations (12/12 scripted walking place, and a live operator walked in), so the
-  arm's-reach fallback is off the table and loco-manipulation stays in the contribution (PLAN.md). **O6.** Dead code: `gating.py`, `GatingConfig`, `TorsoYawConfig`,
-  `IKConfig.neutral_weight`/`.target_deadzone`, `set_waist_yaw`, `ZEDConfig.camera_fps` (O29); `RejectReason` survives for `NAN`. **O7.** Stale
-  docs: README claims torso-yaw following and active gating; `config.py` says locomotion is "not yet built"; `test/*.py` is stale.
-  **O10, O14–O16, O18, O20–O24. RESOLVED** — see §8 and `NOTES.md`; O10's cap now comes from the measured 694–846 distribution, spawn-dependent
-  rather than schedule-derived.
+- **O32. NEW — prediction: the ACT latent is ACTIVE on piloted data.** Scripted: KL 1e-05, z inert (§8 2026-09-22). Predicted on teleop:
+  KL stays above zero and the z = 0 vs posterior-mean gap opens. If it collapses there too, beta (10; balance-matched 14.70) is the suspect.
+- **O6.** Dead code: `gating.py`, `GatingConfig`, `TorsoYawConfig`, `IKConfig.neutral_weight`/`.target_deadzone`, `set_waist_yaw`,
+  `ZEDConfig.camera_fps` (O29); `RejectReason` survives for `NAN`. **O7.** Stale docs: README claims torso-yaw following and active gating;
+  `config.py` says locomotion is "not yet built"; `test/*.py` is stale. Resolved issues (O10, O12, O14–O16, O18, O20–O24): `NOTES.md` "2026-09-22 — CLAUDE.md §8 ARCHIVE".
 
 ## 11. File and module structure
 
@@ -279,11 +288,9 @@ Full listing in `NOTES.md`. Only the entries that carry a decision live here:
 
 ## 13. Verified vs assumed
 
-Everything in §4, §6 and §12 is verified by loading the model or running the file; full list in `NOTES.md`. **Now verified, previously
-assumed:** `run_integrated_combined.py` **runs end to end** — executed repeatedly with a live ZED, and on 2026-09-15 a live operator completed
-the full task under stepped physics (walk in, grasp, transport, place); the headless synthetic fixture reproduces lock, weld and release.
-**The camera is a ZED 2i** — serial 31064762, firmware 1523, HD720@30, NEURAL depth, HUMAN_BODY_ACCURATE, BODY_38 — read back FROM the camera
-by `tools/record_keypoints.py` and stored in every take's metadata. **Still assumed:** box friction/solref were tuned, not inherited.
+Everything in §4, §6 and §12 is verified by loading the model or running the file; full list in `NOTES.md`. The camera's identity and
+settings are read back FROM the camera and stored in every take's metadata (`tools/record_keypoints.py`); read them there. **Still assumed:**
+box friction/solref were tuned, not inherited.
 
 ## 14. Maintenance protocol — instructions to future sessions
 
@@ -293,7 +300,15 @@ proposal divergence with the chapter affected; (3) move completed items from §5
 resolved issues are the *only* deletable thing here.
 
 **Rules:** **never delete a §9 entry** — the most expensive knowledge here to rediscover, even when it later looks obvious, and never solve
-overflow by cutting §9. **Keep this file under 300 lines**; past that, move detail to `NOTES.md` and leave a pointer. **If code and this file
-disagree, the code is correct** — fix the file and note the drift in §8. **If code and the proposal disagree, neither is automatically
+overflow by cutting §9. **Keep this file under 400 lines** — raised from 300 on 2026-09-22: that cap was set when the project was small,
+the model work ("Phase 4" in commits, PLAN.md P5) alone added three TR entries and several decisions, and landing at 299 left no room
+for the next session; a cap that forces a retirement exercise every session costs more than it saves. **If code and this file disagree,
+the code is correct** — fix the file and note the drift in §8. **If code and the proposal disagree, neither is automatically
 correct** — do not silently reconcile; surface it to Charles and record the outcome in §7. **No routine implementation detail here** — only
 decisions, state, and what a fresh session could not work out from the code in five minutes.
+
+**Retirement policy — how this file sheds weight; do not invent another trim.** A §8 decision retires to a dated `NOTES.md` archive section,
+verbatim, leaving a one-line pointer, when ALL hold: (1) its phase is CLOSED (PLAN.md numbering); (2) everything it decided is carried
+elsewhere — a §6/§7/§9/§10 entry or the code's own docstring, cited in the archive; (3) it guards nothing. It STAYS if it is a "never /
+do not re-open" item, an open question, a disclosure still owed to the write-up, or a result with no other home in this file. Resolved
+§10 issues move to the same archive. §9 never retires. Report the stay/go list before moving anything; never cut a decision to fit.
