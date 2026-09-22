@@ -3,21 +3,31 @@
 Companion to `CLAUDE.md`. CLAUDE.md holds *state and decisions*; this file holds *sequence*. Read CLAUDE.md §2 first — it is
 always more current than this file. Detail and measurements live in `NOTES.md`.
 
-**Phase numbering.** The numbering below is **authoritative** and CLAUDE.md §2 uses it: P1 grasp physics, P2 freeze specs,
-P3 recorder, P4 pilot, P5 model code, P6 collection, P7 train+eval, P8 writing. One wrinkle to know about: **Phase 2 grew well
-beyond its original task list.** It absorbed the base-lock predicate, the O26 mitigation and the whole teleop-parity effort
-(base lock in the entry point, the TR17 pad fix, D18, the operator overlay, the keypoint recorder, the IK speed fix). Some of
-that is really Phase-4 pilot preparation done early, because a live camera was available. Nothing was skipped; the work simply
-did not arrive in the order this file predicted.
+**Phase numbering.** The numbering below is **authoritative**, and it is the numbering every other artifact uses — CLAUDE.md,
+`NOTES.md` and the commits: P1 grasp physics, P2 freeze specs, P3 recorder, **P4 model code, P5 pilot**, P6 collection, P7
+train+eval, P8 writing.
 
-**Status: Phases 1 and 2 are CLOSED.** Phase 5 can start immediately and in parallel. Phase 3 is next.
+**Why P4 and P5 changed places (2026-09-22).** This file first put the pilot at P4 and the model code at P5, running in parallel.
+The model codebase was then **deliberately built ahead of its data**, because collection waits on the camera session and the model
+code does not — it depends only on the Phase-2 dimensions. From 2026-09-21 every commit ("Phase 4 stage 1" onward) and every
+`NOTES.md` entry called that work Phase 4, so the numbering here was changed to match what exists. **The original ordering was
+superseded by that decision, not by drift.** The price is stated rather than hidden: every model result so far comes from SCRIPTED
+episodes and must be re-run on piloted data (CLAUDE.md O31, O32).
+
+One wrinkle to know about: **Phase 2 grew well beyond its original task list.** It absorbed the base-lock predicate, the O26
+mitigation and the whole teleop-parity effort (base lock in the entry point, the TR17 pad fix, D18, the operator overlay, the
+keypoint recorder, the IK speed fix). Some of that is really Phase-5 pilot preparation done early, because a live camera was
+available. Nothing was skipped; the work simply did not arrive in the order this file predicted.
+
+**Status: Phases 1–3 are CLOSED. Phase 4 (model code) is IN PROGRESS:** BC, chunked BC and state-only ACT pass the overfit-10
+gate on scripted data; ACT-LSTM is next. **Phase 5 (pilot) has NOT STARTED** — no piloted episode exists (`data/raw/` is empty).
 
 ```
 P1 grasp physics ─┐
-   (CLOSED)       ├─> P3 recorder ──> P4 pilot ──> P6 collection ──> P7 train+eval ──> P8 writing
-P2 freeze specs ──┘                                                     ^
-   (CLOSED)                                                             │
-P5 model codebase ──────────────────────────────────────────────────────┘  (parallel, no P1 dependency)
+   (CLOSED)       ├─> P3 recorder ────────────> P5 pilot ──> P6 collection ──> P7 train+eval ──> P8 writing
+P2 freeze specs ──┘     (CLOSED)                  ^                               ^
+   (CLOSED)                                       │                               │
+P4 model codebase ────────────────────────────────┴───────────────────────────────┘  (IN PROGRESS; needs only P2's dims)
 ```
 
 ---
@@ -59,7 +69,7 @@ that took the live loop from 37.4% to 128.2% of real time.
 
 ---
 
-## Phase 3 — Data logging pipeline — NEXT
+## Phase 3 — Data logging pipeline — CLOSED 2026-09-16
 
 **Decided already, do not re-open:** one `.npz` per episode; phase labels **auto-derived**, and derivable OFFLINE from the
 recorded trajectory (the weld bit gives grasp and release, box height gives lift and lower, base-to-box distance gives approach
@@ -86,9 +96,43 @@ and transport), so collection needs no live phase classifier.
 original trajectory within a stated tolerance. If replay does not reproduce, the logged action is the wrong quantity — find that
 out now, not after 150 episodes.
 
+**Closed with a qualification** (`NOTES.md` 2026-09-16). The replay ran on **5 SCRIPTED episodes across 5 seeds**, not
+hand-driven ones, with two negative controls that fail 5/5. It reproduces the MANIPULATION channel: the grasp to within a tick,
+the box to within 15 mm. The LOCOMOTION channel cannot be reproduced open loop by any recorder, because an open-loop walk is not
+reproducible, so the criterion as written is unachievable for it. A trained policy closes the loop and is unaffected, but an
+open-loop metric must never stand in for task success in Chapter 4. Hand-driven episodes first exist in the Phase 5 pilot.
+
 ---
 
-## Phase 4 — Pilot: full loop end to end — HARD GATE before scaling
+## Phase 4 — Shared model codebase — IN PROGRESS (built ahead of its data; see Phase numbering)
+
+No dependency on Phase 1 or 3, only on the Phase-2 dimensions, which are frozen.
+
+**As built** (in `g1_model/`, not the `g1_policy/` / `g1_train/` paths below): one training loop, one masked-L1 loss and the
+neighbour-ambiguity gate (`train.py`, `ambiguity.py`); BC and chunked BC as ONE class (`models.py`); state-only ACT (`act.py`).
+All three PASS the overfit-10 gate on 10 scripted episodes (CLAUDE.md §8, 2026-09-22). **Remaining:** ACT-LSTM, the `use_lstm`
+flag on the same class. The task list below is the original plan; where the code differs (AdamW with step budgets and a stop
+rule, not cosine annealing and epoch early-stopping), the code and CLAUDE.md are authoritative.
+
+**Decide before starting:** observation window `W_o`, action chunk size `K`, LSTM hidden size and layer count (proposal: 2
+stacked, dropout 0.3), transformer width/depth, KL weight β. The proposal defers all of these.
+
+**Tasks:**
+1. `g1_policy/base.py` — one interface all three conditions satisfy, so deployment never branches on policy type.
+2. `g1_policy/bc.py` — feedforward, single-step, L1 only, no CVAE.
+3. `g1_policy/act.py` — **one class**: transformer encoder/decoder, action chunking, CVAE objective (L1 + β·KL), and a
+   `use_lstm` flag adding the stacked LSTM encoder whose hidden state is projected and concatenated as an input token.
+4. `g1_policy/ensemble.py` — temporal ensembling of overlapping chunks at deployment.
+5. `g1_train/train.py` — Adam, cosine annealing, early stop after 10 epochs without validation improvement, best-checkpoint
+   save. Identical across conditions.
+6. Shape-and-gradient unit tests on synthetic data at the frozen dimensions. **Mask the 6 constant action dims out of the loss.**
+
+**Exit criterion:** all three train to convergence on synthetic data, and toggling `use_lstm` is the *only* difference between
+ACT and ACT-LSTM — verified by diffing the two config objects.
+
+---
+
+## Phase 5 — Pilot: full loop end to end — HARD GATE before scaling — NOT STARTED
 
 **Partly de-risked already:** a live operator has completed the full task, and the teleop path runs at 128% of real time with
 tracking active, so the pilot is no longer discovering whether the loop runs at all. It is discovering whether the DATA is right.
@@ -106,28 +150,6 @@ tracking active, so the pilot is no longer discovering whether the loop runs at 
 
 **Exit criterion:** 10 clean episodes on disk; BC overfits them; the autonomous loop runs a full episode without crashing; the
 success detector agrees with human judgement on all 10.
-
----
-
-## Phase 5 — Shared model codebase — RUNS IN PARALLEL, can start now
-
-No dependency on Phase 1 or 3, only on the Phase-2 dimensions, which are frozen.
-
-**Decide before starting:** observation window `W_o`, action chunk size `K`, LSTM hidden size and layer count (proposal: 2
-stacked, dropout 0.3), transformer width/depth, KL weight β. The proposal defers all of these.
-
-**Tasks:**
-1. `g1_policy/base.py` — one interface all three conditions satisfy, so deployment never branches on policy type.
-2. `g1_policy/bc.py` — feedforward, single-step, L1 only, no CVAE.
-3. `g1_policy/act.py` — **one class**: transformer encoder/decoder, action chunking, CVAE objective (L1 + β·KL), and a
-   `use_lstm` flag adding the stacked LSTM encoder whose hidden state is projected and concatenated as an input token.
-4. `g1_policy/ensemble.py` — temporal ensembling of overlapping chunks at deployment.
-5. `g1_train/train.py` — Adam, cosine annealing, early stop after 10 epochs without validation improvement, best-checkpoint
-   save. Identical across conditions.
-6. Shape-and-gradient unit tests on synthetic data at the frozen dimensions. **Mask the 6 constant action dims out of the loss.**
-
-**Exit criterion:** all three train to convergence on synthetic data, and toggling `use_lstm` is the *only* difference between
-ACT and ACT-LSTM — verified by diffing the two config objects.
 
 ---
 
@@ -187,11 +209,11 @@ Can start during Phase 6 — collection is mostly waiting.
 | 3.3.5 Arm teleoperation | code | **rewrite**: 4-joint IK, pinned wrists, elbow+wrist 6-D task (D2, D3), and D2's REAL justification — it protects the place, not the grasp pose |
 | 3.3.6 Grasping trigger | P1 | **full rewrite**: weld grasp (D11), geometric gate, friction pinch as a negative result (D7) |
 | 3.3 + limitations | P2 | **new**: base support (D12) and the hand/platform contact exclusion (D18), both simulation-only relaxations that shape every downstream result |
-| 3.3.8 Protocol | P4, P6 | update with pilot-measured timings, the real reject rate, and the operator's reported difficulties |
+| 3.3.8 Protocol | P5, P6 | update with pilot-measured timings, the real reject rate, and the operator's reported difficulties |
 | 3.4 State/Action | P2 | **rewrite** from `spec.py`: gripper dims from the weld bit (D14), velocity clips (D15), velocity dims zero while locked (D17), the constant-dim mask |
-| 3.5 Preprocessing | P5 | mostly reusable; normalization contract is fixed |
-| 3.6 Architecture | P5 | **extend**: plain ACT as a third condition (D8) |
-| 3.7 Training | P5, P7 | fill in the deferred hyperparameters |
+| 3.5 Preprocessing | P4 | mostly reusable; normalization contract is fixed |
+| 3.6 Architecture | P4 | **extend**: plain ACT as a third condition (D8) |
+| 3.7 Training | P4, P7 | fill in the deferred hyperparameters |
 | 3.8 Evaluation | P7 | extend to three policies; `d_place` = 0.10 m; episode cap from the measured 694–846 (D13); fresh Exp-1 seeds (D16); the 15-point separability limit |
 | 3.9 Hardware/Software | — | **rewrite**: Windows 11, no ROS2 (D9) |
 | 4 Results | P7 | new; report WALK_IN's share against its 10–13% base rate |
@@ -215,7 +237,7 @@ fallback of putting both platforms within arm's reach is off the table, and loco
 A live operator grasped, lifted and placed free-based, because a human at full forward command pushes against the O17 attractor
 in a way the capped scripted station-keeper cannot. Unmeasured: standoff spread at grasp without the lock, and whether a learned
 policy can hold against the attractor. Dropping D12 would remove the project's largest limitation AND give Objective 4 natural
-standoff variation. Settle it in Phase 4 at the latest.
+standoff variation. Settle it in Phase 5 (the pilot) at the latest.
 
 **Q9 — OPEN. How much of the teleop fidelity gap reaches the data?** p50 achieved palm error is 56 mm (O27), dropouts hold the
 arms indefinitely rather than freezing (O28), and One-Euro is tuned for a frame rate that does not occur (O29). None of these

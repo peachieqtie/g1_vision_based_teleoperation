@@ -20,13 +20,13 @@ record the divergence and ask Charles. A drift from an OBJECTIVE, not a method, 
 
 ## 2. CURRENT BLOCKER
 
-**None. Phase numbers are PLAN.md's** (P3 recorder, P4 pilot, P5 model code); commits and `NOTES.md` since 2026-09-21 call the P5 work
-"Phase 4 stages". **P1–P3 CLOSED.** P3's open-loop replay reproduces the manipulation channel on 5 scripted episodes; the locomotion channel
-cannot be replayed open loop by any recorder (`NOTES.md` 2026-09-16). **P5 in progress:** BC, chunked BC and state-only ACT all pass the
+**None. Phase numbers are PLAN.md's** (P3 recorder, P4 model code, P5 pilot); the model code was built ahead of its data, and PLAN.md
+says why. **P1–P3 CLOSED.** P3's open-loop replay reproduces the manipulation channel on 5 scripted episodes; the locomotion channel
+cannot be replayed open loop by any recorder (`NOTES.md` 2026-09-16). **P4 in progress:** BC, chunked BC and state-only ACT all pass the
 overfit-10 gate (§8 2026-09-22). **Next: ACT-LSTM, the `use_lstm` flag on the SAME class** (`g1_model/act.py`). **Every model result so far
-is on SCRIPTED data — no piloted episode exists** (`data/raw/` is empty), so O31 and O32 stay open until P4.
+is on SCRIPTED data — no piloted episode exists** (`data/raw/` is empty), so O31 and O32 stay open until P5.
 
-**P4 pilot has not started.** It must settle D12: the grasp worked free-based on 2026-09-15, so D12 may bind only the scripted demonstrator
+**P5 pilot has not started.** It must settle D12: the grasp worked free-based on 2026-09-15, so D12 may bind only the scripted demonstrator
 (§8). D18 is enforced at every reset (`g1_data/reset.py` raises on a contract mismatch; the recorder stores it per episode) — the
 evaluation harness, not yet built, must start its episodes through the same reset.
 
@@ -301,7 +301,7 @@ resolved issues are the *only* deletable thing here.
 
 **Rules:** **never delete a §9 entry** — the most expensive knowledge here to rediscover, even when it later looks obvious, and never solve
 overflow by cutting §9. **Keep this file under 400 lines** — raised from 300 on 2026-09-22: that cap was set when the project was small,
-the model work ("Phase 4" in commits, PLAN.md P5) alone added three TR entries and several decisions, and landing at 299 left no room
+Phase 4 (the model code) alone added three TR entries and several decisions, and landing at 299 left no room
 for the next session; a cap that forces a retirement exercise every session costs more than it saves. **If code and this file disagree,
 the code is correct** — fix the file and note the drift in §8. **If code and the proposal disagree, neither is automatically
 correct** — do not silently reconcile; surface it to Charles and record the outcome in §7. **No routine implementation detail here** — only
