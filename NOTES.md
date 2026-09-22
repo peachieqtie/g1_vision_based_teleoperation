@@ -6713,3 +6713,107 @@ cannot truncate them. A Python-level failure - an out-of-memory error is one - w
 "crashed" and the reason before re-raising (`test_a_crash_leaves_the_verdict_and_a_resumable_state`
 injects one mid-step and reads result.json from disk while the run is still alive). A hard OS
 kill cannot be caught; the last window's files then say the step at which the run was last alive.
+
+## 2026-09-22 — The gate scores the DEPLOYED function. ACT PASSES at 0.920.
+
+The converged ACT run (`runs/20260922-153630_act_overfit10_K100`, lr 1e-5, beta 10, one decoder
+layer; resumed weights-only from step 113,000 of the killed run; stopped by the stop rule at
+**195,000** steps) reported recon 0.050886 against the reference 0.044657, **ratio 1.140, FAIL**,
+with KL 1e-05. That number was a TRAIN-MODE WINDOW MEAN, and the gate should never have scored it.
+
+### What the logged number was (code facts)
+- `train()` calls `model.train()` every epoch and again after evaluation in `_window_row`; the
+  logged `recon_l1` is the running mean of per-step training losses over the window, while the
+  weights move.
+- For ACT that means **dropout 0.1 active** (`act.py DROPOUT`, reference `main.py:43`) and z
+  **sampled from the posterior of an encoder that read the target chunk** (`loss_terms` passes
+  the target; `reparametrize` samples in either mode).
+- Chunked BC has **no dropout at all** (`BCConfig.dropout = 0.0`, and the gate forces 0.0), so it
+  was scored fairly by accident. The reference is a nearest-neighbour spread of the data: no
+  model, no dropout, no sampling.
+- The reference ACT validates under `policy.eval()` (`imitate_episodes.py:343`) and deploys with
+  z = 0, the encoder not run (`detr_vae.py:113`; paper §IV-B).
+- The old `train.evaluate()` was NOT the fix: in eval mode it still went through `loss_terms`,
+  so the encoder still read the target. Inert here, since the latent had collapsed, but it would
+  leak the answer to a working CVAE.
+
+### Measured (no training): same 10 episodes (seeds 0-6, 8-10), K=100, W_o=1, `masked_l1`
+| converged ACT | train mode, posterior z | train mode, z=0 | eval, posterior z | **eval, z=0 (deployment)** |
+|---|---|---|---|---|
+| best.pt (185k) | 0.050624 | 0.050460 | 0.041913 | **0.041931 (0.939)** |
+| last.pt (195k) | 0.050720 | 0.050569 | 0.041127 | **0.041081 (0.920)** |
+
+Stochastic rows are the mean of 5 passes (std ≤ 1.7e-4). **All of the gap is dropout**: dropout
+off moves 0.0507 → 0.0411; z = posterior vs z = 0 moves less than 2e-4. For chunked BC, train
+mode = eval mode exactly (difference 0.0).
+
+### The fix (applied, tested)
+- `train.score_deployment(model, ds)` is THE gated number: one pass, `no_grad`, `model(obs)`
+  with the observation ALONE. The target is used only by `masked_l1`, after the prediction
+  exists. `_deployment_guard` enforces eval mode on every submodule for the duration: a pre-hook
+  raises if any module runs in train mode, and a pre-hook on every module the model declares in
+  `TARGET_READING_MODULES` raises unconditionally. A model with an `encode` method that declares
+  nothing is refused. ACT declares `cls_embed`, `encoder_action_proj`, `encoder_joint_proj`,
+  `latent_proj` and `encoder`. `cls_embed` is read via `.weight`, so no hook can fire on it; the
+  other four run on every `encode` call, which is what makes the encoder unreachable.
+- Batches are cut by index, not by a DataLoader: a DataLoader draws its base seed from the GLOBAL
+  generator even unshuffled, and scoring every window would then shift the training run's dropout
+  and shuffle streams. Measured: a 40-step dropout-bearing ACT curve is **bit-identical** at HEAD
+  and with the fix.
+- **The gate** scores `score_deployment` on the FINAL weights, in one pass after training.
+  The per-window provisional `gate.json` scores the weights at that window. `ambiguity.Quantity`
+  gains a `measured` field, and `gate()` refuses anything not `MEASURED_AT_DEPLOYMENT`,
+  including an unstated measurement. The train-mode window mean is labelled
+  `MEASURED_TRAIN_MODE_WINDOW` and logged beside it, never gated.
+- **Selection** uses the same quantity: `best.pt` is the window with the lowest deployment
+  score (validation set if given, else the training set; `train.SELECTION_CRITERION`, recorded
+  in every best.pt and state.pt). On the OLD criterion both best.pt files scored WORSE than
+  their last.pt: chunked BC 0.043962 vs 0.042570, ACT 0.041931 vs 0.041081. A resume from a
+  state chosen on the old criterion restarts selection and says so.
+- `evaluate()` (validation) now delegates to `score_deployment`; `forward_loss` serves the
+  training step only.
+- NOT changed: the STOP RULE still monitors the train-mode window means (`recon_l1`,
+  `train_loss`). It asks whether optimization is still making progress, which is a training
+  question; changing it would change when future runs stop.
+- Cost: ~2.7 s per pass over the 7,628 gate samples for ACT, ~3.7% of a 73 s window.
+- Tests: `test_train` +10 (scoring ignores the mode it is handed; refuses a forward that flips
+  back to train mode; never hands the model the target; cannot reach the ACT encoder, with a
+  check that the posterior path really does differ so the test is not blind; the declaration
+  matches `encode`; an undeclared encoder is refused; RNG untouched; selection and gate use one
+  quantity, re-derived from the files; old-criterion resume restarts selection; the scoring
+  path is structurally separate). `test_ambiguity` +2 (the gate refuses a train-mode or
+  unstated measurement; only `score_deployment` stamps a gateable quantity).
+
+### Every gate.json on disk rewritten (`tools/train_bc.py rescore-gate`, NO TRAINING)
+The dataset is rebuilt from each run's own metadata. The reference is recomputed and must
+equal the recorded one, or nothing is written. The old gate.json is kept inside the new one
+under `superseded`.
+
+| run | old gate.json | corrected (deployment) | verdict |
+|---|---|---|---|
+| 072043 BC K=1 | 0.009200 (0.721) | 0.009512 / 0.012764 = **0.745** | PASS, unchanged |
+| 072254 chunked BC K=100 | 0.042763 (0.958) | 0.042570 / 0.044657 = **0.953** | PASS, unchanged |
+| 121515 ACT lr 1e-3, 7 dec | 0.466184 (10.44) | 0.466052 = **10.436** | FAIL, unchanged |
+| 151816 ACT lr 1e-5, 12 ep | **0.289004 (TOTAL loss, pre-TR29)** | 0.117054 = **2.621** | FAIL, unchanged |
+| 161407 ACT killed at 113k | none (killed) | best.pt 0.053488 = **1.198** | FAIL, provisional |
+| **153630 ACT converged** | 0.050886 (1.140) FAIL | **0.041081 = 0.920** | **FAIL → PASS** |
+
+161407's final weights were never saved; its gate.json scores best.pt, says it was selected
+on the old criterion, and is marked `final: false`. 121515's checkpoint predates TR28, so
+`ACTConfig.lr` was supplied from its own TrainConfig; lr does not enter the forward pass, and
+the gate.json records this. 065658 (BC K=1) has no recorded reference and was not rescored; its
+checkpoints score identically to 072043's. `runs/` is gitignored: these rewrites exist on this
+disk only.
+
+### The latent collapsed, and that is the EXPECTED outcome on this data
+KL is 1e-05 in the log and ~4e-06 in eval mode; deployment at z = 0 matches z = posterior mean to
+6 decimals. So ACT passes as a transformer chunked-BC with an inert CVAE. **Reading:** the CVAE
+latent exists to encode the STYLE of a demonstration, the variation a demonstrator introduces
+that the observation does not determine. The scripted demonstrator is deterministic given its
+spawn, so there is no style variation for z to carry, and posterior collapse is what the
+objective should find. **This is a PREDICTION to test, not a defect to fix:** on piloted
+teleoperation data (one human, varying speed, hesitation, approach), the KL is predicted to stay
+above zero and the z = 0 vs posterior-mean gap to open. If it collapses on piloted data too,
+that is the finding, and beta (10; balance-matched 14.70, which points further toward collapse)
+becomes the live suspect. NOT tested; no beta change made. Consequence for RQ2: on scripted data,
+ACT vs chunked BC cannot isolate the CVAE, because there is nothing for the CVAE to do.

@@ -16,6 +16,7 @@ favour whichever stage happened to match it.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -309,14 +310,20 @@ def test_citation_carries_the_provenance():
                                     "obs_window", "chunk_size", "episodes"}
 
 
+def _dep(v):
+    """A reconstruction measured the one way the gate accepts. Tests may build
+    one by hand; production code gets it only from `train.score_deployment`."""
+    return AMB.Quantity(v, AMB.RECON_UNITS, measured=AMB.MEASURED_AT_DEPLOYMENT)
+
+
 def test_gate_reports_both_numbers_and_the_ratio():
     ds = _staged(K=1, W=1, seeds=[0, 1])
     if ds is None:
         print("      (skipped: nothing staged in data/synthetic)")
         return
     r = AMB.neighbour_ambiguity(ds)
-    good = AMB.gate(AMB.Quantity(r.mean * 0.5, AMB.RECON_UNITS), r)
-    bad = AMB.gate(AMB.Quantity(r.mean * 2.0, AMB.RECON_UNITS), r)
+    good = AMB.gate(_dep(r.mean * 0.5), r)
+    bad = AMB.gate(_dep(r.mean * 2.0), r)
     assert good.passed is True and bad.passed is False
     assert abs(good.ratio - 0.5) < 1e-9 and abs(bad.ratio - 2.0) < 1e-9
     for v in (good, bad):
@@ -325,7 +332,7 @@ def test_gate_reports_both_numbers_and_the_ratio():
         assert v.detail.cite() in txt
     assert "PASS" in good.render() and "FAIL" in bad.render()
     # a boundary case is a fail, not a pass: strictly below
-    assert AMB.gate(AMB.Quantity(r.mean, AMB.RECON_UNITS), r).passed is False
+    assert AMB.gate(_dep(r.mean), r).passed is False
 
 
 def test_gate_refuses_a_degenerate_reference():
@@ -335,7 +342,7 @@ def test_gate_refuses_a_degenerate_reference():
         return
     r = AMB.neighbour_ambiguity(ds)
     r.mean = 0.0
-    _raises(AMB.AmbiguityError, AMB.gate, AMB.Quantity(0.001, AMB.RECON_UNITS), r)
+    _raises(AMB.AmbiguityError, AMB.gate, _dep(0.001), r)
 
 
 def test_one_sample_has_no_neighbour_and_says_so():
@@ -387,7 +394,7 @@ def test_gate_refuses_a_quantity_in_other_units():
     e = _raises(AMB.UnitsError, AMB.gate,
                 AMB.Quantity(r.mean * 0.5, AMB.TOTAL_LOSS_UNITS), r)  # total loss
     assert AMB.TOTAL_LOSS_UNITS in str(e) and AMB.RECON_UNITS in str(e)
-    ok = AMB.gate(AMB.Quantity(r.mean * 0.5, AMB.RECON_UNITS), r)
+    ok = AMB.gate(_dep(r.mean * 0.5), r)
     assert ok.passed and abs(ok.ratio - 0.5) < 1e-9
 
 
@@ -397,8 +404,55 @@ def test_train_labels_its_quantities_at_the_source():
     import inspect
     from g1_model import train as T
     src = inspect.getsource(T.train)
-    assert "Quantity(float(history[-1][\"recon_l1\"]), RECON_UNITS)" in src, src
+    assert "Quantity(float(history[-1][\"recon_l1\"]), RECON_UNITS," in src
+    assert "measured=MEASURED_TRAIN_MODE_WINDOW" in src
+    assert "deployment_recon=dep[\"q\"]" in src
     assert "TOTAL_LOSS_UNITS" in src
+
+
+def test_gate_refuses_a_reconstruction_measured_in_train_mode():
+    """The eval-mode fix, 2026-09-22 - TR29's family, second member. Converged
+    ACT's train-mode window mean (dropout on) read 0.050886, ratio 1.140, FAIL;
+    the deployed function reads 0.041081, 0.920, PASS. Right units, wrong
+    measurement, so the units check alone let it through. Now the gate also
+    requires the measurement, and an UNSTATED measurement is refused too."""
+    ds = _staged(K=1, W=1, seeds=[0, 1])
+    if ds is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    r = AMB.neighbour_ambiguity(ds)
+    e = _raises(AMB.MeasurementError, AMB.gate,
+                AMB.Quantity(r.mean * 0.5, AMB.RECON_UNITS,
+                             measured=AMB.MEASURED_TRAIN_MODE_WINDOW), r)
+    assert "score_deployment" in str(e)
+    _raises(AMB.MeasurementError, AMB.gate,
+            AMB.Quantity(r.mean * 0.5, AMB.RECON_UNITS), r)          # unstated
+    # units are still checked FIRST: a total loss is a units error whatever it says
+    _raises(AMB.UnitsError, AMB.gate,
+            AMB.Quantity(r.mean * 0.5, AMB.TOTAL_LOSS_UNITS,
+                         measured=AMB.MEASURED_AT_DEPLOYMENT), r)
+    assert AMB.gate(_dep(r.mean * 0.5), r).passed
+
+
+def test_only_score_deployment_produces_a_gateable_quantity():
+    """By construction, not by convention: outside the tests, the one place in
+    the code base that stamps MEASURED_AT_DEPLOYMENT is train.score_deployment."""
+    import glob
+    from g1_data.paths import repo_relpath
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    hits = []
+    for p in (glob.glob(os.path.join(root, "g1_model", "*.py"))
+              + glob.glob(os.path.join(root, "g1_data", "*.py"))
+              + glob.glob(os.path.join(root, "tools", "*.py"))):
+        if os.path.basename(p).startswith("test_"):
+            continue
+        for i, line in enumerate(io.open(p, encoding="utf-8"), 1):
+            if "measured=MEASURED_AT_DEPLOYMENT" in line:
+                hits.append((repo_relpath(p, root).replace(os.sep, "/"), i))
+    assert [h[0] for h in hits] == ["g1_model/train.py"], hits
+    import inspect
+    from g1_model import train as T
+    assert "measured=MEASURED_AT_DEPLOYMENT" in inspect.getsource(T.score_deployment)
 
 
 def _tests():

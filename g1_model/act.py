@@ -412,6 +412,17 @@ class ACTPolicy(nn.Module):
     ticks. See the session report.
     """
 
+    #: The modules that read the TARGET action chunk: exactly the CVAE encoder,
+    #: used only by `encode`. `train.score_deployment` hooks every one of them to
+    #: raise, so scoring cannot reach the encoder even if a future forward pass
+    #: tried to. A declaration, not a change to the model: nothing reads it at
+    #: training or inference time. Checked against `encode` by test_train.
+    #: `cls_embed` is read through `.weight`, never CALLED, so its hook cannot
+    #: fire; the other four run on every `encode` call, which is what makes the
+    #: encoder unreachable.
+    TARGET_READING_MODULES = ("cls_embed", "encoder_action_proj",
+                              "encoder_joint_proj", "latent_proj", "encoder")
+
     def __init__(self, cfg: ACTConfig):
         super().__init__()
         self.cfg = cfg

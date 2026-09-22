@@ -41,6 +41,7 @@ and K=100 and the scaling comparison would be measuring the padding.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json
 import os
@@ -481,23 +482,111 @@ def dataset_provenance(ds: ChunkDataset) -> dict:
             "Real teleoperated demonstrations."))
 
 
-@torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device,
-             dim_mask: torch.Tensor) -> float:
-    """The ONE evaluation path. Weighted by contributing elements, not batches."""
-    model.eval()
+#: What best.pt is chosen on, and what the gate scores: ONE quantity. Recorded in
+#: every best.pt and state.pt, so a resume never compares against a best value
+#: chosen on something else.
+SELECTION_CRITERION = ("deployment reconstruction (score_deployment): validation "
+                       "set if given, else the training set")
+
+
+class ScoringError(TrainError):
+    """Scoring reached something the deployed policy never runs: a module in
+    train mode, or a module that reads the target action chunk."""
+
+
+@contextlib.contextmanager
+def _deployment_guard(model: nn.Module):
+    """Eval mode, enforced for the duration - not requested once and hoped for.
+
+    Every submodule gets a forward pre-hook that raises if it runs in train mode
+    (so a forward pass that flips a mode back cannot slip dropout in), and every
+    module the model declares in `TARGET_READING_MODULES` gets one that raises
+    unconditionally (so the CVAE encoder is unreachable). A model with an
+    `encode` method that declares nothing is refused outright: it could read the
+    target and would not say so. The caller's mode is restored afterwards.
+    """
+    declared = tuple(getattr(model, "TARGET_READING_MODULES", ()))
+    if hasattr(model, "encode") and not declared:
+        raise ScoringError(
+            "%s has an `encode` method but declares no TARGET_READING_MODULES; "
+            "scoring cannot prove its encoder is unreachable" % type(model).__name__)
+    was_training = model.training
+    handles = []
+
+    def _no_train_mode(mod, _inp):
+        if mod.training:
+            raise ScoringError("%s ran in TRAIN mode during scoring; the gate scores "
+                               "the deployed function only" % type(mod).__name__)
+
+    def _forbidden(name):
+        def hook(_mod, _inp):
+            raise ScoringError("scoring reached %r, which reads the target action "
+                               "chunk; the deployed policy never runs it" % name)
+        return hook
+
+    try:
+        model.eval()
+        for mod in model.modules():
+            handles.append(mod.register_forward_pre_hook(_no_train_mode))
+        for name in declared:
+            handles.append(getattr(model, name).register_forward_pre_hook(_forbidden(name)))
+        yield
+    finally:
+        for h in handles:
+            h.remove()
+        model.train(was_training)
+
+
+def score_deployment(model: nn.Module, ds: ChunkDataset,
+                     device: Optional[torch.device] = None,
+                     dim_mask: Optional[torch.Tensor] = None,
+                     batch_size: int = 256):
+    """THE gated number: masked-L1 reconstruction of the DEPLOYED function.
+
+    One pass over `ds` on the weights as they are NOW, in eval mode (enforced by
+    `_deployment_guard`), under no_grad, calling `model(obs)` with the observation
+    ALONE. The target is used only by `masked_l1` after the prediction exists; the
+    model is never handed it, so a CVAE cannot condition on it and runs its prior
+    (ACT: z = 0, encoder skipped, detr_vae.py:113). Not `forward_loss`, not
+    `loss_terms`: those feed the target to the encoder even in eval mode.
+
+    Why: the ambiguity reference describes the data, with no dropout and no
+    sampling. Scored as a train-mode window mean, converged ACT read 0.050886
+    (FAIL, 1.140); its deployed function reads 0.041081 (PASS, 0.920). The whole
+    gap was dropout 0.1 (NOTES.md 2026-09-22).
+
+    Batches are cut by index, not by a DataLoader: a DataLoader draws its base
+    seed from the GLOBAL generator even unshuffled, and scoring every window would
+    then shift the training run's dropout and shuffle streams.
+
+    Returns a `Quantity` measured `MEASURED_AT_DEPLOYMENT` - the only kind
+    `ambiguity.gate` accepts.
+    """
+    from g1_model.ambiguity import Quantity, RECON_UNITS, MEASURED_AT_DEPLOYMENT
+    device = device or next(model.parameters()).device
+    if dim_mask is None:
+        dim_mask = torch.from_numpy(
+            np.asarray(spec.ACTION_MASK, dtype=bool).copy()).to(device)
     total, n = 0.0, 0
-    for batch in loader:
-        obs = batch["obs"].to(device, non_blocking=True)
-        target = batch["action"].to(device, non_blocking=True)
-        pad = batch["action_mask"].to(device, non_blocking=True)
-        # Scored on the RECONSTRUCTION term only, identically for every model: a
-        # validation number that included ACT's KL would not be comparable with
-        # BC's, and model selection would then choose on a different quantity.
-        _, l1, count, _ = forward_loss(model, obs, target, pad, dim_mask)
-        total += float(l1) * int(count)
-        n += int(count)
-    return total / max(n, 1)
+    with _deployment_guard(model), torch.no_grad():
+        for i in range(0, len(ds), int(batch_size)):
+            batch = collate_chunks([ds[j] for j in range(i, min(i + int(batch_size), len(ds)))])
+            obs = batch["obs"].to(device, non_blocking=True)
+            pred = model(obs)                        # the observation, and nothing else
+            target = batch["action"].to(device, non_blocking=True)
+            pad = batch["action_mask"].to(device, non_blocking=True)
+            l1, count = masked_l1(pred, target, pad, dim_mask)
+            total += float(l1) * int(count)
+            n += int(count)
+    return Quantity(total / max(n, 1), RECON_UNITS, measured=MEASURED_AT_DEPLOYMENT)
+
+
+def evaluate(model: nn.Module, ds: ChunkDataset, device: torch.device,
+             dim_mask: torch.Tensor) -> float:
+    """The ONE evaluation path, for validation and selection alike: the deployed
+    function, via `score_deployment`. Reconstruction only, identically for every
+    model - a number including ACT's KL would not be comparable with BC's."""
+    return float(score_deployment(model, ds, device, dim_mask).value)
 
 
 # ─── survivability: atomic writes, resumable state ────────────────────────────
@@ -593,7 +682,9 @@ def _load_resume(resume: Resume, model: nn.Module, opt, cfg: TrainConfig) -> tup
     if "optimizer" in ck:                                       # FULL STATE
         _check_resume_config(ck["config"], cfg, resume.path)
         opt.load_state_dict(ck["optimizer"])
-        state = dict(history=ck["history"], best=float(ck["best"]),
+        same = ck.get("selection") == SELECTION_CRITERION
+        state = dict(history=ck["history"],
+                     best=float(ck["best"]) if same else float("inf"),
                      step=int(ck["step"]), epoch=int(ck["epoch"]),
                      batches_done=int(ck["batches_done"]),
                      epoch_gen_state=ck["epoch_gen_state"], rng=ck["rng"],
@@ -603,7 +694,12 @@ def _load_resume(resume: Resume, model: nn.Module, opt, cfg: TrainConfig) -> tup
                               "RNG: torch CPU, torch CUDA, numpy, python",
                               "data-order generator and position within the pass",
                               "history, best value, elapsed time"],
-                    not_restored=[], scheduler="none exists in this loop",
+                    not_restored=[] if same else [
+                        "best value: the prior run selected best.pt on %r, not %r; "
+                        "selection restarts, and the first new window writes best.pt"
+                        % (ck.get("selection") or "train-mode window mean",
+                           SELECTION_CRITERION)],
+                    scheduler="none exists in this loop",
                     prior_windows=len(state["history"]))
         return info, state
 
@@ -625,9 +721,14 @@ def _load_resume(resume: Resume, model: nn.Module, opt, cfg: TrainConfig) -> tup
             % (resume.path, len(match), ck.get("train_loss")))
     at = match[0]
     history = [dict(r) for r in rows if r["step"] <= at["step"]]
-    watch = [r["val_loss"] if r.get("val_loss") is not None else r["recon_l1"]
+    # Selection quantity only (val, else the deployment score). Rows from before
+    # the eval-mode fix carry neither, and their train-mode number is NOT the same
+    # quantity, so selection then restarts.
+    watch = [r["val_loss"] if r.get("val_loss") is not None else r.get("eval_recon_l1")
              for r in history]
-    state = dict(history=history, best=float(min(watch)), step=int(at["step"]),
+    watch = [w for w in watch if w is not None]
+    state = dict(history=history, best=float(min(watch)) if watch else float("inf"),
+                 step=int(at["step"]),
                  epoch=int(at["epoch"]), batches_done=None, epoch_gen_state=None,
                  rng=None, elapsed=float(at["elapsed_seconds"]))
     info = dict(
@@ -700,9 +801,15 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
     tl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
                     collate_fn=collate_chunks, num_workers=cfg.num_workers,
                     generator=g, worker_init_fn=seed_worker, drop_last=False)
-    vl = (DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
-                     collate_fn=collate_chunks, num_workers=cfg.num_workers)
-          if val_ds is not None else None)
+    # Validation and selection are scored by `score_deployment` directly on the
+    # dataset (no DataLoader: see its docstring on the global generator).
+    vl = val_ds
+    # The training set is scored the same way whenever it is the selection
+    # quantity (no validation set) or the gate needs it.
+    score_train = val_ds is None or gate_reference is not None
+    from g1_model.ambiguity import (Quantity, RECON_UNITS, TOTAL_LOSS_UNITS,
+                                    MEASURED_TRAIN_MODE_WINDOW, gate as _gate)
+    dep = {"q": None, "step": None}     # latest deployment score of the train set
 
     base = baselines(train_ds, device)
     prov = dataset_provenance(train_ds)
@@ -740,6 +847,7 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
     rng_to_restore = None
     segment = 1
     resumed_from_step = 0
+    meta["selection"] = SELECTION_CRITERION
     if resume is not None:
         info, st = _load_resume(resume, model, opt, cfg)
         meta["resume"] = info
@@ -800,10 +908,12 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
 
     def _write_progress(final: bool = False, error: Optional[str] = None):
         """result.json and gate.json as of NOW. Called every window, at the end,
-        and on a crash - so a kill costs at most one window, never the verdict."""
+        and on a crash - so a kill costs at most one window, never the verdict.
+
+        The gate scores `dep["q"]`: the deployed function on the weights at
+        `dep["step"]` - the final weights when `final`, else the latest window's."""
         if not history:
             return
-        from g1_model.ambiguity import Quantity, RECON_UNITS, gate as _gate
         last = history[-1]
         seg_s = time.perf_counter() - t0
         doc = dict(status=status["value"], final=final, error=error,
@@ -820,15 +930,23 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
                        timespec="seconds"),
                    history=history)
         _atomic_json(os.path.join(run_dir, "result.json"), doc)
-        if gate_reference is not None:
-            v = _gate(Quantity(float(last["recon_l1"]), RECON_UNITS), gate_reference)
+        if gate_reference is not None and dep["q"] is not None:
+            q = dep["q"]
+            v = _gate(q, gate_reference)
             _atomic_json(os.path.join(run_dir, "gate.json"), dict(
                 status=status["value"], final=final, error=error,
                 note=(None if final else
                       "PROVISIONAL: the verdict at the step the run was last "
                       "alive, not a final verdict"),
                 passed=v.passed, train_error=v.train_error,
-                train_error_units=RECON_UNITS, total_loss=last["train_loss"],
+                train_error_units=q.units, train_error_measured=q.measured,
+                scored_weights=("final weights" if final else
+                                "weights at the last completed window"),
+                scored_at_step=dep["step"],
+                train_mode_window_recon=dict(
+                    value=last["recon_l1"], measured=MEASURED_TRAIN_MODE_WINDOW,
+                    note="logged for comparison; NOT gated"),
+                total_loss=last["train_loss"],
                 reference=v.reference, ratio=v.ratio, at_step=int(step),
                 optimizer_steps=int(step), stop=stop_info,
                 steps_per_second=doc["segment_steps_per_second"],
@@ -847,7 +965,8 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
             spec_version=spec.SPEC_VERSION, git_commit=meta["git_commit"],
             step=int(step), epoch=int(epoch), batches_done=int(batches_done),
             epoch_gen_state=epoch_gen_state, rng=rng, history=history,
-            best=float(best), elapsed_seconds=float(_elapsed())),
+            best=float(best), selection=SELECTION_CRITERION,
+            elapsed_seconds=float(_elapsed())),
             os.path.join(run_dir, "state.pt"))
 
     w_tot, w_rec, w_n, w_ext, w_t0 = 0.0, 0.0, 0, {}, time.perf_counter()
@@ -858,8 +977,11 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
         secs = time.perf_counter() - w_t0
         tl_, rl_ = w_tot / max(w_n, 1), w_rec / max(w_n, 1)
         val = evaluate(model, vl, device, dim_mask) if vl is not None else None
+        if score_train:
+            dep["q"], dep["step"] = score_deployment(model, train_ds, device, dim_mask), step
         model.train()
         row = dict(step=step, epoch=epoch, train_loss=tl_, recon_l1=rl_,
+                   eval_recon_l1=float(dep["q"].value) if score_train else None,
                    **{("train_" + k_): v_ / max(w_n, 1) for k_, v_ in w_ext.items()},
                    val_loss=val, lr=float(opt.param_groups[0]["lr"]),
                    window_seconds=round(secs, 3),
@@ -868,11 +990,11 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
         history.append(row)
         with open(metrics_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
-        watch = val if val is not None else rl_
+        watch = val if val is not None else row["eval_recon_l1"]
         if watch < best:
             best = watch
             save_checkpoint(os.path.join(run_dir, "best.pt"), model, cfg, meta,
-                            epoch, tl_, val, step=step)
+                            epoch, tl_, val, step=step, selected_on=watch)
         if cfg.log_every:
             kl = row.get("train_kl")
             print("  step %8d  recon %.6f  total %.6f%s  %.1fs"
@@ -960,8 +1082,12 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
             recon_loss = recon / max(n, 1)
             extra_means = {k_: v_ / max(n, 1) for k_, v_ in extra_sums.items()}
             val_loss = evaluate(model, vl, device, dim_mask) if vl is not None else None
+            if score_train:
+                dep["q"], dep["step"] = (score_deployment(model, train_ds, device, dim_mask),
+                                         step)
 
             row = dict(epoch=epoch, train_loss=train_loss, recon_l1=recon_loss,
+                       eval_recon_l1=float(dep["q"].value) if score_train else None,
                        **{("train_" + k_): v_ for k_, v_ in extra_means.items()},
                        val_loss=val_loss,
                        lr=float(opt.param_groups[0]["lr"]),
@@ -974,11 +1100,11 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
             history.append(row)
             with open(metrics_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(row) + "\n")
-            watch = val_loss if val_loss is not None else train_loss
+            watch = val_loss if val_loss is not None else row["eval_recon_l1"]
             if watch < best:
                 best = watch
                 save_checkpoint(os.path.join(run_dir, "best.pt"), model, cfg, meta,
-                                epoch, train_loss, val_loss)
+                                epoch, train_loss, val_loss, selected_on=watch)
             if cfg.log_every and (epoch % cfg.log_every == 0 or epoch == cfg.epochs):
                 print("  epoch %4d  train %.6f%s  (%.3fx zero, %.3fx copy)  %.1fs"
                       % (epoch, train_loss,
@@ -1003,21 +1129,28 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
     save_checkpoint(os.path.join(run_dir, "last.pt"), model, cfg, meta,
                     len(history), history[-1]["train_loss"],
                     history[-1]["val_loss"], step=step if step_mode else None)
-    from g1_model.ambiguity import Quantity, RECON_UNITS, TOTAL_LOSS_UNITS
+    # THE GATED NUMBER: one pass, after training, on the FINAL weights - the
+    # weights in last.pt - through the deployed function.
+    dep["q"], dep["step"] = score_deployment(model, train_ds, device, dim_mask), step
     wall = round(time.perf_counter() - t0, 3)
     seg_steps = step - resumed_from_step
     result = dict(run_dir=run_dir, history=history, baselines=base,
                   metadata=meta, best=best,
                   final_train_loss=history[-1]["train_loss"],
                   final_recon_l1=history[-1]["recon_l1"],
+                  final_deployment_recon=float(dep["q"].value),
                   final_val_loss=history[-1]["val_loss"],
                   # Labelled AT THE SOURCE (TR29): the gate accepts only a
                   # Quantity in the reference's units, and only this loop knows
                   # which of these numbers is which.
                   quantities=dict(
-                      recon_l1=Quantity(float(history[-1]["recon_l1"]), RECON_UNITS),
+                      # the gate accepts ONLY this one
+                      deployment_recon=dep["q"],
+                      recon_l1=Quantity(float(history[-1]["recon_l1"]), RECON_UNITS,
+                                        measured=MEASURED_TRAIN_MODE_WINDOW),
                       train_loss=Quantity(float(history[-1]["train_loss"]),
-                                          TOTAL_LOSS_UNITS)),
+                                          TOTAL_LOSS_UNITS,
+                                          measured=MEASURED_TRAIN_MODE_WINDOW)),
                   optimizer_steps=int(step),
                   segment_steps=int(seg_steps),
                   steps_per_second=round(seg_steps / wall, 3) if wall else None,
@@ -1035,7 +1168,8 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
 # ─── checkpoints ──────────────────────────────────────────────────────────────
 def save_checkpoint(path: str, model: nn.Module, cfg: TrainConfig, meta: dict,
                     epoch: int, train_loss: float,
-                    val_loss: Optional[float], step: Optional[int] = None) -> str:
+                    val_loss: Optional[float], step: Optional[int] = None,
+                    selected_on: Optional[float] = None) -> str:
     """Weights and provenance - NOT a resumable state (no optimizer, no RNG).
     `state.pt`, written by `train()`, is the resumable one. `step` is recorded
     so a weights-only resume need not infer it."""
@@ -1047,7 +1181,9 @@ def save_checkpoint(path: str, model: nn.Module, cfg: TrainConfig, meta: dict,
                     data=meta.get("data"), baselines=meta.get("baselines"),
                     epoch=int(epoch), train_loss=float(train_loss),
                     val_loss=None if val_loss is None else float(val_loss),
-                    step=None if step is None else int(step)),
+                    step=None if step is None else int(step),
+                    selection=None if selected_on is None else dict(
+                        criterion=SELECTION_CRITERION, value=float(selected_on))),
                path)
     return path
 

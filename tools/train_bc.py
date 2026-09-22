@@ -241,7 +241,7 @@ def cmd_determinism(a):
 
 def _report(res, base, label):
     h = res["history"]
-    rec = res["final_recon_l1"]
+    rec = res["final_deployment_recon"]
     print("\n%s" % label)
     print("  optimizer steps   %d   (%.2f steps/s)" % (res["optimizer_steps"],
                                                       res["steps_per_second"] or 0))
@@ -249,7 +249,10 @@ def _report(res, base, label):
     if res.get("stop"):
         print("  stopped by        %s at step %d" % (res["stop"]["reason"],
                                                      res["stop"]["step"]))
-    print("  final recon_l1    %.6f   (the gated quantity)" % rec)
+    print("  deployment recon  %.6f   (THE GATED QUANTITY: final weights, eval mode, "
+          "model(obs) only)" % rec)
+    print("  train-mode recon  %.6f   (window mean, dropout on; NOT gated)"
+          % res["final_recon_l1"])
     print("  final total loss  %.6f   (recon + any KL term; NOT gated)"
           % res["final_train_loss"])
     if res["final_val_loss"] is not None:
@@ -327,10 +330,11 @@ def cmd_overfit10(a):
     res = T.train(model, ds, cfg, gate_reference=ref, resume=_resume_arg(a))
     _report(res, res["baselines"], "OVERFIT-10 RESULT (%s)" % name)
 
-    # TR29: the reference is a RECONSTRUCTION quantity, so the gate scores the
-    # reconstruction error train() labelled at the source - never the total loss,
-    # which for ACT includes beta*KL. gate() refuses anything else.
-    verdict = AMB.gate(res["quantities"]["recon_l1"], ref)
+    # TR29: the reference is a RECONSTRUCTION quantity, so the gate scores
+    # reconstruction - never the total loss, which for ACT includes beta*KL.
+    # 2026-09-22: and it scores the DEPLOYED function on the FINAL weights, not a
+    # train-mode window mean. gate() refuses anything else on both counts.
+    verdict = AMB.gate(res["quantities"]["deployment_recon"], ref)
     print("")
     print("GATE (neighbour-ambiguity criterion)")
     print(verdict.render())
@@ -449,6 +453,115 @@ def cmd_wo_curve(a):
     return 0
 
 
+def _factory_for(ck):
+    """The builder for a checkpoint, and a note on anything supplied to it.
+
+    ACT checkpoints written before TR28 (2026-09-21) have no `lr` in their config,
+    which ACTConfig now requires. lr is an OPTIMIZER field - it does not touch the
+    forward pass - so the value the run actually trained with, from the
+    checkpoint's own TrainConfig, is supplied, and the fact is recorded."""
+    if ck["model_cls"] == "BCPolicy":
+        return build_bc, None
+    if ck["model_cls"] != "ACTPolicy":
+        raise SystemExit("no builder for %r" % ck["model_cls"])
+    kw = dict(ck["model_kwargs"]["cfg"])
+    note = None
+    if "lr" not in kw:
+        kw["lr"] = ck["config"]["lr"]
+        note = ("pre-TR28 checkpoint: ACTConfig.lr absent, supplied from the "
+                "checkpoint's own TrainConfig (lr=%r); lr does not enter the "
+                "forward pass" % kw["lr"])
+    return (lambda **_: build_act(cfg=ACTConfig(**kw))), note
+
+
+def cmd_rescore_gate(a):
+    """Re-score a finished (or killed) overfit-10 run's gate on the CORRECTED
+    criterion - the deployed function on the final weights - and REWRITE its
+    gate.json. NO TRAINING. The previous gate.json is kept inside the new one
+    under `superseded`, so the old verdict stays checkable but can no longer be
+    read as current.
+
+    The dataset is rebuilt from the run's own metadata, and the reference is
+    recomputed and must equal the one the run recorded, or nothing is written:
+    a rescore on different data would be a new experiment, not a correction.
+    """
+    d = a.run_dir
+    meta = json.load(open(os.path.join(d, "metadata.json"), encoding="utf-8"))
+    notes = meta["config"].get("notes") or {}
+    if notes.get("gate") != "overfit-10" or "ambiguity_reference" not in notes:
+        raise SystemExit("%s: not an overfit-10 gate run with a recorded reference"
+                         % d)
+    old_ref = notes["ambiguity_reference"]
+    ck_name = "last.pt" if os.path.isfile(os.path.join(d, "last.pt")) else "best.pt"
+    final = ck_name == "last.pt"
+    ck_path = os.path.join(d, ck_name)
+    ck = torch.load(ck_path, map_location="cpu", weights_only=False)
+    factory, load_note = _factory_for(ck)
+    model, ck = T.load_checkpoint(ck_path, factory)
+
+    tr, _ = _splits()
+    seeds = list(meta["data"]["seeds"])
+    if list(ck["data"]["seeds"]) != seeds:
+        raise SystemExit("checkpoint seeds %r differ from the run's %r"
+                         % (ck["data"]["seeds"], seeds))
+    K, W = int(meta["loader"]["chunk_size"]), int(meta["loader"]["obs_window"])
+    st, ac, nmeta = DS.load_norm_stats()
+    ds = _load(seeds, BCConfig(obs_window=W, chunk_size=K), nmeta, norm_fit_seeds=tr)
+    device = T.select_device()
+    ref = AMB.neighbour_ambiguity(ds, device=device)
+    if abs(ref.mean - float(old_ref["mean"])) > 1e-9 or ref.samples != old_ref["samples"]:
+        raise SystemExit("reference recomputed as %.9f on %d samples; the run recorded "
+                         "%.9f on %d. Refusing: this would not be the same gate."
+                         % (ref.mean, ref.samples, old_ref["mean"], old_ref["samples"]))
+    model.to(device)
+    q = T.score_deployment(model, ds, device)
+    v = AMB.gate(q, ref)
+
+    gp = os.path.join(d, "gate.json")
+    old = json.load(open(gp, encoding="utf-8")) if os.path.isfile(gp) else None
+    hist = [json.loads(L) for L in open(os.path.join(d, "metrics.jsonl"),
+                                        encoding="utf-8") if L.strip()]
+    status = (old or {}).get("status") or ("finished" if final else "killed")
+    doc = dict(
+        status=status, final=final, error=(old or {}).get("error"),
+        note=(None if final else
+              "PROVISIONAL: the run was killed and its final weights were never "
+              "saved. Scored best.pt, which was SELECTED on the old train-mode "
+              "window-mean criterion, so it is not necessarily the best weights "
+              "on the corrected one."),
+        passed=v.passed, train_error=v.train_error,
+        train_error_units=q.units, train_error_measured=q.measured,
+        scored_weights=("final weights (%s)" % ck_name if final else
+                        "best.pt - final weights unavailable"),
+        scored_at_step=ck.get("step"), scored_at_epoch=ck.get("epoch"),
+        train_mode_window_recon=dict(
+            value=hist[-1].get("recon_l1"),
+            measured=AMB.MEASURED_TRAIN_MODE_WINDOW,
+            note="the run's last logged window; logged for comparison, NOT gated"),
+        reference=v.reference, ratio=v.ratio,
+        detail=ref.as_metadata(),
+        rescored=dict(
+            by="tools/train_bc.py rescore-gate", git_commit=T._git_commit(),
+            utc=__import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc).isoformat(timespec="seconds"),
+            checkpoint=ck_name, load_note=load_note,
+            reason="2026-09-22 eval-mode gate fix: the gate scores the deployed "
+                   "function (eval mode, model(obs) only, fixed weights), not the "
+                   "train-mode window mean. NO TRAINING was done."),
+        superseded=(dict(gate_json=old,
+                         reason="scored a train-mode quantity (and, for runs "
+                                "before the units fix, the TOTAL loss, TR29)")
+                    if old is not None else None),
+    )
+    T._atomic_json(gp, doc)
+    print("%-44s %-8s step %-7s %.6f / %.6f = %.4f %s%s"
+          % (os.path.basename(os.path.normpath(d)), ck_name, ck.get("step"),
+             v.train_error, v.reference, v.ratio, "PASS" if v.passed else "FAIL",
+             "" if old is None else "   (was %.6f, %s)"
+             % (old["train_error"], "PASS" if old.get("passed") else "FAIL")))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -457,7 +570,8 @@ def main():
                          ("full", cmd_full, 100),
                          ("baselines", cmd_baselines, 0),
                          ("determinism", cmd_determinism, 0),
-                         ("wo-curve", cmd_wo_curve, 0)):
+                         ("wo-curve", cmd_wo_curve, 0),
+                         ("rescore-gate", cmd_rescore_gate, 0)):
         p = sub.add_parser(name)
         p.set_defaults(fn=fn)
         if ep:
@@ -491,6 +605,8 @@ def main():
             p.add_argument("--model", default="bc", choices=("bc", "act"))
             p.add_argument("--batch", type=int, default=256,
                            help="batch size. ACT's 4 GB ceiling is 32 (measured)")
+        if name == "rescore-gate":
+            p.add_argument("--run-dir", required=True)
         if name == "wo-curve":
             p.add_argument("--windows", default="1,2,4,8,16,32")
             p.add_argument("--chunk", type=int, default=1)

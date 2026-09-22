@@ -113,9 +113,27 @@ RECON_UNITS = "masked_l1_reconstruction"
 #: for ACT it adds beta*KL, which is in nats times a weight, not action units.
 TOTAL_LOSS_UNITS = "total_training_loss"
 
+# ─── how the number was MEASURED: the second axis the gate checks ─────────────
+#: The ONLY measurement the gate accepts: the deployed function, scored once on
+#: fixed weights - eval mode (no dropout), `model(obs)` alone (the target is never
+#: passed, so a CVAE runs its prior, z = 0, and its encoder cannot run), no
+#: gradient. Produced by `train.score_deployment` and by nothing else.
+MEASURED_AT_DEPLOYMENT = "deployment: eval mode, model(obs) only, fixed weights"
+#: The loop's running mean of per-step TRAINING losses over a window: dropout on,
+#: ACT's z sampled from a posterior that read the target chunk, weights moving.
+#: Same units as the reference - which is exactly why the units check alone let it
+#: through. It scored converged ACT 0.050886 (FAIL, 1.140) where the deployed
+#: function scores 0.041081 (PASS, 0.920): the whole gap was dropout.
+MEASURED_TRAIN_MODE_WINDOW = "train mode: running mean over a window of optimizer steps"
+
 
 class UnitsError(AmbiguityError):
     """A quantity whose units differ from the reference's (TR29)."""
+
+
+class MeasurementError(AmbiguityError):
+    """A quantity in the right units, measured the wrong way (the eval-mode fix,
+    2026-09-22): not the deployed function on fixed weights."""
 
 
 @dataclass(frozen=True)
@@ -130,10 +148,16 @@ class Quantity:
     KL had collapsed to zero. A bare float cannot say which it is, so the gate
     accepts only a `Quantity`, labelled where it is COMPUTED (`train.train`), and
     refuses one whose units are not the reference's.
+
+    `measured` is the second axis, added after the same family struck again:
+    units right, measurement wrong (a train-mode window mean, dropout on). The gate
+    refuses anything but `MEASURED_AT_DEPLOYMENT`. None means "not stated", and is
+    refused too - a number that cannot say how it was taken is not gated.
     """
 
     value: float
     units: str
+    measured: Optional[str] = None
 
 
 @dataclass
@@ -354,8 +378,16 @@ def gate(train_error: Quantity, reference: AmbiguityResult) -> GateVerdict:
         raise UnitsError(
             "gate() refuses to compare %r (%s) against a reference in %s. Score the "
             "model's reconstruction error - train() reports it as "
-            "result['quantities']['recon_l1'] - not its total loss (TR29)."
+            "result['quantities']['deployment_recon'] - not its total loss (TR29)."
             % (train_error.value, train_error.units, reference.units))
+    if train_error.measured != MEASURED_AT_DEPLOYMENT:
+        raise MeasurementError(
+            "gate() refuses %r measured as %r. The reference describes the data, "
+            "with no dropout and no sampling; the policy must be scored the same way - "
+            "the deployed function on fixed weights, `train.score_deployment`, which "
+            "train() reports as result['quantities']['deployment_recon']. A train-mode "
+            "window mean failed converged ACT (1.140) that deploys at 0.920."
+            % (train_error.value, train_error.measured))
     train_error = float(train_error.value)
     ref = float(reference.mean)
     if ref <= 0:

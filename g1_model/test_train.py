@@ -484,8 +484,13 @@ def test_step_budgeted_run_logs_windows_records_budget_and_labels_quantities():
         assert r["optimizer_steps"] == 25, r["optimizer_steps"]
         assert r["stop"] == dict(reason="hard_cap", step=25), r["stop"]
         assert [h["step"] for h in r["history"]] == [5, 10, 15, 20, 25]
+        from g1_model.ambiguity import MEASURED_AT_DEPLOYMENT, MEASURED_TRAIN_MODE_WINDOW
         assert r["quantities"]["recon_l1"].units == RECON_UNITS
+        assert r["quantities"]["recon_l1"].measured == MEASURED_TRAIN_MODE_WINDOW
         assert r["quantities"]["train_loss"].units == TOTAL_LOSS_UNITS
+        dq = r["quantities"]["deployment_recon"]
+        assert dq.units == RECON_UNITS and dq.measured == MEASURED_AT_DEPLOYMENT
+        assert all(h["eval_recon_l1"] is not None for h in r["history"])
         assert r["steps_per_second"] > 0
         meta = json.load(open(os.path.join(out, "metadata.json"), encoding="utf-8"))
         assert meta["budget"]["unit"] == "optimizer_steps"
@@ -646,7 +651,7 @@ def test_weights_only_resume_continues_the_curve_and_says_what_it_lost():
         ck = torch.load(os.path.join(a, "best.pt"), map_location="cpu",
                         weights_only=False)
         assert "optimizer" not in ck and "rng" not in ck
-        best_row = min(prior["history"], key=lambda h: h["recon_l1"])
+        best_row = min(prior["history"], key=lambda h: h["eval_recon_l1"])
         res = _act_run(ds, c, max_steps=60, window=10,
                        resume=T.Resume(os.path.join(a, "best.pt")))
         info = res["metadata"]["resume"]
@@ -735,8 +740,11 @@ def test_a_crash_leaves_the_verdict_and_a_resumable_state():
         gate = json.load(open(os.path.join(a, "gate.json"), encoding="utf-8"))
         assert gate["status"] == "crashed" and gate["at_step"] == 12, gate["at_step"]
         assert gate["train_error_units"] == AMB.RECON_UNITS
+        assert gate["train_error_measured"] == AMB.MEASURED_AT_DEPLOYMENT
         assert gate["final"] is False and "PROVISIONAL" in gate["note"]
-        assert abs(gate["train_error"] - res["history"][-1]["recon_l1"]) < 1e-12
+        # the provisional verdict scores the weights at the last completed window
+        assert gate["scored_at_step"] == 10
+        assert abs(gate["train_error"] - res["history"][-1]["eval_recon_l1"]) < 1e-12
 
         # and the state it left behind finishes the run
         done = _act_run(ds, c, max_steps=40, window=5,
@@ -762,6 +770,276 @@ def test_progress_files_are_written_atomically():
     assert '_atomic_json(os.path.join(run_dir, "result.json")' in loop
     assert '_atomic_json(os.path.join(run_dir, "gate.json")' in loop
     assert "open(os.path.join(run_dir, \"result.json\"), \"w\"" not in loop
+
+
+
+# ═══ Stage 4: the gate scores the DEPLOYED function (eval-mode fix, 2026-09-22) ═
+# Converged ACT failed the gate at 0.050886 (ratio 1.140), scored as a train-mode
+# window mean with dropout 0.1 on. Its deployed function scores 0.041081 (0.920,
+# PASS). TR29 was the first of this family (total loss scored as reconstruction);
+# these tests make a third impossible: the gate cannot score a model in train
+# mode, cannot reach a CVAE encoder, and cannot be handed a number measured any
+# other way.
+def _dropout_bc(p=0.5):
+    cfg = BCConfig(obs_window=1, chunk_size=1, dropout=p)
+    torch.manual_seed(0)
+    return build_bc(cfg=cfg)
+
+
+def _manual_eval_l1(model, ds):
+    model.eval()
+    tot, n = 0.0, 0
+    with torch.no_grad():
+        for i in range(len(ds)):
+            b = T.collate_chunks([ds[i]])
+            l1, c = T.masked_l1(model(b["obs"]), b["action"], b["action_mask"])
+            tot += float(l1) * int(c)
+            n += int(c)
+    return tot / n
+
+
+def test_scoring_is_eval_mode_whatever_mode_the_model_is_in():
+    got = _tiny(n_eps=2, n_ticks=40)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    try:
+        m = _dropout_bc()
+        m.train()                                   # handed over in TRAIN mode
+        a = T.score_deployment(m, ds, torch.device("cpu")).value
+        b = T.score_deployment(m, ds, torch.device("cpu")).value
+        assert a == b, "dropout leaked into scoring: two passes differ (%r, %r)" % (a, b)
+        assert m.training, "the caller's mode was not restored"
+        assert abs(a - _manual_eval_l1(m, ds)) < 1e-6
+        # and the guard is not vacuous: in train mode this model DOES score differently
+        m.train()
+        with torch.no_grad():
+            bt = T.collate_chunks([ds[i] for i in range(len(ds))])
+            tr_l1, _ = T.masked_l1(m(bt["obs"]), bt["action"], bt["action_mask"])
+        assert abs(float(tr_l1) - a) > 1e-4, "dropout 0.5 changed nothing - test is blind"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_scoring_refuses_a_forward_that_switches_back_to_train_mode():
+    got = _tiny(n_eps=1, n_ticks=20)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    try:
+        class Sneaky(BCPolicy):
+            def forward(self, obs):
+                self.train()                        # flips dropout back on
+                return super().forward(obs)
+        m = Sneaky(obs_window=1, chunk_size=1, dropout=0.5)
+        e = _raises(T.ScoringError, T.score_deployment, m, ds, torch.device("cpu"))
+        assert "TRAIN mode" in str(e)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_scoring_never_hands_the_model_the_target():
+    got = _tiny(n_eps=1, n_ticks=20)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    try:
+        calls = []
+
+        class Spy(BCPolicy):
+            def forward(self, *args, **kw):
+                calls.append((len(args), sorted(kw), tuple(args[0].shape)))
+                return super().forward(args[0])
+        m = Spy(obs_window=1, chunk_size=1)
+        T.score_deployment(m, ds, torch.device("cpu"))
+        assert calls and all(c[0] == 1 and c[1] == [] for c in calls), calls[:3]
+        assert all(c[2][1:] == (1, spec.STATE_DIM) for c in calls), calls[:3]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_scoring_cannot_reach_the_act_encoder():
+    got = _tiny_k(K=5, n_eps=1, n_ticks=20)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    try:
+        from g1_model.act import ACTPolicy
+        mcfg, build = _tiny_act()
+        torch.manual_seed(0)
+        m = build(cfg=mcfg)
+        # a normal ACT scores through its prior (z = 0) ...
+        q = T.score_deployment(m, ds, torch.device("cpu")).value
+        assert abs(q - _manual_eval_l1(m, ds)) < 1e-6
+        # ... which differs from what eval-mode loss_terms reports, because that
+        # path runs the encoder ON THE TARGET - the leak this guard exists for
+        m.eval()
+        with torch.no_grad():
+            bt = T.collate_chunks([ds[i] for i in range(len(ds))])
+            _, post, _, _ = m.loss_terms(bt["obs"], bt["action"], bt["action_mask"])
+        assert abs(float(post) - q) > 1e-6, "posterior path equals prior - test is blind"
+
+        class Leaky(ACTPolicy):
+            def forward(self, obs, actions=None, action_mask=None):
+                if actions is None:                 # "inference" that peeks
+                    fake = torch.zeros(obs.shape[0], self.cfg.chunk_size,
+                                       self.cfg.action_dim)
+                    self.encode(obs, fake)
+                return super().forward(obs, actions, action_mask)
+        leaky = Leaky(mcfg)
+        e = _raises(T.ScoringError, T.score_deployment, leaky, ds, torch.device("cpu"))
+        assert "reads the target" in str(e)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_act_declares_exactly_the_modules_encode_uses():
+    """The hook list is only as good as the declaration. Run `encode` and
+    `forward(obs)` with every child hooked, and compare."""
+    mcfg, build = _tiny_act()
+    torch.manual_seed(0)
+    m = build(cfg=mcfg).eval()
+    fired = set()
+    hs = [mod.register_forward_pre_hook(lambda _m, _i, n=n: fired.add(n))
+          for n, mod in m.named_children()]
+    obs = torch.zeros(2, 1, spec.STATE_DIM)
+    acts = torch.zeros(2, mcfg.chunk_size, spec.ACTION_DIM)
+    with torch.no_grad():
+        m.encode(obs, acts)
+        by_encode = set(fired)
+        fired.clear()
+        m(obs)
+        by_inference = set(fired)
+    for h in hs:
+        h.remove()
+    declared = set(m.TARGET_READING_MODULES)
+    # every module encode CALLS is declared (and hooked) ...
+    assert by_encode <= declared, (by_encode, declared)
+    # ... the one declared-but-uncalled is cls_embed, read via .weight (no hook can
+    # fire on it); the four that ARE called fire on every encode, so it is covered
+    assert declared - by_encode == {"cls_embed"}, declared - by_encode
+    assert len(by_encode) == 4
+    assert not (by_inference & declared), by_inference
+
+
+def test_a_model_with_an_encoder_it_does_not_declare_is_refused():
+    got = _tiny(n_eps=1, n_ticks=20)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    try:
+        class Undeclared(BCPolicy):
+            def encode(self, obs, actions):
+                return obs
+        e = _raises(T.ScoringError, T.score_deployment,
+                    Undeclared(obs_window=1, chunk_size=1), ds, torch.device("cpu"))
+        assert "TARGET_READING_MODULES" in str(e)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_scoring_does_not_touch_the_training_rng():
+    """Scored every window, so any RNG draw would shift the run's dropout and
+    shuffle streams. It cuts batches by index - no DataLoader base-seed draw."""
+    got = _tiny(n_eps=1, n_ticks=20)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    try:
+        m = _dropout_bc()
+        before = (torch.get_rng_state().clone(), np.random.get_state()[1].copy())
+        T.score_deployment(m, ds, torch.device("cpu"))
+        assert torch.equal(before[0], torch.get_rng_state())
+        assert np.array_equal(before[1], np.random.get_state()[1])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_selection_and_the_gate_use_one_quantity():
+    """B and A together, on an ACT WITH dropout: best.pt is the window with the
+    lowest DEPLOYMENT score, the gate scores last.pt's weights the same way, and
+    both are what score_deployment returns when re-run from the files."""
+    got = _tiny_k(K=5)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    from g1_model import ambiguity as AMB
+    from g1_model.act import build_act
+    ref = AMB.neighbour_ambiguity(ds)
+    out = tempfile.mkdtemp()
+    try:
+        res = _act_run(ds, out, max_steps=30, window=5, gate_reference=ref)
+        rows = res["history"]
+        best_row = min(rows, key=lambda h: h["eval_recon_l1"])
+        best, _ = T.load_checkpoint(os.path.join(out, "best.pt"), build_act)
+        ck = torch.load(os.path.join(out, "best.pt"), map_location="cpu",
+                        weights_only=False)
+        assert ck["step"] == best_row["step"], (ck["step"], best_row["step"])
+        assert ck["selection"]["criterion"] == T.SELECTION_CRITERION
+        rescored = T.score_deployment(best, ds, torch.device("cpu")).value
+        assert abs(rescored - best_row["eval_recon_l1"]) < 1e-5
+        assert abs(ck["selection"]["value"] - best_row["eval_recon_l1"]) < 1e-12
+        # the selection criterion is NOT the train-mode number: they differ here
+        assert any(abs(h["eval_recon_l1"] - h["recon_l1"]) > 1e-4 for h in rows)
+
+        gate = json.load(open(os.path.join(out, "gate.json"), encoding="utf-8"))
+        last, _ = T.load_checkpoint(os.path.join(out, "last.pt"), build_act)
+        final = T.score_deployment(last, ds, torch.device("cpu")).value
+        assert gate["final"] is True and gate["scored_weights"] == "final weights"
+        assert gate["train_error_measured"] == AMB.MEASURED_AT_DEPLOYMENT
+        assert abs(gate["train_error"] - final) < 1e-5, (gate["train_error"], final)
+        assert abs(res["quantities"]["deployment_recon"].value - gate["train_error"]) < 1e-12
+        assert gate["train_mode_window_recon"]["value"] == rows[-1]["recon_l1"]
+    finally:
+        for d in (tmp, out):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_resume_from_a_state_chosen_on_the_old_criterion_restarts_selection():
+    """A state.pt written before this fix holds a `best` chosen on the train-mode
+    window mean. Comparing the new quantity against it would compare two
+    different measurements, so the resumed run restarts selection and says so."""
+    got = _tiny_k(K=5)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    a, c = tempfile.mkdtemp(), tempfile.mkdtemp()
+    try:
+        _act_run(ds, a, max_steps=10, window=5)
+        p = os.path.join(a, "state.pt")
+        ck = torch.load(p, map_location="cpu", weights_only=False)
+        del ck["selection"]
+        ck["best"] = -1.0            # a value no new window could ever beat
+        torch.save(ck, p)
+        res = _act_run(ds, c, max_steps=20, window=5, resume=T.Resume(p))
+        assert any("best value" in x for x in res["metadata"]["resume"]["not_restored"])
+        assert os.path.isfile(os.path.join(c, "best.pt")), "selection did not restart"
+    finally:
+        for d in (tmp, a, c):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_the_scoring_path_is_structurally_separate_from_the_training_loss():
+    import inspect
+    import ast, textwrap
+    fn = ast.parse(textwrap.dedent(inspect.getsource(T.score_deployment))).body[0]
+    fn.body = fn.body[1:]                          # the code, not the docstring
+    src = ast.unparse(fn)
+    for banned in ("loss_terms", "forward_loss", "actions=", "DataLoader("):
+        assert banned not in src, banned
+    assert "model(obs)" in src and "_deployment_guard(model)" in src, src
+    assert "score_deployment" in inspect.getsource(T.evaluate)
+    loop = inspect.getsource(T.train)
+    assert loop.count("forward_loss(") == 1, "forward_loss must serve training only"
+    assert "_gate(q, gate_reference)" in loop
 
 
 def _tests():
