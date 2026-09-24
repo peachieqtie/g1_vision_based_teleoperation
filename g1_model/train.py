@@ -41,7 +41,6 @@ and K=100 and the scaling comparison would be measuring the padding.
 """
 from __future__ import annotations
 
-import contextlib
 import datetime as _dt
 import json
 import os
@@ -339,6 +338,32 @@ class StopRule:
                    100 * self.min_rel_improvement, window_steps))
 
 
+class _Unstated:
+    """Sentinel for a TrainConfig field the caller did not state. One instance;
+    survives copy, deepcopy and pickling as itself."""
+    _inst = None
+
+    def __new__(cls):
+        if cls._inst is None:
+            cls._inst = super().__new__(cls)
+        return cls._inst
+
+    def __repr__(self):
+        return "UNSTATED"
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __reduce__(self):
+        return (_Unstated, ())
+
+
+UNSTATED = _Unstated()
+
+
 @dataclass
 class TrainConfig:
     """Everything a run needs that is not the model or the data.
@@ -352,15 +377,23 @@ class TrainConfig:
     is one random tick per episode, and that difference is ~760x in optimizer
     steps (NOTES.md 2026-09-21). Step-budgeted runs are the ones to compare.
     `epochs` has no default and may be passed as None, so the choice is explicit.
+
+    NO FIELD THAT SHAPES THE TRAINED WEIGHTS HAS A DEFAULT (TR28, third and last
+    occurrence: `grad_clip = 1.0` reached every model from here, unstated). Every
+    field is classified in `TRAIN_CONFIG_FIELDS`; "model" fields must also equal
+    the model's own declaration (`assert_optimizer_source`), "run" fields are
+    stated by the caller, and only "environment"/"plumbing" fields - which cannot
+    change the hyperparameters of what is learned - keep defaults. A test fails if
+    a field is added without being classified.
     """
 
     epochs: Optional[int]
     batch_size: int
     lr: float
-    weight_decay: float = 0.0
-    optimizer: str = "adamw"
-    grad_clip: Optional[float] = 1.0
-    seed: int = 0
+    weight_decay: float
+    optimizer: str
+    grad_clip: float
+    seed: int
     num_workers: int = 0
     prefer_cuda: bool = True
     strict_determinism: bool = True
@@ -373,9 +406,13 @@ class TrainConfig:
     #: Step budget. When set, `epochs` must be None and the run ends at the first
     #: of: the stop rule firing, or this HARD CAP.
     max_steps: Optional[int] = None
-    stop_rule: Optional[StopRule] = None
-    #: Optimizer steps per logged window in a step-budgeted run.
-    window_steps: int = 1000
+    #: Step-budgeted runs must STATE this - `None` to run to the cap, or a rule.
+    #: Left unstated it is `UNSTATED`, which a step-budgeted run refuses.
+    stop_rule: Optional[StopRule] = UNSTATED
+    #: Optimizer steps per logged window in a step-budgeted run. Required there:
+    #: it is the stop rule's granularity and the selection cadence, so it decides
+    #: which weights a run ends on. Unused (None) in an epoch run.
+    window_steps: Optional[int] = UNSTATED
     #: Write the resumable `state.pt` every this many windows. 1 = a kill costs
     #: at most one window. The file holds weights plus AdamW's two moments, so
     #: it is about 3x the weights on disk.
@@ -387,14 +424,74 @@ class TrainConfig:
                 "state exactly ONE budget: epochs=%r, max_steps=%r. An epoch is a "
                 "dataset-dependent unit; a step budget is the comparable one."
                 % (self.epochs, self.max_steps))
-        if self.stop_rule is not None and self.max_steps is None:
-            raise TrainError("a stop rule needs a step budget (max_steps) as its cap")
-        if int(self.window_steps) < 1:
-            raise TrainError("window_steps must be >= 1")
+        if self.max_steps is None:
+            if self.stop_rule not in (None, UNSTATED):
+                raise TrainError("a stop rule needs a step budget (max_steps) as its cap")
+            if self.window_steps not in (None, UNSTATED):
+                raise TrainError("window_steps applies to a step budget (max_steps) only")
+            self.stop_rule, self.window_steps = None, None
+        else:
+            unstated = [k for k in ("stop_rule", "window_steps")
+                        if getattr(self, k) is UNSTATED]
+            if unstated:
+                raise TrainError(
+                    "a step-budgeted run must STATE %s (stop_rule=None means run to "
+                    "the cap). Both decide which weights the run ends on, so neither "
+                    "may arrive as a loop default (TR28)." % " and ".join(unstated))
+            if int(self.window_steps) < 1:
+                raise TrainError("window_steps must be >= 1")
+
+
+#: EVERY TrainConfig field, classified. A test asserts this covers the dataclass
+#: exactly, so a field cannot be added without deciding where its value comes from.
+#:   model        a training hyperparameter. No default; the MODEL declares it
+#:                (`optimizer_config()`), and `assert_optimizer_source` refuses a
+#:                TrainConfig that disagrees. The TR28 class of bug lives here.
+#:   run          decided per run by the caller. No default (or, for the
+#:                step-budget fields, UNSTATED until stated). Recorded verbatim.
+#:   environment  changes floating-point bits, never a hyperparameter; recorded
+#:                in metadata (device, determinism). May keep a default.
+#:   plumbing     cannot change the trained weights at all. May keep a default.
+TRAIN_CONFIG_FIELDS: Dict[str, Tuple[str, str]] = dict(
+    lr=("model", "optimizer step size"),
+    weight_decay=("model", "AdamW decoupled weight decay"),
+    optimizer=("model", "optimizer family"),
+    grad_clip=("model", "global-norm gradient clip; also a LADDER INVARIANT"),
+    epochs=("run", "budget; exactly one of epochs / max_steps"),
+    max_steps=("run", "budget; exactly one of epochs / max_steps"),
+    batch_size=("run", "batch size; changes the gradient noise and the step count"),
+    seed=("run", "initial weights (via seeded_build), data order, dropout and "
+                 "reparameterisation streams"),
+    stop_rule=("run", "step budgets: when training ends, so which weights are final"),
+    window_steps=("run", "step budgets: stop-rule granularity and selection cadence"),
+    num_workers=("environment", "loader worker count; order comes from the main-"
+                                "process generator and the dataset draws no randomness"),
+    prefer_cuda=("environment", "device; recorded as metadata.device"),
+    strict_determinism=("environment", "deterministic kernels; recorded as "
+                                       "metadata.determinism"),
+    log_every=("plumbing", "console printing"),
+    checkpoint_every=("plumbing", "extra checkpoint files"),
+    run_name=("plumbing", "run directory name"),
+    notes=("plumbing", "free-form provenance written to metadata"),
+    state_every_windows=("plumbing", "resumable state.pt cadence; resume is bit-exact"),
+)
+
+#: The fields a model must declare - exactly these, no more, no fewer.
+MODEL_DECLARED_FIELDS = tuple(k for k, (c, _) in TRAIN_CONFIG_FIELDS.items()
+                              if c == "model")
+
+
+def _ladder_invariants() -> dict:
+    """Values that must be IDENTICAL for every model in the ladder, because a
+    difference would sit inside an RQ2/RQ3 comparison. One source each."""
+    from g1_model.models import LADDER_GRAD_CLIP
+    return dict(grad_clip=float(LADDER_GRAD_CLIP))
 
 
 class OptimizerSourceError(TrainError):
-    """A TrainConfig whose optimizer settings are not the model's own (TR28)."""
+    """A TrainConfig whose training hyperparameters are not the model's own (TR28),
+    a model that declares none or only some, or a declaration that breaks a
+    ladder invariant."""
 
 
 def assert_optimizer_source(model: nn.Module, cfg: TrainConfig) -> None:
@@ -405,17 +502,37 @@ def assert_optimizer_source(model: nn.Module, cfg: TrainConfig) -> None:
     reached it and nothing raised, because nothing compared. Sharing a training
     LOOP is correct; sharing a hyperparameter SOURCE is the bug.
 
-    Any model that declares `optimizer_config()` is checked here, so a mismatch
-    stops the run before a single step. A model that declares nothing is not
-    checked - it has made no claim to contradict - which keeps the loop
-    model-agnostic while making silence impossible for anything that does.
+    Every model must declare `optimizer_config()` covering EXACTLY
+    `MODEL_DECLARED_FIELDS`, and every declared value must equal the TrainConfig's.
+    A model that declares nothing is REFUSED: silence used to mean "unchecked",
+    which is how BC trained for a whole stage with no stated source for any of
+    its optimizer settings and how `grad_clip` reached every model as a loop
+    default. Declared values must also satisfy the ladder invariants
+    (`_ladder_invariants`): a clip that differed between ACT and ACT-LSTM would
+    sit inside the headline comparison.
     """
     declared = getattr(model, "optimizer_config", None)
-    if declared is None:
-        return
-    want = declared()
-    got = dict(lr=float(cfg.lr), weight_decay=float(cfg.weight_decay),
-               optimizer=str(cfg.optimizer))
+    want = declared() if declared is not None else None
+    if want is None:
+        raise OptimizerSourceError(
+            "%s declares no training hyperparameters (optimizer_config). The loop "
+            "would have to supply %s from its own config - which is TR28. Build "
+            "the model through its factory from its config (build_bc(cfg=...), "
+            "build_act(cfg=...))." % (type(model).__name__, list(MODEL_DECLARED_FIELDS)))
+    missing = sorted(set(MODEL_DECLARED_FIELDS) - set(want))
+    extra = sorted(set(want) - set(MODEL_DECLARED_FIELDS))
+    if missing or extra:
+        raise OptimizerSourceError(
+            "%s declares an incomplete or unknown set of training hyperparameters: "
+            "missing %s, unknown %s. A partial declaration leaves the rest to the "
+            "loop's config, which is TR28 again." % (type(model).__name__, missing, extra))
+    for k, v in _ladder_invariants().items():
+        if abs(float(want[k]) - v) > 1e-12:
+            raise OptimizerSourceError(
+                "%s declares %s=%r, but every model in the ladder must use %r "
+                "(ladder invariant; see models.GRAD_CLIP_DISCLOSURE). Change it for "
+                "EVERY model or for none." % (type(model).__name__, k, want[k], v))
+    got = {k: getattr(cfg, k) for k in MODEL_DECLARED_FIELDS}
     bad = {}
     for k, w in want.items():
         g = got[k]
@@ -432,6 +549,21 @@ def assert_optimizer_source(model: nn.Module, cfg: TrainConfig) -> None:
             + "".join("\n" + L for L in lines)
             + "\n  Build the TrainConfig from THIS model's config. The loop is "
               "shared; the hyperparameter source is not (TR28).")
+
+
+def _training_provenance(model: nn.Module, opt: torch.optim.Optimizer) -> dict:
+    """Where every training hyperparameter of this run came from, for metadata.
+    Written by every run, so the grad-clip deviation travels with the numbers."""
+    from g1_model.models import GRAD_CLIP_DISCLOSURE
+    return dict(
+        source="declared by the model (optimizer_config); checked against the "
+               "TrainConfig by assert_optimizer_source before the first step",
+        declared=model.optimizer_config(),
+        ladder_invariants=_ladder_invariants(),
+        optimizer_defaults={k: v for k, v in opt.defaults.items()
+                            if k not in MODEL_DECLARED_FIELDS},
+        field_policy={k: c for k, (c, _) in TRAIN_CONFIG_FIELDS.items()},
+        disclosed_deviations=dict(grad_clip=GRAD_CLIP_DISCLOSURE))
 
 
 def make_optimizer(model: nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
@@ -490,51 +622,288 @@ SELECTION_CRITERION = ("deployment reconstruction (score_deployment): validation
 
 
 class ScoringError(TrainError):
-    """Scoring reached something the deployed policy never runs: a module in
-    train mode, or a module that reads the target action chunk."""
+    """Scoring reached something the deployed policy never runs or never has: a
+    module in train mode, a module that reads the target action chunk, a latent
+    that is not the prior mean, randomness, or state carried between calls."""
 
 
-@contextlib.contextmanager
-def _deployment_guard(model: nn.Module):
-    """Eval mode, enforced for the duration - not requested once and hoped for.
+# ─── the deployment guard ─────────────────────────────────────────────────────
+# docs/ACT_AUDIT_REPORT.md item 5 defeated the first version of this guard four
+# ways out of six, and measured that a leak moves the gated number by 1.0e-7 -
+# so no implausible score will ever reveal one. Every check below is therefore
+# STRUCTURAL: it fails on what the model does, never on what it scores.
+#
+#   attack (audit)                           closed by
+#   z drawn at inference, not the prior      PRIOR_LATENT_MODULES verified == 0 on
+#                                            every call, and every forward must
+#                                            pass through one; plus the RNG check
+#   encoder run via .forward() (no hooks)    the target-reading modules' forward
+#                                            is REPLACED on the instance, which
+#                                            .forward() and __call__ both reach;
+#                                            the NaN probe catches functional use
+#                                            of their weights
+#   functional dropout(training=True)        no RNG stream may advance; the probe
+#                                            batch must reproduce bit-for-bit
+#   target stashed in training, returned     no tensor may live on a module
+#   at inference                             outside its parameters and buffers
+#   (new) state carried between calls -      the above, plus: parameters and
+#   an un-reset ACT-LSTM hidden state        buffers may not change during
+#                                            scoring, and the first batch must
+#                                            score identically before and after
+#                                            the whole pass
 
-    Every submodule gets a forward pre-hook that raises if it runs in train mode
-    (so a forward pass that flips a mode back cannot slip dropout in), and every
-    module the model declares in `TARGET_READING_MODULES` gets one that raises
-    unconditionally (so the CVAE encoder is unreachable). A model with an
-    `encode` method that declares nothing is refused outright: it could read the
-    target and would not say so. The caller's mode is restored afterwards.
-    """
-    declared = tuple(getattr(model, "TARGET_READING_MODULES", ()))
-    if hasattr(model, "encode") and not declared:
-        raise ScoringError(
-            "%s has an `encode` method but declares no TARGET_READING_MODULES; "
-            "scoring cannot prove its encoder is unreachable" % type(model).__name__)
-    was_training = model.training
-    handles = []
+#: What every nn.Module keeps in its own __dict__: bookkeeping, never model state.
+_MODULE_INTERNALS = frozenset(vars(nn.Module()).keys()) | {"forward"}
 
-    def _no_train_mode(mod, _inp):
-        if mod.training:
-            raise ScoringError("%s ran in TRAIN mode during scoring; the gate scores "
-                               "the deployed function only" % type(mod).__name__)
 
-    def _forbidden(name):
-        def hook(_mod, _inp):
-            raise ScoringError("scoring reached %r, which reads the target action "
-                               "chunk; the deployed policy never runs it" % name)
-        return hook
+def _holds_foreign_array(v, own: set, depth: int = 0) -> bool:
+    """True if `v` is, or contains, a tensor that is NOT one of the model's own
+    parameters or buffers, or any numpy array. Aliases of the model's own
+    parameters are not state: `nn.LSTM` keeps its weights in `_flat_weights`."""
+    if torch.is_tensor(v):
+        return id(v) not in own
+    if isinstance(v, np.ndarray):
+        return True
+    if depth >= 3:
+        return False
+    if isinstance(v, dict):
+        return any(_holds_foreign_array(x, own, depth + 1) for x in v.values())
+    if isinstance(v, (list, tuple, set, frozenset)):
+        return any(_holds_foreign_array(x, own, depth + 1) for x in v)
+    return False
 
-    try:
-        model.eval()
-        for mod in model.modules():
-            handles.append(mod.register_forward_pre_hook(_no_train_mode))
-        for name in declared:
-            handles.append(getattr(model, name).register_forward_pre_hook(_forbidden(name)))
-        yield
-    finally:
-        for h in handles:
+
+def hidden_state(model: nn.Module) -> List[str]:
+    """Every tensor or array a module holds OUTSIDE its parameters and registered
+    buffers - state the checkpoint does not carry and a deployed policy starting
+    an episode would not have. A leftover recurrent hidden state, a cached
+    target, a memo: all land here. Empty for a stateless model."""
+    own = {id(t) for t in model.parameters()} | {id(t) for t in model.buffers()}
+    found = []
+    for name, mod in model.named_modules():
+        for k, v in vars(mod).items():
+            if k not in _MODULE_INTERNALS and _holds_foreign_array(v, own):
+                found.append("%s.%s" % (name or type(model).__name__, k))
+    return found
+
+
+def _weights_fingerprint(model: nn.Module) -> dict:
+    """Identity, storage and in-place version counter of every parameter and
+    buffer: any mutation during scoring changes one of them, at no copying cost."""
+    out = {}
+    named = (list(model.named_parameters(remove_duplicate=False))
+             + list(model.named_buffers(remove_duplicate=False)))
+    for n, t in named:
+        out[n] = (id(t), t.data_ptr(), t._version, tuple(t.shape), str(t.dtype))
+    return out
+
+
+def _rng_snapshot() -> dict:
+    snap = dict(torch=torch.get_rng_state().clone(), numpy=np.random.get_state(),
+                python=random.getstate())
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        snap["cuda"] = [s.clone() for s in torch.cuda.get_rng_state_all()]
+    return snap
+
+
+def _rng_advanced(a: dict, b: dict) -> List[str]:
+    moved = []
+    if not torch.equal(a["torch"], b["torch"]):
+        moved.append("torch CPU")
+    na, nb = a["numpy"], b["numpy"]
+    if not (na[0] == nb[0] and np.array_equal(na[1], nb[1]) and tuple(na[2:]) == tuple(nb[2:])):
+        moved.append("numpy")
+    if a["python"] != b["python"]:
+        moved.append("python random")
+    if "cuda" in a and "cuda" in b:
+        if len(a["cuda"]) != len(b["cuda"]) or any(
+                not torch.equal(x, y) for x, y in zip(a["cuda"], b["cuda"])):
+            moved.append("CUDA")
+    return moved
+
+
+class _DeploymentGuard:
+    """Eval mode, enforced; the encoder unreachable; z verified; no randomness;
+    no state. Entered by `score_deployment`, which also runs the checks that need
+    the finished pass (`finish`). Every change it makes is undone on exit."""
+
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self.declared = tuple(getattr(model, "TARGET_READING_MODULES", ()))
+        self.prior = tuple(getattr(model, "PRIOR_LATENT_MODULES", ()))
+        name = type(model).__name__
+        if hasattr(model, "encode") and not self.declared:
+            raise ScoringError(
+                "%s has an `encode` method but declares no TARGET_READING_MODULES; "
+                "scoring cannot prove its encoder is unreachable" % name)
+        if hasattr(model, "encode") and not self.prior:
+            raise ScoringError(
+                "%s has an `encode` method but declares no PRIOR_LATENT_MODULES; "
+                "scoring cannot verify that z is the prior mean" % name)
+        self.z_calls = 0
+        self._z_at_call = None
+        self._handles, self._patched = [], []
+
+    # -- helpers -------------------------------------------------------------
+    def _patch(self, mod: nn.Module, make):
+        had = "forward" in vars(mod)
+        old = vars(mod).get("forward")
+        mod.forward = make(mod.forward)
+        self._patched.append((mod, had, old))
+
+    def _forbidden(self, name):
+        def make(_orig):
+            def forward(*_a, **_k):
+                raise ScoringError(
+                    "scoring reached %r, which reads the target action chunk; the "
+                    "deployed policy never runs it (called via __call__ or "
+                    ".forward() - both are refused)" % name)
+            return forward
+        return make
+
+    def _prior_check(self, name):
+        def make(orig):
+            def forward(*a, **k):
+                z = a[0] if a else next(iter(k.values()), None)
+                if not torch.is_tensor(z):
+                    raise ScoringError("%r was called without a tensor latent" % name)
+                if z.numel() and bool((z != 0).any()):
+                    raise ScoringError(
+                        "the latent entering %r is not the prior mean: max|z| = %.3e. "
+                        "The deployed ACT uses z = 0 (detr_vae.py:113; paper §IV-B)"
+                        % (name, float(z.detach().abs().nan_to_num(float("inf")).max())))
+                self.z_calls += 1
+                return orig(*a, **k)
+            return forward
+        return make
+
+    # -- context -------------------------------------------------------------
+    def __enter__(self):
+        m = self.model
+        held = hidden_state(m)
+        if held:
+            raise ScoringError(
+                "%s holds state outside its parameters and buffers: %s. The deployed "
+                "function must be a function of (weights, observation) alone - a "
+                "leftover recurrent hidden state or a cached target would reach the "
+                "gate, and would make it score BETTER. A recurrent model needs an "
+                "explicit per-episode reset protocol, which score_deployment does not "
+                "implement." % (type(m).__name__, held))
+        self.was_training = m.training
+        self.fp0 = _weights_fingerprint(m)
+        self.rng0 = _rng_snapshot()
+        try:
+            m.eval()
+
+            def _no_train_mode(mod, _inp):
+                if mod.training:
+                    raise ScoringError(
+                        "%s ran in TRAIN mode during scoring; the gate scores the "
+                        "deployed function only" % type(mod).__name__)
+            for mod in m.modules():
+                self._handles.append(mod.register_forward_pre_hook(_no_train_mode))
+            seen = set()
+            for name in self.declared:
+                for sub in getattr(m, name).modules():
+                    if id(sub) not in seen:
+                        seen.add(id(sub))
+                        self._patch(sub, self._forbidden(name))
+            for name in self.prior:
+                self._patch(getattr(m, name), self._prior_check(name))
+            if self.prior:
+                def _pre(_mod, _inp):
+                    self._z_at_call = self.z_calls
+
+                def _post(_mod, _inp, _out):
+                    if self.z_calls <= self._z_at_call:
+                        raise ScoringError(
+                            "a forward pass of %s returned without passing a latent "
+                            "through %s, so z = 0 could not be verified"
+                            % (type(m).__name__, list(self.prior)))
+                self._handles.append(m.register_forward_pre_hook(_pre))
+                self._handles.append(m.register_forward_hook(_post))
+        except BaseException:
+            self._restore()
+            raise
+        return self
+
+    def _restore(self):
+        for h in self._handles:
             h.remove()
-        model.train(was_training)
+        self._handles = []
+        for mod, had, old in reversed(self._patched):
+            if had:
+                mod.forward = old
+            else:
+                del mod.forward
+        self._patched = []
+        self.model.train(self.was_training)
+
+    def __exit__(self, *exc):
+        self._restore()
+        return False
+
+    # -- the checks that need the finished pass --------------------------------
+    def finish(self, probe_obs, probe_out):
+        """Called inside the context, after the scoring pass. Order matters: the
+        NaN probe writes to parameters, so the fingerprint is checked first."""
+        m = self.model
+        with torch.no_grad():
+            again = m(probe_obs)
+        if not torch.equal(again, probe_out):
+            raise ScoringError(
+                "the first batch scored differently after the full pass (max |diff| "
+                "%.3e): the deployed function carried state between calls, or is not "
+                "deterministic. An un-reset recurrent hidden state does exactly this."
+                % float((again - probe_out).abs().max()))
+        held = hidden_state(m)
+        if held:
+            raise ScoringError("scoring left state outside parameters and buffers on "
+                               "%s: %s" % (type(m).__name__, held))
+        fp = _weights_fingerprint(m)
+        if fp != self.fp0:
+            changed = sorted(k for k in set(fp) | set(self.fp0)
+                             if fp.get(k) != self.fp0.get(k))
+            raise ScoringError(
+                "parameters or buffers changed during scoring: %s. The gate scores "
+                "FIXED weights; a buffer updated per call is carried state."
+                % changed[:8])
+        moved = _rng_advanced(self.rng0, _rng_snapshot())
+        if moved:
+            raise ScoringError(
+                "scoring drew randomness (%s RNG advanced): the deployed function "
+                "must be deterministic - dropout active, a sampled latent, or any "
+                "other stochastic op" % ", ".join(moved))
+        if self.declared:
+            self._nan_probe(probe_obs, probe_out)
+
+    def _nan_probe(self, probe_obs, probe_out):
+        """Fill every weight of the target-reading modules with NaN and score the
+        probe batch again: if the output moves (or goes NaN), the prediction
+        depends on them - by any route, functional calls included. Weights are
+        restored bit-exactly from a CPU copy."""
+        m = self.model
+        params, seen = [], set()
+        for name in self.declared:
+            for p in list(getattr(m, name).parameters()) + list(getattr(m, name).buffers()):
+                if id(p) not in seen and p.is_floating_point():
+                    seen.add(id(p))
+                    params.append(p)
+        saved = [p.detach().to("cpu", copy=True) for p in params]
+        try:
+            with torch.no_grad():
+                for p in params:
+                    p.fill_(float("nan"))
+                poisoned = m(probe_obs)
+        finally:
+            with torch.no_grad():
+                for p, s in zip(params, saved):
+                    p.copy_(s.to(p.device))
+        if not torch.equal(poisoned, probe_out):
+            raise ScoringError(
+                "the deployed output depends on the weights of %s (target-reading "
+                "modules): with them set to NaN the probe batch changed. The deployed "
+                "policy must not use the CVAE encoder by any route." % list(self.declared))
 
 
 def score_deployment(model: nn.Module, ds: ChunkDataset,
@@ -543,17 +912,20 @@ def score_deployment(model: nn.Module, ds: ChunkDataset,
                      batch_size: int = 256):
     """THE gated number: masked-L1 reconstruction of the DEPLOYED function.
 
-    One pass over `ds` on the weights as they are NOW, in eval mode (enforced by
-    `_deployment_guard`), under no_grad, calling `model(obs)` with the observation
-    ALONE. The target is used only by `masked_l1` after the prediction exists; the
-    model is never handed it, so a CVAE cannot condition on it and runs its prior
-    (ACT: z = 0, encoder skipped, detr_vae.py:113). Not `forward_loss`, not
-    `loss_terms`: those feed the target to the encoder even in eval mode.
+    One pass over `ds` on the weights as they are NOW, in eval mode, under no_grad,
+    calling `model(obs)` with the observation ALONE. The target is used only by
+    `masked_l1` after the prediction exists; the model is never handed it, so a
+    CVAE cannot condition on it and runs its prior (ACT: z = 0, encoder skipped,
+    detr_vae.py:113). Not `forward_loss`, not `loss_terms`: those feed the target
+    to the encoder even in eval mode.
 
-    Why: the ambiguity reference describes the data, with no dropout and no
-    sampling. Scored as a train-mode window mean, converged ACT read 0.050886
-    (FAIL, 1.140); its deployed function reads 0.041081 (PASS, 0.920). The whole
-    gap was dropout 0.1 (NOTES.md 2026-09-22).
+    `_DeploymentGuard` makes every property of "deployed" a CHECK rather than a
+    convention - see the attack table above it. A leak is invisible in the number
+    itself (1.0e-7 on the converged ACT gate weights), so nothing here relies on it.
+
+    Why deployment at all: the ambiguity reference describes the data, with no
+    dropout and no sampling. Scored as a train-mode window mean, converged ACT read
+    0.050886 (FAIL, 1.140); its deployed function reads 0.041081 (PASS, 0.920).
 
     Batches are cut by index, not by a DataLoader: a DataLoader draws its base
     seed from the GLOBAL generator even unshuffled, and scoring every window would
@@ -568,16 +940,21 @@ def score_deployment(model: nn.Module, ds: ChunkDataset,
         dim_mask = torch.from_numpy(
             np.asarray(spec.ACTION_MASK, dtype=bool).copy()).to(device)
     total, n = 0.0, 0
-    with _deployment_guard(model), torch.no_grad():
+    probe_obs = probe_out = None
+    with _DeploymentGuard(model) as guard, torch.no_grad():
         for i in range(0, len(ds), int(batch_size)):
             batch = collate_chunks([ds[j] for j in range(i, min(i + int(batch_size), len(ds)))])
             obs = batch["obs"].to(device, non_blocking=True)
             pred = model(obs)                        # the observation, and nothing else
+            if probe_obs is None:
+                probe_obs, probe_out = obs, pred.clone()
             target = batch["action"].to(device, non_blocking=True)
             pad = batch["action_mask"].to(device, non_blocking=True)
             l1, count = masked_l1(pred, target, pad, dim_mask)
             total += float(l1) * int(count)
             n += int(count)
+        if probe_obs is not None:
+            guard.finish(probe_obs, probe_out)
     return Quantity(total / max(n, 1), RECON_UNITS, measured=MEASURED_AT_DEPLOYMENT)
 
 
@@ -829,6 +1206,7 @@ def train(model: nn.Module, train_ds: ChunkDataset, cfg: TrainConfig,
         data=prov, baselines=base,
         val=dict(episodes=len(val_ds.lengths), seeds=list(val_ds.seeds),
                  samples=len(val_ds)) if val_ds is not None else None,
+        training_hyperparameters=_training_provenance(model, opt),
     )
     step_mode = cfg.max_steps is not None
     if resume is not None and not step_mode:

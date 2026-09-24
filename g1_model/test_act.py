@@ -455,7 +455,7 @@ def test_temporal_ensemble_changes_inference_and_never_training():
 def test_seeded_build_makes_act_deterministic():
     """D10. Stage 2 measured that seeding AFTER construction leaves weight init
     unseeded (6.0e-3 divergence); this is a new class, so it is re-checked."""
-    cfg = T.TrainConfig(epochs=1, batch_size=4, lr=1e-4, seed=5)
+    cfg = T.TrainConfig(epochs=1, batch_size=4, seed=5, **_cfg().optimizer_config())
     a = T.seeded_build(cfg, build_act, cfg=_cfg())
     b = T.seeded_build(cfg, build_act, cfg=_cfg())
     for pa, pb in zip(a.parameters(), b.parameters()):
@@ -482,7 +482,7 @@ def test_two_identical_act_runs_are_bit_identical():
             st, ac, None)
         losses = []
         for i in (1, 2):
-            cfg = T.TrainConfig(epochs=2, batch_size=8, lr=1e-4, seed=3,
+            cfg = T.TrainConfig(epochs=2, batch_size=8, seed=3, **_cfg().optimizer_config(),
                                 run_name="act%d" % i, log_every=0)
             m = T.seeded_build(cfg, build_act, cfg=_cfg(K=6))
             r = T.train(m, ds, cfg, run_dir=os.path.join(out, "r%d" % i))
@@ -521,7 +521,7 @@ def test_act_trains_through_the_unchanged_shared_loop():
         ds = ChunkDataset.from_directory(
             tmp, LoaderConfig(chunk_size=6, obs_window=1, tracking=TrackingPolicy()),
             st, ac, None)
-        cfg = T.TrainConfig(epochs=3, batch_size=8, lr=1e-4, seed=0,
+        cfg = T.TrainConfig(epochs=3, batch_size=8, seed=0, **_cfg().optimizer_config(),
                             run_name="actloop", log_every=0)
         m = T.seeded_build(cfg, build_act, cfg=_cfg(K=6))
         r = T.train(m, ds, cfg, run_dir=out)
@@ -548,7 +548,7 @@ def test_checkpoint_round_trips_to_identical_predictions():
         ds = ChunkDataset.from_directory(
             tmp, LoaderConfig(chunk_size=6, obs_window=1, tracking=TrackingPolicy()),
             st, ac, None)
-        cfg = T.TrainConfig(epochs=1, batch_size=8, lr=1e-4, seed=1,
+        cfg = T.TrainConfig(epochs=1, batch_size=8, seed=1, **_cfg().optimizer_config(),
                             run_name="actck", log_every=0)
         m = T.seeded_build(cfg, build_act, cfg=_cfg(K=6))
         T.train(m, ds, cfg, run_dir=out)
@@ -597,12 +597,11 @@ def test_act_config_cannot_be_satisfied_by_bc_config_values():
     from g1_model.models import BCConfig
     bc = BCConfig(obs_window=1, chunk_size=4)
     m = ACTPolicy(_cfg(K=4, lr=A.LR, weight_decay=A.WEIGHT_DECAY))
-    leaked = T.TrainConfig(epochs=1, batch_size=8, lr=bc.lr,
-                           weight_decay=bc.weight_decay, optimizer=bc.optimizer)
+    leaked = T.TrainConfig(epochs=1, batch_size=8, seed=0, **bc.optimizer_config())
     assert bc.lr != A.LR, "the test is vacuous if the two lrs happen to agree"
     e = _raises(T.OptimizerSourceError, T.make_optimizer, m, leaked)
     assert "lr" in str(e) and "TR28" in str(e)
-    ok = T.TrainConfig(epochs=1, batch_size=8, **m.optimizer_config())
+    ok = T.TrainConfig(epochs=1, batch_size=8, seed=0, **m.optimizer_config())
     T.make_optimizer(m, ok)                           # its own values: accepted
 
 
@@ -611,10 +610,11 @@ def test_every_declared_optimizer_value_is_checked_not_just_lr():
     0.0 while the reference is 1e-4 - so the guard compares every declared value."""
     m = ACTPolicy(_cfg(K=4, lr=A.LR, weight_decay=A.WEIGHT_DECAY))
     good = m.optimizer_config()
-    for field_, bad in (("lr", 1e-3), ("weight_decay", 0.0), ("optimizer", "sgd")):
+    for field_, bad in (("lr", 1e-3), ("weight_decay", 0.0), ("optimizer", "sgd"),
+                        ("grad_clip", 0.5)):
         cfg = dict(good); cfg[field_] = bad
         e = _raises(T.OptimizerSourceError, T.make_optimizer, m,
-                    T.TrainConfig(epochs=1, batch_size=8, **cfg))
+                    T.TrainConfig(epochs=1, batch_size=8, seed=0, **cfg))
         assert field_ in str(e), (field_, str(e))
 
 
@@ -622,7 +622,8 @@ def test_reference_optimizer_values_are_cited_constants():
     """README.md:77 --lr 1e-5; main.py:17 --weight_decay 1e-4; main.py:87 AdamW."""
     assert A.LR == 1e-5 and A.WEIGHT_DECAY == 1e-4 and A.OPTIMIZER == "adamw"
     c = ACTConfig(obs_window=1, chunk_size=4, lr=A.LR)
-    assert c.optimizer_config() == dict(lr=1e-5, weight_decay=1e-4, optimizer="adamw")
+    assert c.optimizer_config() == dict(lr=1e-5, weight_decay=1e-4, optimizer="adamw",
+                                        grad_clip=1.0)
 
 
 def test_the_runner_takes_act_lr_from_act_not_from_bc():
@@ -641,6 +642,33 @@ def test_the_runner_takes_act_lr_from_act_not_from_bc():
     assert (tc.lr, tc.weight_decay, tc.optimizer) == (A.LR, 0.0, "adamw")
     m = ACTPolicy(_cfg(K=4, lr=gate.lr, weight_decay=gate.weight_decay))
     T.assert_optimizer_source(m, tc)                  # consistent: no raise
+
+
+def test_gate_metadata_states_the_dropout_the_model_actually_has():
+    """docs/ACT_AUDIT_REPORT.md T2: every overfit-10 run was stamped "NONE: dropout
+    0", including ACT's, which keeps its architectural dropout of 0.1. The
+    statement is now derived from the model config and checked against the BUILT
+    model before the run starts."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "tools"))
+    import importlib
+    tb = importlib.import_module("train_bc")
+    act = tb._model_config("act", 4, 8, gate=True)
+    bc = tb._model_config("bc", 4, 8, gate=True)
+    s_act, s_bc = tb.regularization_statement(act), tb.regularization_statement(bc)
+    assert "dropout 0.1" in s_act and not s_act.startswith("NONE"), s_act
+    assert s_bc.startswith("NONE: dropout 0,"), s_bc
+    small = ACTConfig(obs_window=1, chunk_size=4, lr=act.lr, weight_decay=0.0,
+                      hidden_dim=64, dim_feedforward=128, nheads=4, enc_layers=1)
+    m_act = build_act(cfg=small)
+    assert tb.observed_dropout(m_act) == [0.1]
+    tb.assert_regularization_matches(m_act, small)          # consistent: no raise
+    from g1_model.models import build_bc
+    tb.assert_regularization_matches(build_bc(cfg=bc), bc)
+    # and the check has teeth: a config claiming no dropout on an ACT that has it
+    import dataclasses
+    lie = dataclasses.replace(small, dropout=0.0)
+    _raises(SystemExit, tb.assert_regularization_matches, m_act, lie)
 
 
 def test_epoch_budget_must_be_stated_with_a_reason():

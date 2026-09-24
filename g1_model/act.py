@@ -56,6 +56,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from g1_data import spec
+from g1_model.models import LADDER_GRAD_CLIP
 
 # ─── reference constants ──────────────────────────────────────────────────────
 # Every value here is the reference's, cited. Values that are OURS are in
@@ -355,6 +356,10 @@ class ACTConfig:
     kl_weight: float = KL_WEIGHT
     weight_decay: float = WEIGHT_DECAY
     optimizer: str = OPTIMIZER
+    #: NOT the reference's: it never clips (`detr/main.py:20` "# not used"). The
+    #: ladder's one value, identical for every model and refused if it differs -
+    #: see `models.LADDER_GRAD_CLIP` and `models.GRAD_CLIP_DISCLOSURE`.
+    grad_clip: float = LADDER_GRAD_CLIP
 
     #: OURS, PROVISIONAL. The reference's action head is `Linear(hidden, 14)`
     #: (`detr_vae.py:52`, `state_dim = 14` hardcoded at `:230`). Our action is
@@ -380,13 +385,14 @@ class ACTConfig:
         was silent precisely because no such comparison existed.
         """
         return dict(lr=float(self.lr), weight_decay=float(self.weight_decay),
-                    optimizer=str(self.optimizer))
+                    optimizer=str(self.optimizer), grad_clip=float(self.grad_clip))
 
     def as_metadata(self) -> dict:
         d = asdict(self)
         d.update(reference_commit=REF_COMMIT, reference_paper=REF_PAPER,
                  decoder_layer_read=DECODER_LAYER_READ,
-                 reference_lr=LR, reference_weight_decay=WEIGHT_DECAY)
+                 reference_lr=LR, reference_weight_decay=WEIGHT_DECAY,
+                 reference_grad_clip="none (reference/act/detr/main.py:20 '# not used')")
         return d
 
 
@@ -405,23 +411,32 @@ class ACTPolicy(nn.Module):
     `is_training = actions is not None`), so a caller cannot accidentally run the
     CVAE encoder at inference — it has nothing to run it on.
 
-    WHERE THE LSTM WILL ATTACH (not built, D8): between `_encode_obs` and the
-    transformer, as a third token or as a transform of `proprio_input`, so that
+    WHERE THE LSTM WILL ATTACH (not built, D8): between the observation
+    projection (`input_proj_robot_state`, in `_decode`) and the transformer, as a
+    third token or as a transform of `proprio_input`, so that
     the CVAE encoder, the decoder, the queries and the head are untouched and the
     only difference between ACT and ACT-LSTM is that one carries state across
     ticks. See the session report.
     """
 
     #: The modules that read the TARGET action chunk: exactly the CVAE encoder,
-    #: used only by `encode`. `train.score_deployment` hooks every one of them to
-    #: raise, so scoring cannot reach the encoder even if a future forward pass
-    #: tried to. A declaration, not a change to the model: nothing reads it at
-    #: training or inference time. Checked against `encode` by test_train.
-    #: `cls_embed` is read through `.weight`, never CALLED, so its hook cannot
-    #: fire; the other four run on every `encode` call, which is what makes the
-    #: encoder unreachable.
+    #: used only by `encode`. During scoring `train._DeploymentGuard` replaces the
+    #: `forward` of every one of them AND their submodules so that any call -
+    #: `__call__` or `.forward()` - raises, and after the pass fills their weights
+    #: with NaN and re-scores a probe batch, so even a functional use of a weight
+    #: is caught. `cls_embed` is read through `.weight`, never CALLED: the NaN
+    #: probe is what covers it. A declaration, not a change to the model: nothing
+    #: reads it at training or inference time. Checked against `encode` by
+    #: test_train.
     TARGET_READING_MODULES = ("cls_embed", "encoder_action_proj",
                               "encoder_joint_proj", "latent_proj", "encoder")
+
+    #: The modules whose INPUT is the latent z. `train.score_deployment` checks,
+    #: on every call during scoring, that what enters them is EXACTLY zero - the
+    #: prior mean (`detr_vae.py:113`; paper §IV-B p.5) - and that every forward
+    #: pass went through one of them, so z = 0 is verified at the gate rather than
+    #: left to this file and a unit test. A declaration, not a change to the model.
+    PRIOR_LATENT_MODULES = ("latent_out_proj",)
 
     def __init__(self, cfg: ACTConfig):
         super().__init__()
@@ -484,9 +499,18 @@ class ACTPolicy(nn.Module):
 
     def _reset_parameters(self):
         """reference/act/detr/models/transformer.py:44-47 — xavier_uniform_ on
-        every parameter with dim() > 1. Applied to the transformer stacks only,
-        as in the reference, where `_reset_parameters` is a method of
-        `Transformer` and does not touch the projections built in `DETRVAE`."""
+        every parameter with dim() > 1 of the POLICY transformer (`t_encoder`,
+        `t_decoder`), as in the reference, where `_reset_parameters` is a method of
+        `Transformer` and does not touch the projections built in `DETRVAE`.
+
+        DIVERGENCE, DISCLOSED (docs/ACT_AUDIT_REPORT.md R2; correspondence row 27):
+        it is ALSO applied to the CVAE encoder (`self.encoder`). The reference does
+        not do that: `build_encoder` (`detr_vae.py:212-226`) never re-initialises,
+        and `TransformerEncoder` deep-copies ONE layer (`transformer.py:83,
+        289-290`), so the reference's four CVAE-encoder layers start IDENTICAL,
+        with PyTorch's default init (measured: linear1 std 0.02553 vs xavier's
+        0.02321). Changes the starting point, not the function class. Left as is:
+        changing the init is a model change, and the passing gate used this one."""
         for m in (self.encoder, self.t_encoder, self.t_decoder):
             for p in m.parameters():
                 if p.dim() > 1:
@@ -653,8 +677,11 @@ class TemporalEnsembler:
         exp_weights = exp_weights / exp_weights.sum()                    :257
         raw_action  = (actions_for_curr_step * exp_weights).sum(dim=0)   :259
 
-    `w_0` weights the OLDEST prediction still in the buffer (paper §IV-A), and a
-    smaller `m` incorporates new observations more slowly. It is OFF by default
+    `w_0` weights the OLDEST prediction still in the buffer, and "a smaller m
+    means faster incorporation" of new observations (paper §IV-A, p.5, arXiv
+    2304.13705v1): with index 0 the oldest, a smaller m flattens the weights and
+    gives the newer predictions more of the average. (This line previously said
+    the opposite - docs/ACT_AUDIT_REPORT.md T1.) It is OFF by default
     in the reference — `--temporal_agg` is `store_true` (`:433`) — and when on it
     sets `query_frequency = 1` (`:193`).
 

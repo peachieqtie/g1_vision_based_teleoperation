@@ -163,7 +163,7 @@ def test_two_identical_runs_are_bit_identical():
     try:
         losses = []
         for i in (1, 2):
-            cfg = T.TrainConfig(epochs=2, batch_size=16, lr=1e-3, seed=7,
+            cfg = T.TrainConfig(epochs=2, batch_size=16, seed=7, **_BC_OPT,
                                 run_name="det%d" % i, log_every=0)
             model = T.seeded_build(cfg, build_bc, cfg=BCConfig(obs_window=1, chunk_size=1))
             res = T.train(model, ds, cfg, run_dir=os.path.join(out, "r%d" % i))
@@ -178,7 +178,7 @@ def test_two_identical_runs_are_bit_identical():
 def test_seeded_build_is_what_makes_it_deterministic():
     """The mechanism, not just the outcome: building WITHOUT seeding first gives
     different initial weights, which is the bug `seeded_build` exists to stop."""
-    cfg = T.TrainConfig(epochs=1, batch_size=8, lr=1e-3, seed=3)
+    cfg = T.TrainConfig(epochs=1, batch_size=8, seed=3, **_BC_OPT)
     a = T.seeded_build(cfg, build_bc, cfg=BCConfig(obs_window=1, chunk_size=1))
     b = T.seeded_build(cfg, build_bc, cfg=BCConfig(obs_window=1, chunk_size=1))
     for pa, pb in zip(a.parameters(), b.parameters()):
@@ -224,7 +224,7 @@ def test_checkpoint_round_trips_to_identical_predictions():
     tmp, ds = tmp
     out = tempfile.mkdtemp()
     try:
-        cfg = T.TrainConfig(epochs=1, batch_size=16, lr=1e-3, seed=1,
+        cfg = T.TrainConfig(epochs=1, batch_size=16, seed=1, **_BC_OPT,
                             run_name="ckpt", log_every=0)
         model = T.seeded_build(cfg, build_bc, cfg=BCConfig(obs_window=1, chunk_size=1))
         res = T.train(model, ds, cfg, run_dir=out)
@@ -326,7 +326,7 @@ def test_chunked_bc_trains_through_the_unchanged_loop():
         ds = ChunkDataset.from_directory(
             tmp, LoaderConfig(chunk_size=K, obs_window=1,
                               tracking=TrackingPolicy()), st, ac, None)
-        cfg = T.TrainConfig(epochs=2, batch_size=16, lr=1e-3, seed=0,
+        cfg = T.TrainConfig(epochs=2, batch_size=16, seed=0, **_BC_OPT,
                             run_name="chunk", log_every=0)
         model = T.seeded_build(cfg, build_bc,
                                cfg=BCConfig(obs_window=1, chunk_size=K))
@@ -407,7 +407,7 @@ def test_run_metadata_states_which_data_it_ran_on():
         assert prov["real_demonstrations"] is False
         assert "piloted" in prov["caveat"] and "CITED" in prov["caveat"].upper()
 
-        cfg = T.TrainConfig(epochs=1, batch_size=16, lr=1e-3, seed=0,
+        cfg = T.TrainConfig(epochs=1, batch_size=16, seed=0, **_BC_OPT,
                             run_name="prov", log_every=0)
         model = T.seeded_build(cfg, build_bc, cfg=BCConfig(obs_window=1, chunk_size=1))
         T.train(model, ds, cfg, run_dir=out)
@@ -459,11 +459,12 @@ def test_stop_rule_uses_best_of_span_so_one_noisy_window_cannot_decide():
 
 
 def test_budget_must_be_exactly_one_of_epochs_or_steps():
-    _raises(T.TrainError, T.TrainConfig, epochs=None, batch_size=8, lr=1e-3)
-    _raises(T.TrainError, T.TrainConfig, epochs=3, batch_size=8, lr=1e-3, max_steps=10)
+    kw = dict(batch_size=8, seed=0, **_BC_OPT)
+    _raises(T.TrainError, T.TrainConfig, epochs=None, **kw)
+    _raises(T.TrainError, T.TrainConfig, epochs=3, max_steps=10, **kw)
     rule = T.StopRule(patience_windows=2, min_rel_improvement=0.01)
-    _raises(T.TrainError, T.TrainConfig, epochs=3, batch_size=8, lr=1e-3, stop_rule=rule)
-    T.TrainConfig(epochs=None, batch_size=8, lr=1e-3, max_steps=10, stop_rule=rule)
+    _raises(T.TrainError, T.TrainConfig, epochs=3, stop_rule=rule, **kw)
+    T.TrainConfig(epochs=None, max_steps=10, stop_rule=rule, window_steps=5, **kw)
     _raises(T.TrainError, T.StopRule, patience_windows=0, min_rel_improvement=0.01)
     _raises(T.TrainError, T.StopRule, patience_windows=2, min_rel_improvement=1.5)
 
@@ -477,8 +478,8 @@ def test_step_budgeted_run_logs_windows_records_budget_and_labels_quantities():
     out = tempfile.mkdtemp()
     try:
         from g1_model.ambiguity import RECON_UNITS, TOTAL_LOSS_UNITS
-        cfg = T.TrainConfig(epochs=None, batch_size=8, lr=1e-3, seed=0,
-                            max_steps=25, window_steps=5, log_every=0)
+        cfg = T.TrainConfig(epochs=None, batch_size=8, seed=0, **_BC_OPT,
+                            max_steps=25, window_steps=5, stop_rule=None, log_every=0)
         m = T.seeded_build(cfg, build_bc, cfg=BCConfig(obs_window=1, chunk_size=1))
         r = T.train(m, ds, cfg, run_dir=out)
         assert r["optimizer_steps"] == 25, r["optimizer_steps"]
@@ -518,10 +519,12 @@ def test_stop_rule_ends_a_run_before_the_cap_and_says_where():
         # of the 10-episode gate set, for exactly this reason.
         rule = T.StopRule(patience_windows=2, min_rel_improvement=0.01)
         spe = (len(ds) + 7) // 8
-        cfg = T.TrainConfig(epochs=None, batch_size=8, lr=0.0, seed=0,
+        frozen = BCConfig(obs_window=1, chunk_size=1, lr=0.0)
+        cfg = T.TrainConfig(epochs=None, batch_size=8, seed=0,
+                            **frozen.optimizer_config(),
                             max_steps=1000, window_steps=spe, stop_rule=rule,
                             log_every=0)
-        m = T.seeded_build(cfg, build_bc, cfg=BCConfig(obs_window=1, chunk_size=1))
+        m = T.seeded_build(cfg, build_bc, cfg=frozen)
         r = T.train(m, ds, cfg, run_dir=out)
         assert r["stop"]["reason"] == "stop_rule", r["stop"]
         assert r["stop"]["step"] == 3 * spe,             "a 2-window span needs 3 windows: %s" % r["stop"]
@@ -534,6 +537,12 @@ def test_stop_rule_ends_a_run_before_the_cap_and_says_where():
 
 
 # ═══ Stage 4 A/D: resume, and a run that survives being killed ════════════════
+#: BC's own declared training hyperparameters (TR28): what every BC TrainConfig
+#: in this file is built from, instead of restating lr and leaving the rest to
+#: loop defaults.
+_BC_OPT = BCConfig(obs_window=1, chunk_size=1).optimizer_config()
+
+
 def _tiny_act(K=5):
     """A small ACT WITH dropout, so resuming must restore the dropout RNG too."""
     from g1_model.act import ACTConfig, build_act
@@ -557,7 +566,8 @@ def _tiny_k(K, n_eps=2, n_ticks=40):
 def _act_run(ds, out, max_steps, window, resume=None, gate_reference=None):
     mcfg, build = _tiny_act()
     cfg = T.TrainConfig(epochs=None, batch_size=8, seed=3, max_steps=max_steps,
-                        window_steps=window, log_every=0, **mcfg.optimizer_config())
+                        window_steps=window, stop_rule=None, log_every=0,
+                        **mcfg.optimizer_config())
     m = T.seeded_build(cfg, build, cfg=mcfg)
     return T.train(m, ds, cfg, run_dir=out, resume=resume,
                    gate_reference=gate_reference)
@@ -686,7 +696,8 @@ def test_resume_refuses_a_different_training_config():
                          hidden_dim=32, dim_feedforward=64, nheads=4, enc_layers=1,
                          dec_layers=1, dropout=0.1)                 # lr differs
         cfg = T.TrainConfig(epochs=None, batch_size=8, seed=3, max_steps=20,
-                            window_steps=5, log_every=0, **mcfg.optimizer_config())
+                            window_steps=5, stop_rule=None, log_every=0,
+                            **mcfg.optimizer_config())
         m = T.seeded_build(cfg, build_act, cfg=mcfg)
         e = _raises(T.TrainError, T.train, m, ds, cfg, run_dir=c,
                     resume=T.Resume(os.path.join(a, "state.pt")))
@@ -716,7 +727,8 @@ def test_a_crash_leaves_the_verdict_and_a_resumable_state():
     try:
         mcfg, build = _tiny_act()
         cfg = T.TrainConfig(epochs=None, batch_size=8, seed=3, max_steps=40,
-                            window_steps=5, log_every=0, **mcfg.optimizer_config())
+                            window_steps=5, stop_rule=None, log_every=0,
+                            **mcfg.optimizer_config())
         m = T.seeded_build(cfg, build, cfg=mcfg)
         seen, calls = {}, {"n": 0}
         real_terms = m.loss_terms
@@ -1035,11 +1047,401 @@ def test_the_scoring_path_is_structurally_separate_from_the_training_loss():
     src = ast.unparse(fn)
     for banned in ("loss_terms", "forward_loss", "actions=", "DataLoader("):
         assert banned not in src, banned
-    assert "model(obs)" in src and "_deployment_guard(model)" in src, src
+    assert "model(obs)" in src and "_DeploymentGuard(model)" in src, src
+    assert "guard.finish(" in src, "the end-of-pass checks must run on every score"
     assert "score_deployment" in inspect.getsource(T.evaluate)
     loop = inspect.getsource(T.train)
     assert loop.count("forward_loss(") == 1, "forward_loss must serve training only"
     assert "_gate(q, gate_reference)" in loop
+
+
+# ═══ The hardened deployment guard (docs/ACT_AUDIT_REPORT.md item 5) ═════════
+# The audit defeated 4 of 6 attacks on the first guard, and measured that a leak
+# moves the gated number by 1.0e-7 - an implausible score would never reveal one.
+# Each test below is the audit's own attack (m5_gate.py), and each FAILS against
+# the pre-hardening guard: it raised on none of these.
+def _guarded_score(model, ds):
+    return T.score_deployment(model, ds, torch.device("cpu"))
+
+
+def _attack_act(cls):
+    mcfg, _ = _tiny_act()
+    torch.manual_seed(0)
+    return cls(mcfg)
+
+
+def _expect_refused(model, ds, *needles):
+    e = _raises(T.ScoringError, _guarded_score, model, ds)
+    for s in needles:
+        assert s in str(e), (s, str(e))
+    return e
+
+
+def _with_act_data(fn):
+    got = _tiny_k(K=5, n_eps=1, n_ticks=20)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    try:
+        fn(ds)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_guard_refuses_a_latent_that_is_not_the_prior_mean():
+    """Audit attack 1: z drawn at inference. Also a DETERMINISTIC non-zero z, so
+    the refusal is the z check itself, not only the RNG check."""
+    from g1_model.act import ACTPolicy
+
+    class SamplePrior(ACTPolicy):
+        def forward(self, obs, actions=None, action_mask=None):
+            if actions is None:
+                z = torch.randn(obs.shape[0], self.cfg.latent_dim) * 50
+                return self.action_head(self._decode(obs, self.latent_out_proj(z)))
+            return super().forward(obs, actions, action_mask)
+
+    class FixedNonzero(ACTPolicy):
+        def forward(self, obs, actions=None, action_mask=None):
+            if actions is None:
+                z = torch.full((obs.shape[0], self.cfg.latent_dim), 0.5)
+                return self.action_head(self._decode(obs, self.latent_out_proj(z)))
+            return super().forward(obs, actions, action_mask)
+
+    def run(ds):
+        _expect_refused(_attack_act(SamplePrior), ds, "not the prior mean")
+        _expect_refused(_attack_act(FixedNonzero), ds, "not the prior mean", "5.000e-01")
+    _with_act_data(run)
+
+
+def test_guard_refuses_the_encoder_called_through_forward():
+    """Audit attack 2: `.forward()` skips pre-hooks. The guard now replaces the
+    forward of every target-reading module AND its submodules on the instance."""
+    from g1_model.act import ACTPolicy
+
+    class BypassHook(ACTPolicy):
+        def forward(self, obs, actions=None, action_mask=None):
+            if actions is None:
+                src = torch.zeros(self.cfg.chunk_size + 2, obs.shape[0], self.cfg.hidden_dim)
+                self.encoder.forward(src)
+            return super().forward(obs, actions, action_mask)
+
+    class SubmoduleBypass(ACTPolicy):
+        def forward(self, obs, actions=None, action_mask=None):
+            if actions is None:
+                src = torch.zeros(self.cfg.chunk_size + 2, obs.shape[0], self.cfg.hidden_dim)
+                self.encoder.layers[0](src)
+            return super().forward(obs, actions, action_mask)
+
+    def run(ds):
+        _expect_refused(_attack_act(BypassHook), ds, "reads the target")
+        _expect_refused(_attack_act(SubmoduleBypass), ds, "reads the target")
+    _with_act_data(run)
+
+
+def test_guard_refuses_functional_use_of_the_encoder_weights():
+    """No module call at all: an encoder WEIGHT read directly into the output.
+    The NaN probe catches it because the output then depends on it."""
+    from g1_model.act import ACTPolicy
+
+    class FunctionalLeak(ACTPolicy):
+        def forward(self, obs, actions=None, action_mask=None):
+            out = super().forward(obs, actions, action_mask)
+            if actions is None:                         # weights, no module call
+                out = out + 1e-3 * self.encoder_action_proj.weight.mean()
+            return out
+
+    _with_act_data(lambda ds: _expect_refused(
+        _attack_act(FunctionalLeak), ds, "depends on the weights"))
+
+
+def test_guard_refuses_functional_dropout():
+    """Audit attack 3: F.dropout(training=True) has no module whose mode could be
+    checked. It draws randomness, and the probe batch no longer reproduces."""
+    from g1_model.act import ACTPolicy
+    import torch.nn.functional as F
+
+    class FunctionalDropout(ACTPolicy):
+        def forward(self, obs, actions=None, action_mask=None):
+            out = super().forward(obs, actions, action_mask)
+            return F.dropout(out, 0.5, training=True) if actions is None else out
+
+    _with_act_data(lambda ds: _expect_refused(_attack_act(FunctionalDropout), ds))
+
+
+def test_guard_refuses_a_target_stashed_during_training():
+    """Audit attack 4: `loss_terms` caches the target, `forward(obs)` returns it -
+    it scored 0.000000 against the old guard. A tensor living on a module outside
+    its parameters and buffers is refused before scoring starts."""
+    from g1_model.act import ACTPolicy
+
+    class Stash(ACTPolicy):
+        def loss_terms(self, obs, target, pad_mask, dim_mask=None):
+            self._stash = target.detach()
+            return super().loss_terms(obs, target, pad_mask, dim_mask)
+
+        def forward(self, obs, actions=None, action_mask=None):
+            st = getattr(self, "_stash", None)
+            if actions is None and st is not None and st.shape[0] == obs.shape[0]:
+                return st
+            return super().forward(obs, actions, action_mask)
+
+    def run(ds):
+        m = _attack_act(Stash)
+        b = T.collate_chunks([ds[i] for i in range(len(ds))])
+        with torch.no_grad():
+            m.loss_terms(b["obs"], b["action"], b["action_mask"])
+        _expect_refused(m, ds, "_stash")
+    _with_act_data(run)
+
+
+def test_guard_requires_every_forward_to_pass_a_verified_latent():
+    """A forward that builds its latent token without the declared module (so z
+    could be anything) cannot have z = 0 verified, and is refused."""
+    from g1_model.act import ACTPolicy
+
+    class Unverifiable(ACTPolicy):
+        def forward(self, obs, actions=None, action_mask=None):
+            if actions is None:
+                z = torch.zeros(obs.shape[0], self.cfg.latent_dim)
+                lat = torch.nn.functional.linear(z, self.latent_out_proj.weight,
+                                                 self.latent_out_proj.bias)
+                return self.action_head(self._decode(obs, lat))
+            return super().forward(obs, actions, action_mask)
+
+    _with_act_data(lambda ds: _expect_refused(
+        _attack_act(Unverifiable), ds, "could not be verified"))
+
+
+def test_a_cvae_that_does_not_declare_its_latent_entry_is_refused():
+    from g1_model.act import ACTPolicy
+
+    class NoPrior(ACTPolicy):
+        PRIOR_LATENT_MODULES = ()
+
+    _with_act_data(lambda ds: _expect_refused(
+        _attack_act(NoPrior), ds, "PRIOR_LATENT_MODULES"))
+
+
+# ── state carried between calls: built BEFORE ACT-LSTM, which could do this ──
+class _RecurrentBC(BCPolicy):
+    """The un-reset ACT-LSTM bug in miniature: an LSTM whose (h, c) is kept on
+    the module and carried from call to call, never reset per episode."""
+
+    def __init__(self, **kw):
+        super().__init__(obs_window=1, chunk_size=1, **kw)
+        self.lstm = torch.nn.LSTM(spec.STATE_DIM, spec.STATE_DIM)
+        self.hc = None
+
+    def forward(self, obs):
+        x = obs.reshape(1, obs.shape[0], -1)
+        y, (h, c) = self.lstm(x, self.hc) if self.hc is not None else self.lstm(x)
+        self.hc = (h.detach(), c.detach())
+        return super().forward(y.reshape(obs.shape[0], 1, -1))
+
+
+def test_guard_refuses_a_recurrent_state_left_over_from_training():
+    """The case the user named: state carried INTO scoring. A hidden state left
+    by the last training batch is refused before a single prediction."""
+    def run(ds):
+        torch.manual_seed(0)
+        m = _RecurrentBC()
+        m(torch.zeros(4, 1, spec.STATE_DIM))          # "training" leaves (h, c)
+        _expect_refused(m, ds, "holds state outside its parameters", "hc")
+    _with_bc_data(run)
+
+
+def test_guard_refuses_a_recurrent_state_created_during_scoring():
+    """Starts clean, carries state across the scoring batches: the first batch no
+    longer reproduces after the pass."""
+    def run(ds):
+        torch.manual_seed(0)
+        _expect_refused(_RecurrentBC(), ds, "carried state between calls")
+    _with_bc_data(run)
+
+
+def test_guard_refuses_state_kept_in_a_registered_buffer():
+    """State hidden in a registered buffer, updated in place: the weights
+    fingerprint moves. (The probe batch catches it too; either is enough.)"""
+    class BufferState(BCPolicy):
+        def __init__(self):
+            super().__init__(obs_window=1, chunk_size=1)
+            self.register_buffer("h", torch.zeros(spec.STATE_DIM))
+
+        def forward(self, obs):
+            out = super().forward(obs + self.h)
+            self.h.add_(obs.mean(dim=(0, 1)))
+            return out
+
+    def run(ds):
+        torch.manual_seed(0)
+        _expect_refused(BufferState(), ds)
+    _with_bc_data(run)
+
+
+def test_guard_refuses_state_kept_outside_the_module():
+    """State in a closure, invisible to any scan of the module: only behaviour
+    can show it, and the probe batch does."""
+    memory = {"n": 0}
+
+    class ClosureState(BCPolicy):
+        def forward(self, obs):
+            memory["n"] += 1
+            return super().forward(obs) + 1e-3 * memory["n"]
+
+    def run(ds):
+        torch.manual_seed(0)
+        _expect_refused(ClosureState(obs_window=1, chunk_size=1), ds,
+                        "carried state between calls")
+    _with_bc_data(run)
+
+
+def _with_bc_data(fn):
+    got = _tiny(n_eps=1, n_ticks=20)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    try:
+        fn(ds)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_honest_models_pass_the_hardened_guard_unchanged():
+    """The guard must cost an honest model nothing: same score as a manual
+    eval-mode pass, weights bit-identical afterwards (the NaN probe restores
+    them), no RNG drawn, and the caller's train/eval mode restored."""
+    from g1_model.act import build_act
+
+    def check(m, ds):
+        before = {k: v.clone() for k, v in m.state_dict().items()}
+        m.train()
+        rng = (torch.get_rng_state().clone(), np.random.get_state()[1].copy())
+        q = _guarded_score(m, ds).value
+        assert m.training, "the caller's mode must be restored"
+        assert torch.equal(rng[0], torch.get_rng_state())
+        assert np.array_equal(rng[1], np.random.get_state()[1])
+        for k, v in m.state_dict().items():
+            assert torch.equal(v, before[k]), "weight %s changed by scoring" % k
+        assert abs(q - _manual_eval_l1(m, ds)) < 1e-6
+
+    def act(ds):
+        mcfg, _ = _tiny_act()
+        torch.manual_seed(0)
+        check(build_act(cfg=mcfg), ds)
+    _with_act_data(act)
+    _with_bc_data(lambda ds: check(_dropout_bc(), ds))
+
+
+# ═══ TR28, third and last: the WHOLE loop config has a stated source ═════════
+def test_every_train_config_field_is_classified():
+    import dataclasses
+    names = {f.name for f in dataclasses.fields(T.TrainConfig)}
+    assert set(T.TRAIN_CONFIG_FIELDS) == names, (
+        "unclassified: %s; stale: %s" % (sorted(names - set(T.TRAIN_CONFIG_FIELDS)),
+                                         sorted(set(T.TRAIN_CONFIG_FIELDS) - names)))
+    for f in dataclasses.fields(T.TrainConfig):
+        cat, why = T.TRAIN_CONFIG_FIELDS[f.name]
+        assert cat in ("model", "run", "environment", "plumbing") and why, f.name
+        if cat == "model":
+            assert f.default is dataclasses.MISSING, "%s is a model field with a default" % f.name
+        if cat == "run":
+            assert f.default in (dataclasses.MISSING, None, T.UNSTATED), (
+                "%s is a run field with a real default %r" % (f.name, f.default))
+            if f.default is None:        # the budget pair: exactly one must be given
+                assert f.name in ("epochs", "max_steps"), f.name
+
+
+def test_every_model_declares_exactly_the_model_fields():
+    from g1_model.act import ACTConfig, build_act
+    want = set(T.MODEL_DECLARED_FIELDS)
+    assert want == {"lr", "weight_decay", "optimizer", "grad_clip"}
+    bc = BCConfig(obs_window=1, chunk_size=1)
+    ac = ACTConfig(obs_window=1, chunk_size=4, lr=1e-5)
+    assert set(bc.optimizer_config()) == want == set(ac.optimizer_config())
+    assert build_bc(cfg=bc).optimizer_config() == bc.optimizer_config()
+    assert build_act(cfg=ac).optimizer_config() == ac.optimizer_config()
+
+
+def test_grad_clip_is_one_value_for_every_model():
+    """Identical across the ladder, from ONE constant, and a model that declares
+    anything else is refused even when its TrainConfig agrees with it."""
+    from g1_model.models import LADDER_GRAD_CLIP
+    from g1_model.act import ACTConfig
+    assert LADDER_GRAD_CLIP == 1.0
+    assert BCConfig(obs_window=1, chunk_size=1).grad_clip == LADDER_GRAD_CLIP
+    assert ACTConfig(obs_window=1, chunk_size=4, lr=1e-5).grad_clip == LADDER_GRAD_CLIP
+    odd = BCConfig(obs_window=1, chunk_size=1, grad_clip=0.5)
+    m = build_bc(cfg=odd)
+    e = _raises(T.OptimizerSourceError, T.make_optimizer, m,
+                T.TrainConfig(epochs=1, batch_size=8, seed=0, **odd.optimizer_config()))
+    assert "ladder invariant" in str(e)
+
+
+def test_grad_clip_mismatch_between_model_and_loop_is_refused():
+    m = build_bc(cfg=BCConfig(obs_window=1, chunk_size=1))
+    cfg = dict(_BC_OPT, grad_clip=0.25)
+    e = _raises(T.OptimizerSourceError, T.make_optimizer, m,
+                T.TrainConfig(epochs=1, batch_size=8, seed=0, **cfg))
+    assert "grad_clip" in str(e)
+
+
+def test_an_undeclared_model_is_refused_not_unchecked():
+    """BC trained a whole stage with no stated source for its optimizer settings,
+    because a model that declared nothing was simply not checked."""
+    bare = BCPolicy(obs_window=1, chunk_size=1)
+    e = _raises(T.OptimizerSourceError, T.make_optimizer, bare,
+                T.TrainConfig(epochs=1, batch_size=8, seed=0, **_BC_OPT))
+    assert "declares no training hyperparameters" in str(e)
+
+    class Partial(BCPolicy):
+        def optimizer_config(self):
+            return dict(lr=1e-3, weight_decay=0.0, optimizer="adamw")
+    e = _raises(T.OptimizerSourceError, T.make_optimizer,
+                Partial(obs_window=1, chunk_size=1),
+                T.TrainConfig(epochs=1, batch_size=8, seed=0, **_BC_OPT))
+    assert "grad_clip" in str(e) and "incomplete" in str(e)
+
+
+def test_step_budget_must_state_its_stop_rule_and_window():
+    kw = dict(epochs=None, batch_size=8, seed=0, max_steps=10, **_BC_OPT)
+    e = _raises(T.TrainError, T.TrainConfig, window_steps=5, **kw)
+    assert "stop_rule" in str(e)
+    e = _raises(T.TrainError, T.TrainConfig, stop_rule=None, **kw)
+    assert "window_steps" in str(e)
+    ok = T.TrainConfig(stop_rule=None, window_steps=5, **kw)
+    assert ok.stop_rule is None and ok.window_steps == 5
+    ep = T.TrainConfig(epochs=1, batch_size=8, seed=0, **_BC_OPT)
+    assert ep.stop_rule is None and ep.window_steps is None
+    _raises(T.TrainError, T.TrainConfig, epochs=1, batch_size=8, seed=0,
+            window_steps=5, **_BC_OPT)
+
+
+def test_every_run_records_where_its_hyperparameters_came_from():
+    """The grad-clip deviation is written into the run's own metadata, with the
+    declared values and the whole field policy."""
+    got = _tiny(n_eps=1, n_ticks=20)
+    if got is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, ds = got
+    out = tempfile.mkdtemp()
+    try:
+        cfg = T.TrainConfig(epochs=1, batch_size=16, seed=0, **_BC_OPT,
+                            run_name="hp", log_every=0)
+        model = T.seeded_build(cfg, build_bc, cfg=BCConfig(obs_window=1, chunk_size=1))
+        T.train(model, ds, cfg, run_dir=out)
+        meta = json.load(open(os.path.join(out, "metadata.json"), encoding="utf-8"))
+        hp = meta["training_hyperparameters"]
+        assert hp["declared"] == _BC_OPT
+        assert hp["ladder_invariants"] == dict(grad_clip=1.0)
+        assert "main.py:20" in hp["disclosed_deviations"]["grad_clip"]
+        assert hp["field_policy"]["grad_clip"] == "model"
+        assert set(hp["field_policy"]) == set(T.TRAIN_CONFIG_FIELDS)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(out, ignore_errors=True)
 
 
 def _tests():

@@ -104,6 +104,42 @@ def _model_config(kind, K, batch, gate):
     raise SystemExit("unknown --model %r (bc|act)" % kind)
 
 
+def observed_dropout(model) -> list:
+    """Every dropout probability the BUILT model contains - `nn.Dropout` modules
+    and the attention-internal dropout of `nn.MultiheadAttention` - read from the
+    module tree itself, not from a config or a comment."""
+    ps = set()
+    for m in model.modules():
+        if isinstance(m, torch.nn.Dropout):
+            ps.add(float(m.p))
+        elif isinstance(m, torch.nn.MultiheadAttention):
+            ps.add(float(m.dropout))
+    return sorted(ps)
+
+
+def regularization_statement(mcfg) -> str:
+    """The run-metadata line on regularization, derived from the model's config.
+
+    It used to be the literal "NONE: dropout 0, weight_decay 0, no augmentation"
+    for EVERY overfit-10 run, and was false for ACT, which keeps its architectural
+    dropout of 0.1 at the gate (docs/ACT_AUDIT_REPORT.md T2). The gate SCORES eval
+    mode, where dropout is off; training is where it acts."""
+    d, wd = float(mcfg.dropout), float(mcfg.weight_decay)
+    if d == 0.0 and wd == 0.0:
+        return "NONE: dropout 0, weight_decay 0, no augmentation"
+    return ("dropout %g (active in TRAINING; the gate scores eval mode, where it is "
+            "off), weight_decay %g, no augmentation" % (d, wd))
+
+
+def assert_regularization_matches(model, mcfg) -> None:
+    """Refuse to start a run whose metadata would misstate the model's dropout."""
+    got = [p for p in observed_dropout(model) if p > 0.0]
+    want = [float(mcfg.dropout)] if float(mcfg.dropout) > 0.0 else []
+    if got != want:
+        raise SystemExit("regularization statement says dropout %r but the built "
+                         "model contains dropout %r" % (mcfg.dropout, got))
+
+
 def _train_config(mcfg, epochs, batch, **kw):
     """A TrainConfig whose optimizer values come from THE MODEL'S OWN config.
 
@@ -113,11 +149,9 @@ def _train_config(mcfg, epochs, batch, **kw):
     budget = kw.pop("_budget", None)
     if budget:
         kw["notes"] = dict(kw.get("notes") or {}, **budget)
-    if isinstance(mcfg, ACTConfig):
-        opt = mcfg.optimizer_config()
-    else:
-        opt = dict(lr=mcfg.lr, weight_decay=mcfg.weight_decay,
-                   optimizer=mcfg.optimizer)
+    # Both configs declare the SAME set of fields (train.MODEL_DECLARED_FIELDS),
+    # grad_clip included; the loop re-checks them against the model (TR28).
+    opt = mcfg.optimizer_config()
     return T.TrainConfig(epochs=None if epochs is None else int(epochs),
                          batch_size=int(batch), **opt, **kw)
 
@@ -220,8 +254,8 @@ def cmd_determinism(a):
     ds = _load(tr[:3], bc, meta, norm_fit_seeds=tr)
     losses = []
     for i in (1, 2):
-        cfg = T.TrainConfig(epochs=3, batch_size=bc.batch_size, lr=bc.lr,
-                            weight_decay=bc.weight_decay, optimizer=bc.optimizer,
+        cfg = T.TrainConfig(epochs=3, batch_size=bc.batch_size,
+                            **bc.optimizer_config(),
                             seed=0, run_name="determinism%d" % i, log_every=0)
         model = T.seeded_build(cfg, build_bc, cfg=bc)
         res = T.train(model, ds, cfg, run_dir=os.path.join(
@@ -325,8 +359,9 @@ def cmd_overfit10(a):
                    ambiguity_reference=ref.as_metadata(),
                    provisional_hyperparameters=PROVISIONAL,
                    data_caveat=T.dataset_provenance(ds)["caveat"],
-                   regularization="NONE: dropout 0, weight_decay 0, no augmentation"))
+                   regularization=regularization_statement(mcfg)))
     model = _make_model(mcfg, cfg)
+    assert_regularization_matches(model, mcfg)
     res = T.train(model, ds, cfg, gate_reference=ref, resume=_resume_arg(a))
     _report(res, res["baselines"], "OVERFIT-10 RESULT (%s)" % name)
 

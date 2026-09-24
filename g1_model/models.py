@@ -47,7 +47,7 @@ Chunked BC is the SAME class at K>1. See `BCPolicy` for why that matters.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -73,6 +73,28 @@ PROVISIONAL = (
 #: ON PILOTED DATA.
 K_PROVISIONAL: int = 100
 
+#: THE gradient-clipping threshold (global L2 norm) for EVERY model in the ladder.
+#: Each model config declares it (`BCConfig.grad_clip`, `ACTConfig.grad_clip`), the
+#: loop checks the declaration against the TrainConfig (`train.assert_optimizer_source`)
+#: and REFUSES a model that declares any other value (`train.LADDER_INVARIANTS`).
+#: It used to arrive as `TrainConfig`'s default - TR28's third occurrence
+#: (docs/ACT_AUDIT_REPORT.md R1). To change it, change it HERE, for every model.
+LADDER_GRAD_CLIP: float = 1.0
+
+#: Written into every run's metadata. The deviation is stated where the numbers go.
+GRAD_CLIP_DISCLOSURE = (
+    "DISCLOSED DEVIATION FROM THE ACT REFERENCE: every model clips gradients to a "
+    "global L2 norm of %.1f. The reference never clips: `--clip_max_norm 0.1` is "
+    "marked '# not used' (reference/act/detr/main.py:20) and reference/act contains "
+    "no clip_grad_norm_ call. MEASURED (docs/ACT_AUDIT_REPORT.md R1): the norm is ~678 "
+    "at ACT's initialisation and median 1.35 at the converged ACT gate weights, above "
+    "the threshold on 19 of 20 batches - the clip is active throughout training, not a "
+    "safety net. KEPT, identically for every model, because (1) ACT's passing "
+    "overfit-10 gate already used it, (2) recurrent models are where clipping matters "
+    "most, and (3) a clip that differed between ACT and ACT-LSTM would sit inside the "
+    "headline RQ3 comparison: identical-across-models matters more here than matching "
+    "the reference." % LADDER_GRAD_CLIP)
+
 
 @dataclass(frozen=True)
 class BCConfig:
@@ -95,13 +117,22 @@ class BCConfig:
     dropout: float = 0.0         # the overfit-10 gate must NOT be regularized
     layer_norm: bool = False
 
-    # training, for the record; consumed by tools/train_bc.py
+    # training. DECLARED by the model (`optimizer_config`, attached by `build_bc`)
+    # and checked against the TrainConfig, as ACT's are (TR28).
     lr: float = 1e-3
     weight_decay: float = 0.0
     batch_size: int = 256
     optimizer: str = "adamw"
+    #: The ladder's one value; see LADDER_GRAD_CLIP and GRAD_CLIP_DISCLOSURE.
+    grad_clip: float = LADDER_GRAD_CLIP
 
     provisional: str = PROVISIONAL
+
+    def optimizer_config(self) -> dict:
+        """The training hyperparameters BC declares for itself (TR28). Exactly
+        `train.MODEL_DECLARED_FIELDS`; the loop refuses a partial declaration."""
+        return dict(lr=float(self.lr), weight_decay=float(self.weight_decay),
+                    optimizer=str(self.optimizer), grad_clip=float(self.grad_clip))
 
     def as_metadata(self) -> dict:
         d = asdict(self)
@@ -162,6 +193,22 @@ class BCPolicy(nn.Module):
             d = h
         layers.append(nn.Linear(d, self.chunk_size * spec.ACTION_DIM))
         self.net = nn.Sequential(*layers)
+        #: Set by `build_bc` from a BCConfig. A BCPolicy built from bare keyword
+        #: arguments (a checkpoint being loaded for scoring) declares nothing, and
+        #: `train.make_optimizer` refuses to train it: it has no stated source for
+        #: its learning rate, weight decay, optimizer or clip.
+        self._declared_training: Optional[dict] = None
+
+    def declare_training(self, optimizer_config: dict) -> "BCPolicy":
+        """Attach the training hyperparameters this model is trained with. A
+        declaration, not a change to the forward pass."""
+        self._declared_training = dict(optimizer_config)
+        return self
+
+    def optimizer_config(self) -> Optional[dict]:
+        """Hook read by `train.make_optimizer`; None when nothing was declared."""
+        return (None if self._declared_training is None
+                else dict(self._declared_training))
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         """(B, W_o, 47) -> (B, K, 22)."""
@@ -201,5 +248,6 @@ def build_bc(cfg: BCConfig = None, **kw) -> BCPolicy:
     if cfg is not None:
         return BCPolicy(obs_window=cfg.obs_window, chunk_size=cfg.chunk_size,
                         hidden=cfg.hidden, activation=cfg.activation,
-                        dropout=cfg.dropout, layer_norm=cfg.layer_norm)
+                        dropout=cfg.dropout, layer_norm=cfg.layer_norm
+                        ).declare_training(cfg.optimizer_config())
     return BCPolicy(**kw)

@@ -23,7 +23,9 @@ record the divergence and ask Charles. A drift from an OBJECTIVE, not a method, 
 **None. Phase numbers are PLAN.md's** (P3 recorder, P4 model code, P5 pilot); the model code was built ahead of its data, and PLAN.md
 says why. **P1–P3 CLOSED.** P3's open-loop replay reproduces the manipulation channel on 5 scripted episodes; the locomotion channel
 cannot be replayed open loop by any recorder (`NOTES.md` 2026-09-16). **P4 in progress:** BC, chunked BC and state-only ACT all pass the
-overfit-10 gate (§8 2026-09-22). **Next: ACT-LSTM, the `use_lstm` flag on the SAME class** (`g1_model/act.py`). **Every model result so far
+overfit-10 gate (§8 2026-09-22), and an independent audit found ACT **is** ACT but not trained as the reference trains it (§8 2026-09-23).
+**Next: ACT-LSTM, the `use_lstm` flag on the SAME class** (`g1_model/act.py`) — and the gate now REFUSES carried state, so it needs an
+explicit per-episode scoring protocol before it can be gated. **Every model result so far
 is on SCRIPTED data — no piloted episode exists** (`data/raw/` is empty), so O31 and O32 stay open until P5.
 
 **P5 pilot has not started.** It must settle D12: the grasp worked free-based on 2026-09-15, so D12 may bind only the scripted demonstrator
@@ -37,7 +39,7 @@ evaluation harness, not yet built, must start its episodes through the same rese
 [EXISTS] WELD grasp (D11) + base lock (D12) + B-prime exclusion (D18) + seeded spawn; teleop under stepped physics, full task by a live operator
 [EXISTS] scripted demonstrator (g1_data/scripted_demo.py) 12/12 and 40/40; g1_data/spec.py frozen at g1-spec-1.1.0
 [EXISTS] recorder @25 Hz -> success detection -> offline phase labels -> dataset -> loader -> shared train loop + masked-L1 loss -> neighbour-ambiguity gate -> BC and chunked BC (ONE class, K=1 vs K>1): g1_data/{recorder,success,phase_label,dataset}.py + g1_model/{loader,train,ambiguity,models}.py
-[EXISTS] ACT, state-only, one decoder layer; overfit-10 PASS 0.920 on scripted data: g1_model/act.py
+[EXISTS] ACT, state-only, one decoder layer (bit-identical to the reference's 7, audit 2026-09-23); overfit-10 PASS 0.920 on scripted data: g1_model/act.py
 [MISSING] ACT-LSTM (the `use_lstm` flag on the SAME class) -> autonomous deployment -> Exp 1 in-distribution, Exp 2 held-out patch
 ```
 
@@ -101,6 +103,31 @@ D6, D7, **D12** and **D18** touch **objectives**, not just methods. D6/D7 are re
 
 Older entries are one line; detail is in `NOTES.md` under the same date. Retired entries (§14) keep a one-line pointer.
 
+- 2026-09-23 — **ACT AUDIT VERDICT: the model IS ACT; the training is NOT the reference's; on scripted data the trained model behaves
+  like chunked BC.** Independent audit against `reference/act@742c753c` and arXiv 2304.13705v1 (`docs/ACT_AUDIT_REPORT.md`, with
+  `docs/ACT_AUDIT.md` — the RECORD, never edit either). Measured against the reference's OWN `transformer.py`: outputs, latents, both loss
+  formulas and every gradient bit-identical; the latent reaches the decoder, the encoder never runs at inference, padding is masked.
+  Training differs: grad clip (below), CVAE-encoder init (xavier vs torch default, correspondence row 27), the norm floor (O33), model
+  selection (row 44). **The CVAE is inert on scripted data:** |mu| ≤ 1.07e-3, and feeding the encoder the TARGET moves the gated number
+  from 0.041081069 to 0.041081172 — nothing the gate measures depends on the CVAE. RQ2 cannot be answered on scripted data (O32).
+- 2026-09-23 — **The deployment guard is structural** (`train._DeploymentGuard`). The audit defeated 4 of 6 attacks on the old one. Now:
+  z verified EXACTLY 0 at the declared latent entry (`PRIOR_LATENT_MODULES`) on every call; target-reading modules' `forward` replaced on
+  the instance (`.forward()` no longer bypasses) plus a NaN probe on their weights; no RNG may advance; the first batch must re-score
+  bit-identically after the pass; no tensor may live outside parameters/buffers; weights may not change. **The carried-state detector
+  was built BEFORE ACT-LSTM**: an un-reset hidden state is refused (TR31). Each attack is a test that fails against the old guard. All
+  gated numbers reproduce exactly under it (ACT 0.041081068614, BC 0.009511569189, chunked BC 0.042570259620).
+- 2026-09-23 — **Grad clip 1.0 KEPT as a LADDER INVARIANT, disclosed.** The reference never clips (`detr/main.py:20` "# not used"); ours
+  is active on 19/20 batches at convergence. Kept because ACT's passing gate used it, recurrent models are where clipping matters most,
+  and a clip differing between ACT and ACT-LSTM would sit inside the headline comparison. ONE constant (`models.LADDER_GRAD_CLIP`),
+  declared by every model config, refused if different, written into every run's metadata (`GRAD_CLIP_DISCLOSURE`).
+- 2026-09-23 — **TR28 closed for the whole loop config, not one field.** Every `TrainConfig` field is classified (`TRAIN_CONFIG_FIELDS`,
+  test-enforced: model / run / environment / plumbing). Model fields (lr, weight_decay, optimizer, grad_clip) have no default and must
+  equal the model's declaration; run fields have none (stop_rule/window_steps must be STATED in a step budget). **BC now declares** — it
+  never did, so BC's optimizer settings were unchecked for all of Stage 3; an undeclared or partial declaration is refused. Loop defaults
+  that had been reaching models: grad_clip 1.0, weight_decay 0.0, optimizer adamw, seed 0, window_steps 1000, stop_rule None.
+- 2026-09-23 — **Run records corrected, not rewritten.** All 4 ACT overfit-10 runs said "NONE: dropout 0"; ACT trained with 0.1 (eval-mode
+  gate, so no number changes). Corrected in `metadata.json` and in every checkpoint's embedded config, verified that nothing else differs;
+  all 8 runs gained the grad-clip disclosure; each carries a `corrections` entry saying what changed and what did not.
 - 2026-09-22 — **ACT PASSES the overfit-10 gate: 0.041081 / 0.044657 = 0.920** (converged, 195k steps, lr 1e-5, beta 10, one decoder
   layer). It had "failed" at 1.140 because the gate scored a TRAIN-MODE window mean, with dropout 0.1 on and the weights moving; ALL of the
   gap is dropout (z = posterior vs 0 moves < 2e-4). **The gate AND best.pt now use ONE quantity, `train.score_deployment`**: final weights,
@@ -227,6 +254,12 @@ Older entries are one line; detail is in `NOTES.md` under the same date. Retired
 - **TR30.** Gating on a TRAIN-MODE number. The window mean of per-step losses carries dropout, a posterior z that read the target, and
   moving weights: right units, wrong measurement (TR29's family). Converged ACT read 1.140 FAIL, deployed 0.920 PASS. Score only through
   `train.score_deployment`; `gate()` refuses anything else. Eval-mode `loss_terms` was NOT enough: it still fed the encoder the target.
+- **TR31.** Expecting a leak to announce itself as an implausibly good score. On the converged ACT gate weights the encoder-fed-the-target
+  path scores **1.0e-7** from the deployed one; a stashed target scored a perfect 0.000000 and was still NOT caught by the old guard. Only
+  STRUCTURAL checks count — what the model does at scoring, never what it scores. `docs/ACT_AUDIT_REPORT.md` item 5.
+- **TR32.** Verifying a port against itself. The one-decoder-layer test compared the implementer's 1-layer decoder with the implementer's
+  7-layer decoder, so an error in the shared port passes both. The claim HELD when re-measured against the reference's own
+  `transformer.py`; the test could not have shown otherwise. An equivalence claim runs the REFERENCE's code on one side.
 
 ## 10. Known open issues
 
@@ -260,9 +293,14 @@ Older entries are one line; detail is in `NOTES.md` under the same date. Retired
   (TR16). **Qualified 2026-09-15:** measured with the capped scripted station-keeper; a human at full command overcame it (§8).
 - **O32. NEW — prediction: the ACT latent is ACTIVE on piloted data.** Scripted: KL 1e-05, z inert (§8 2026-09-22). Predicted on teleop:
   KL stays above zero and the z = 0 vs posterior-mean gap opens. If it collapses there too, beta (10; balance-matched 14.70) is the suspect.
+- **O33. NEW — normalization std floor: ours 1e-6, the reference's 1e-2** (`spec.py` `STD_FLOOR`; `reference/act/utils.py:97,102`).
+  On the scripted train split 4 STATE dims fall below 1e-2 — 9 base z (0.0087), 43 right wrist (0.0020), 44–45 waist (0.0030, 0.0069),
+  all pinned — so their jitter is z-scored up to **4.9×** harder than the reference would; no action dim is affected. RECORDED, NOT FIXED:
+  normalization is regenerated from piloted data, and this **must be decided BEFORE norm stats are fitted on real episodes** (D14's hazard).
 - **O6.** Dead code: `gating.py`, `GatingConfig`, `TorsoYawConfig`, `IKConfig.neutral_weight`/`.target_deadzone`, `set_waist_yaw`,
   `ZEDConfig.camera_fps` (O29); `RejectReason` survives for `NAN`. **O7.** Stale docs: README claims torso-yaw following and active gating;
-  `config.py` says locomotion is "not yet built"; `test/*.py` is stale. Resolved issues (O10, O12, O14–O16, O18, O20–O24): `NOTES.md` "2026-09-22 — CLAUDE.md §8 ARCHIVE".
+  `config.py` says locomotion is "not yet built"; `test/*.py` is stale; `docs/ACT_CORRESPONDENCE.md` rows 18/22 still read UNRESOLVED and
+  row 36 "decision required", though the code decided (`act.py` `DEC_LAYERS = 1`, `LR = 1e-5`). Resolved issues (O10, O12, O14–O16, O18, O20–O24): `NOTES.md` "2026-09-22 — CLAUDE.md §8 ARCHIVE".
 
 ## 11. File and module structure
 
@@ -272,6 +310,9 @@ Full listing in `NOTES.md`. Only the entries that carry a decision live here:
   episode starts; **read its docstring before adding per-episode state**; it also enforces the D18 contact contract.
 - `g1_teleop/grasp.py` — **its thresholds are the grasp contract**. `g1_teleop/base_lock.py` (D12) — its docstring holds the measured `eq_data`
   layout (TR17). `g1_teleop/contact_contract.py` (D18) — the setting, the compiled-model check and the runtime toggle.
+- `docs/ACT_AUDIT.md` + `docs/ACT_AUDIT_REPORT.md` — the ACT audit checklist and its report: **the record, never edit**; act on them
+  elsewhere. `docs/ACT_CORRESPONDENCE.md` — row-by-row reference table. `g1_model/train.py` `_DeploymentGuard` — the gate's ONLY defence
+  against a leak (TR31); read its attack table before touching scoring.
 - `locomotion_input.py` — **do not delete**: `PelvisVelocity` is the evidence for D6. `g1_teleop/gating.py` — DEAD, kept for `RejectReason` (O6).
 - `tools/` — `record_keypoints.py`, `analyze_keypoints.py`, `teleop_physics_check.py`, `teleop_throughput.py`, `bprime_validate.py`,
   `plot_platform_regions.py`. `../docs/Thesis_Proposal.pdf` — Ch.3 at PDF pages 33–56. `../NOTES.md` — overflow for this file.
