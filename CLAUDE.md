@@ -299,8 +299,7 @@ Older entries are one line; detail is in `NOTES.md` under the same date. Retired
   normalization is regenerated from piloted data, and this **must be decided BEFORE norm stats are fitted on real episodes** (D14's hazard).
 - **O6.** Dead code: `gating.py`, `GatingConfig`, `TorsoYawConfig`, `IKConfig.neutral_weight`/`.target_deadzone`, `set_waist_yaw`,
   `ZEDConfig.camera_fps` (O29); `RejectReason` survives for `NAN`. **O7.** Stale docs: README claims torso-yaw following and active gating;
-  `config.py` says locomotion is "not yet built"; `test/*.py` is stale; `docs/ACT_CORRESPONDENCE.md` rows 18/22 still read UNRESOLVED and
-  row 36 "decision required", though the code decided (`act.py` `DEC_LAYERS = 1`, `LR = 1e-5`). Resolved issues (O10, O12, O14–O16, O18, O20–O24): `NOTES.md` "2026-09-22 — CLAUDE.md §8 ARCHIVE".
+  `config.py` says locomotion is "not yet built"; `test/*.py` is stale. (`docs/ACT_CORRESPONDENCE.md` rows 18/22/36 resolved 2026-09-25.) Resolved issues (O10, O12, O14–O16, O18, O20–O24): `NOTES.md` "2026-09-22 — CLAUDE.md §8 ARCHIVE".
 
 ## 11. File and module structure
 
