@@ -28,6 +28,7 @@ Controls (focus the MuJoCo window):
 Setup: edit POLICY_PATH and SCENE_PATH below.
 Run:   python walk_test.py
 """
+import os
 import time
 import numpy as np
 import mujoco
@@ -37,8 +38,13 @@ import torch
 from g1_teleop.indices import ModelIndex
 
 # ── Paths (EDIT THESE) ────────────────────────────────────────────────────────
-POLICY_PATH = r"D:\Charles_Aninon\Thesis Project\unitree_rl_gym\deploy\pre_train\g1\motion.pt"
-SCENE_PATH = r"D:\Charles_Aninon\Thesis Project\scene.xml"
+# G1_POLICY_PATH overrides the policy path per machine; unset keeps the original.
+POLICY_PATH = os.environ.get(
+    "G1_POLICY_PATH",
+    r"D:\Charles_Aninon\Thesis Project\unitree_rl_gym\deploy\pre_train\g1\motion.pt")
+# G1_SCENE_PATH overrides the scene path per machine; unset keeps the original.
+SCENE_PATH = os.environ.get(
+    "G1_SCENE_PATH", r"D:\Charles_Aninon\Thesis Project\scene.xml")
 
 # ── Policy config (from unitree_rl_gym deploy/deploy_mujoco/configs/g1.yaml) ──
 SIM_DT = 0.002

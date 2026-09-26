@@ -58,6 +58,7 @@ Test fixtures, no camera:
 """
 import argparse
 import dataclasses
+import os
 import sys
 import threading
 import time
@@ -83,8 +84,13 @@ from g1_data.phases import LockConfig, LockPredicate, PlatformGeometry
 from locomotion_input import PelvisVelocity, LeanJoystick, KeyboardCommand
 
 # ── Paths (EDIT THESE) ────────────────────────────────────────────────────────
-POLICY_PATH = r"D:\Charles_Aninon\Thesis Project\unitree_rl_gym\deploy\pre_train\g1\motion.pt"
-SCENE_PATH = r"D:\Charles_Aninon\Thesis Project\scene.xml"
+# G1_POLICY_PATH overrides the policy path per machine; unset keeps the original.
+POLICY_PATH = os.environ.get(
+    "G1_POLICY_PATH",
+    r"D:\Charles_Aninon\Thesis Project\unitree_rl_gym\deploy\pre_train\g1\motion.pt")
+# G1_SCENE_PATH overrides the scene path per machine; unset keeps the original.
+SCENE_PATH = os.environ.get(
+    "G1_SCENE_PATH", r"D:\Charles_Aninon\Thesis Project\scene.xml")
 
 # ── Display ───────────────────────────────────────────────────────────────────
 PANEL_H = 620
