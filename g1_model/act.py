@@ -4,8 +4,9 @@ WHAT THIS ADDS, AND ONLY THIS
 -----------------------------
 The ladder adds one thing per rung: BC -> chunked BC adds chunking, chunked BC ->
 ACT adds the CVAE, ACT -> ACT-LSTM adds recurrence. So everything here that is
-not the CVAE must be the same as chunked BC's setting: W_o = 1, K = 100, the same
-loader, the same `train.masked_l1`, the same loop. What ACT contributes is the
+not the CVAE must be the same as chunked BC's setting: the same W_o (12 for every
+model, CLAUDE.md §8 2026-09-27), K = 100, the same loader, the same
+`train.masked_l1`, the same loop. What ACT contributes is the
 style variable z and the transformer that consumes it.
 
 THE REFERENCE, AND WHAT WAS DROPPED
@@ -332,11 +333,13 @@ class ACTConfig:
     W_o is the parameter that could hand the transformer the history ACT-LSTM is
     meant to supply. Neither may be inherited silently.
 
-    W_o = 1 is not a compromise, it is the reference: ACT's observation is a
-    single timestep (`utils.py:37`, `detr_vae.py:80`).
+    The reference's observation is a single timestep (`utils.py:37`,
+    `detr_vae.py:80`). We run W_o = 12, the window EVERY model shares (CLAUDE.md
+    §8 2026-09-27; correspondence row 53, ADAPTED); 1 remains valid and
+    reproduces the reference's observation.
     """
 
-    obs_window: int                 # required; 1 to match the reference
+    obs_window: int                 # required; 12 shared by every model, 1 = reference
     chunk_size: int                 # required; K = number of decoder queries
     #: REQUIRED, no default (TR28). ACT's published value is `LR` = 1e-5; the
     #: field is left unset so that a caller who does not think about it gets a

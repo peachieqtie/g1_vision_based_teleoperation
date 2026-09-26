@@ -1,7 +1,7 @@
 """Train BC: the overfit-10 gate, and the full train/val plumbing check.
 
-    python tools/train_bc.py overfit10   [--epochs 300] [--chunk 1]
-    python tools/train_bc.py full        [--epochs 100] [--chunk 1]
+    python tools/train_bc.py overfit10   [--epochs 300] [--chunk 1] [--obs-window 12]
+    python tools/train_bc.py full        [--epochs 100] [--chunk 1] [--obs-window 12]
     python tools/train_bc.py baselines
     python tools/train_bc.py determinism
     python tools/train_bc.py wo-curve    [--windows 1,2,4,8,16,32]
@@ -66,17 +66,19 @@ def _tracking_policy() -> TrackingPolicy:
                           max_degraded_fraction=None)
 
 
-def _load(seeds, bc: BCConfig, norm_meta, norm_fit_seeds=None) -> ChunkDataset:
+def _load(seeds, mcfg, norm_meta, norm_fit_seeds=None) -> ChunkDataset:
+    """The loader shape comes from the MODEL's own config (BCConfig or ACTConfig),
+    so the window the loader cuts is the window the model was built for."""
     st, ac, meta = DS.load_norm_stats()
     return ChunkDataset.from_directory(
         DS.SYNTHETIC,
-        LoaderConfig(chunk_size=bc.chunk_size, obs_window=bc.obs_window,
+        LoaderConfig(chunk_size=mcfg.chunk_size, obs_window=mcfg.obs_window,
                      tracking=_tracking_policy()),
         st, ac, norm_meta if norm_meta else None, seeds=seeds,
         norm_fit_seeds=norm_fit_seeds)
 
 
-def _model_config(kind, K, batch, gate):
+def _model_config(kind, K, W, batch, gate):
     """Each model STATES its own optimizer settings (TR28).
 
     The runner shares the training LOOP. It never shares a hyperparameter source:
@@ -88,9 +90,12 @@ def _model_config(kind, K, batch, gate):
     `gate=True` means the overfit-10 gate, which is UNREGULARISED BY DESIGN for
     every model: weight decay 0 and dropout 0 for BC, weight decay 0 for ACT.
     That is stated here for each model rather than forced from outside.
+
+    `W` is the observation window, shared by every model (CLAUDE.md §8
+    2026-09-27): it comes from --obs-window, never from another model's config.
     """
     if kind == "bc":
-        return BCConfig(obs_window=1, chunk_size=K, batch_size=int(batch),
+        return BCConfig(obs_window=int(W), chunk_size=K, batch_size=int(batch),
                         **(dict(dropout=0.0, weight_decay=0.0) if gate else {}))
     if kind == "act":
         from g1_model.act import LR as ACT_LR, WEIGHT_DECAY as ACT_WD
@@ -99,7 +104,7 @@ def _model_config(kind, K, batch, gate):
         # for every model. Dropout stays at ACT's 0.1 (main.py:43): it is part of
         # the architecture and was 0.1 in the lr-1e-3 run too, so changing it
         # would change a second variable.
-        return ACTConfig(obs_window=1, chunk_size=K, lr=ACT_LR,
+        return ACTConfig(obs_window=int(W), chunk_size=K, lr=ACT_LR,
                          weight_decay=0.0 if gate else ACT_WD)
     raise SystemExit("unknown --model %r (bc|act)" % kind)
 
@@ -311,12 +316,11 @@ def cmd_overfit10(a):
     prediction target changed.
     """
     K = int(a.chunk)
-    mcfg = _model_config(a.model, K, a.batch, gate=True)
-    bc = BCConfig(obs_window=1, chunk_size=K)       # loader shape only; W_o, K
+    mcfg = _model_config(a.model, K, a.obs_window, a.batch, gate=True)
     tr, _ = _splits()
     seeds = tr[:10]
     st, ac, meta = DS.load_norm_stats()
-    ds = _load(seeds, bc, meta, norm_fit_seeds=tr)
+    ds = _load(seeds, mcfg, meta, norm_fit_seeds=tr)
     name = ("ACT (K=%d)" % K if a.model == "act"
             else "BC" if K == 1 else "CHUNKED BC (K=%d)" % K)
     _banner(ds, "OVERFIT-10 GATE: %s on %d episodes, seeds %s"
@@ -329,13 +333,13 @@ def cmd_overfit10(a):
 
     print("")
     print("  computing the neighbour-ambiguity reference for W_o=%d, K=%d ..."
-          % (bc.obs_window, K))
+          % (mcfg.obs_window, K))
     ref = AMB.neighbour_ambiguity(ds, device=T.select_device())
     print("  %s" % ref.cite())
 
     cfg = _train_config(
         mcfg, a.epochs, a.batch, seed=0,
-        run_name="%s_overfit10_K%d" % (a.model, K),
+        run_name="%s_overfit10_K%d_W%d" % (a.model, K, mcfg.obs_window),
         log_every=max(1, int(a.epochs) // 20) if a.epochs else 1,
         _budget=_budget(a, ds), **_step_kwargs(a),
         notes=dict(gate="overfit-10", chunk_size=K, model=a.model,
@@ -384,12 +388,11 @@ def cmd_overfit10(a):
 def cmd_full(a):
     """Part B: the 32/8 split, deferred from Stage 2. A PLUMBING CHECK."""
     K = int(a.chunk)
-    mcfg = _model_config(a.model, K, a.batch, gate=False)
-    bc = BCConfig(obs_window=1, chunk_size=K)       # loader shape only; W_o, K
+    mcfg = _model_config(a.model, K, a.obs_window, a.batch, gate=False)
     tr, va = _splits()
     st, ac, meta = DS.load_norm_stats()
-    tds = _load(tr, bc, meta)
-    vds = _load(va, bc, meta, norm_fit_seeds=tr)
+    tds = _load(tr, mcfg, meta)
+    vds = _load(va, mcfg, meta, norm_fit_seeds=tr)
     assert not (set(tds.seeds) & set(vds.seeds)), "train and val share a seed"
     _banner(tds, "FULL SPLIT: %d train episodes, %d val episodes (K=%d)"
             % (len(tds.lengths), len(vds.lengths), K))
@@ -410,7 +413,7 @@ def cmd_full(a):
 
     cfg = _train_config(
         mcfg, a.epochs, a.batch, seed=0,
-        run_name="%s_full_K%d" % (a.model, K),
+        run_name="%s_full_K%d_W%d" % (a.model, K, mcfg.obs_window),
         log_every=max(1, int(a.epochs) // 20) if a.epochs else 1,
         _budget=_budget(a, tds), **_step_kwargs(a),
         notes=dict(gate="full-split plumbing check",
@@ -638,6 +641,10 @@ def main():
             p.add_argument("--chunk", type=int, default=1,
                            help="K. 1 = BC, >1 = chunked BC (same class)")
             p.add_argument("--model", default="bc", choices=("bc", "act"))
+            p.add_argument("--obs-window", type=int, default=12,
+                           help="W_o, shared by every model (CLAUDE.md §8 "
+                                "2026-09-27): 12 = 0.48 s at 25 Hz. 1 reproduces "
+                                "the pre-2026-09-27 gates")
             p.add_argument("--batch", type=int, default=256,
                            help="batch size. ACT's 4 GB ceiling is 32 (measured)")
         if name == "rescore-gate":

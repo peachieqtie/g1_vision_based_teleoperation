@@ -128,9 +128,11 @@ class LoaderConfig:
     NONE OF THE THREE FIELDS HAS A DEFAULT, and each for its own reason.
 
     `obs_window` is the hyperparameter that can invalidate the whole ACT vs
-    ACT-LSTM comparison: a window long enough to carry the task's temporal
-    structure hands BC the capability the LSTM is supposed to supply. Inheriting
-    it silently is exactly how that happens without anyone choosing it.
+    ACT-LSTM comparison if it differs between models: a model given a longer
+    window than another gets history the other lacks, and the comparison then
+    measures the window, not the architecture. Every model uses the SAME window
+    (12, CLAUDE.md §8 2026-09-27); inheriting it silently is exactly how a
+    mismatch happens without anyone choosing it.
 
     `tracking` is required because a default of "off" means no call site ever
     has to consider O28 - and `tracking_ok` being written and read by nothing is

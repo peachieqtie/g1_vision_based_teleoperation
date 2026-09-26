@@ -127,8 +127,8 @@ stacked, dropout 0.3), transformer width/depth, KL weight β. The proposal defer
    save. Identical across conditions.
 6. Shape-and-gradient unit tests on synthetic data at the frozen dimensions. **Mask the 6 constant action dims out of the loss.**
 
-**Exit criterion:** all three train to convergence on synthetic data, and toggling `use_lstm` is the *only* difference between
-ACT and ACT-LSTM — verified by diffing the two config objects.
+**Exit criterion:** all three train to convergence on synthetic data, and ACT and ACT-LSTM, both at `obs_window = 12`, differ
+*only* in `use_lstm` — verified by diffing the two config objects (CLAUDE.md §8 2026-09-25).
 
 ---
 

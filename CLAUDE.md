@@ -24,8 +24,9 @@ record the divergence and ask Charles. A drift from an OBJECTIVE, not a method, 
 says why. **P1–P3 CLOSED.** P3's open-loop replay reproduces the manipulation channel on 5 scripted episodes; the locomotion channel
 cannot be replayed open loop by any recorder (`NOTES.md` 2026-09-16). **P4 in progress:** BC, chunked BC and state-only ACT all pass the
 overfit-10 gate (§8 2026-09-22), and an independent audit found ACT **is** ACT but not trained as the reference trains it (§8 2026-09-23).
-**Next: ACT-LSTM, the `use_lstm` flag on the SAME class** (`g1_model/act.py`) — and the gate now REFUSES carried state, so it needs an
-explicit per-episode scoring protocol before it can be gated. **Every model result so far
+**Next: ACT-LSTM, the `use_lstm` flag on the SAME class** (`g1_model/act.py`); EVERY model at W_o = 12 —
+design decided (§8 2026-09-25, 2026-09-27): sequence input, fresh memory every call, so the gate works unchanged. All three existing
+gate PASSES were at W_o = 1 and must be re-run at 12. **Every model result so far
 is on SCRIPTED data — no piloted episode exists** (`data/raw/` is empty), so O31 and O32 stay open until P5.
 
 **P5 pilot has not started.** It must settle D12: the grasp worked free-based on 2026-09-15, so D12 may bind only the scripted demonstrator
@@ -85,7 +86,7 @@ command applied FROM `state[t]`; build the pair at ONE point in the loop, before
 | D5 | §3.3.1 joints start at zero | legs start at `DEFAULT_ANGLES` | the walking policy cannot recover from straight legs | 3.3.1, 3.8.1 |
 | D6 | §3.3.4 pelvis-velocity trigger | **abandoned**; `KeyboardCommand` | §3.3.4 and §3.3.8 are incompatible (TR1); written up as a negative result | 3.3.4, 3.3.8 |
 | D7 | §3.3.6 grippers press via IK error | pads press; arm holds a clean pose | IK-error pressing corrupts the arm dims it is recorded into | 3.3.6 |
-| D8 | two policies | three (BC, ACT, ACT-LSTM) | isolates the LSTM instead of confounding it with chunking | 3.6–3.8.4, RQ2 |
+| D8 | two policies | three (BC, ACT, ACT-LSTM); **all at W_o = 12 (ACT reference: 1) — pending adviser approval** (§8 2026-09-25, 2026-09-27) | isolates the LSTM instead of confounding it with chunking; one shared window leaves each model's own mechanism the only difference | 3.6–3.8.4, RQ2 |
 | D9 | §3.9 Ubuntu + ROS2 | Windows 11, no ROS | ROS adds no value for a single-process sim | 3.9 |
 | D10 | §3.4 waist as live DOF | waist pinned at 0 | torso-yaw sign unverified; waist motion perturbs the locomotion policy | 3.4 |
 | D11 | §3.3.6 friction grasp | **weld**, gated on palm proximity/opposition/separation | friction holds 1 of 9 standoffs and couples to unrelated foot contacts; reportable negative result | 3.3.6 + limits |
@@ -103,6 +104,24 @@ D6, D7, **D12** and **D18** touch **objectives**, not just methods. D6/D7 are re
 
 Older entries are one line; detail is in `NOTES.md` under the same date. Retired entries (§14) keep a one-line pointer.
 
+- 2026-09-27 — **ALL MODELS AT W_o = 12: BC, chunked BC, ACT and ACT-LSTM share one observation window; D8 still pending adviser
+  approval.** Replaces "BC stays at W_o = 1 on purpose" (2026-09-25). Reason: with one window every rung of the ladder changes ONE thing
+  (BC → chunked BC chunking, → ACT the CVAE, → ACT-LSTM recurrence), so every comparison is fair. `tools/train_bc.py --obs-window`
+  (default 12) sets it for BC, chunked BC and ACT, and the loader now takes the window from the MODEL's config (it used a separate
+  `BCConfig(obs_window=1)` for ACT too). 1 is still accepted and reproduces the old gates. **Disclose:** BC now has 0.48 s of history, so
+  BC vs ACT-LSTM no longer compares "no temporal context" with "temporal context" — the LSTM's contribution is recurrence over a window
+  every model sees. **Every overfit-10 PASS (BC 0.745, chunked BC 0.953, ACT 0.920) was at W_o = 1 and must be re-run at 12.**
+- 2026-09-25 — **ACT-LSTM DESIGN: Option B, sequence input; THREE models, ACT moves to W_o = 12 — DECIDED, not yet built; D8 pending
+  adviser approval.** The LSTM reads the last W_o states on EVERY call, starting from fresh memory each time, and its output is fed into
+  ACT as an extra input token. No state is carried between calls, so the existing loader and the gate (which refuses carried state, TR31)
+  work unchanged. Rejected, Option A (hidden state carried across the episode): a sequential sampler ACT does not use, plus a guard
+  exemption. **Models: ACT W_o = 12, ACT-LSTM W_o = 12 (BC: see 2026-09-27); ACT and ACT-LSTM differ ONLY in `use_lstm`.** Replaces a same-day,
+  never-committed 4-model design (ACT at 1 plus a separate windowed-ACT control): giving ACT the same window makes ACT vs ACT-LSTM
+  fair with three models and saves a training condition. **LSTM: 2 layers, dropout 0.3 (proposal), hidden 256.** **W_o = 12 is a
+  STARTING CHOICE (0.48 s at 25 Hz), not a tuned value** — a W_o of 1 would leave the LSTM nothing to recur over. **Cost, disclose:**
+  our ACT no longer matches the reference's single-timestep observation (correspondence row 53, ADAPTED).
+  **ACT's overfit-10 PASS (0.920) was at W_o = 1 and must be re-run at 12**; the W_o = 12 gate reference is HIGHER (O31,
+  dimensionality) — never compare gate ratios across W_o.
 - 2026-09-23 — **ACT AUDIT VERDICT: the model IS ACT; the training is NOT the reference's; on scripted data the trained model behaves
   like chunked BC.** Independent audit against `reference/act@742c753c` and arXiv 2304.13705v1 (`docs/ACT_AUDIT_REPORT.md`, with
   `docs/ACT_AUDIT.md` — the RECORD, never edit either). Measured against the reference's OWN `transformer.py`: outputs, latents, both loss
