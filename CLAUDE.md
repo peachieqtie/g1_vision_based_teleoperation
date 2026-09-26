@@ -104,6 +104,10 @@ D6, D7, **D12** and **D18** touch **objectives**, not just methods. D6/D7 are re
 
 Older entries are one line; detail is in `NOTES.md` under the same date. Retired entries (§14) keep a one-line pointer.
 
+- 2026-09-27 — **PIN THE MUJOCO VERSION once the partner's is known** (O34). `requirements.txt` says only `mujoco>=3.7.0`, and a second
+  laptop at 3.14.0 does not reproduce the scripted episodes. Read the version from the partner's episode `mujoco_version`, pin it (and
+  NumPy/torch if needed) in `requirements.txt`, re-record seeds 0–44, and require placement to match the measurement file before any
+  data from a new machine counts.
 - 2026-09-27 — **ALL MODELS AT W_o = 12: BC, chunked BC, ACT and ACT-LSTM share one observation window; D8 still pending adviser
   approval.** Replaces "BC stays at W_o = 1 on purpose" (2026-09-25). Reason: with one window every rung of the ladder changes ONE thing
   (BC → chunked BC chunking, → ACT the CVAE, → ACT-LSTM recurrence), so every comparison is fair. `tools/train_bc.py --obs-window`
@@ -316,6 +320,11 @@ Older entries are one line; detail is in `NOTES.md` under the same date. Retired
   On the scripted train split 4 STATE dims fall below 1e-2 — 9 base z (0.0087), 43 right wrist (0.0020), 44–45 waist (0.0030, 0.0069),
   all pinned — so their jitter is z-scored up to **4.9×** harder than the reference would; no action dim is affected. RECORDED, NOT FIXED:
   normalization is regenerated from piloted data, and this **must be decided BEFORE norm stats are fitted on real episodes** (D14's hazard).
+- **O34. NEW — the simulation does NOT reproduce across library versions.** Seeds 0–44 re-recorded 2026-09-27 on a second laptop
+  (MuJoCo 3.14.0, NumPy 2.4, torch 2.14 CPU): 0 of 39 shared seeds match the partner's placement
+  (`docs/measurements/bprime_gates_adopted_pred_40.json`), 11 are 20–55 mm worse, and seeds 38 and 44 FAIL placement > 0.10 m
+  (partner: 40/40, all ≤ 52 mm). Cause presumed library versions — the partner's are in their episodes' `mujoco_version`, NOT verified.
+  **Data from that laptop is code-test only, never a result.** Collection and evaluation must share one physics build (D18's logic).
 - **O6.** Dead code: `gating.py`, `GatingConfig`, `TorsoYawConfig`, `IKConfig.neutral_weight`/`.target_deadzone`, `set_waist_yaw`,
   `ZEDConfig.camera_fps` (O29); `RejectReason` survives for `NAN`. **O7.** Stale docs: README claims torso-yaw following and active gating;
   `config.py` says locomotion is "not yet built"; `test/*.py` is stale. (`docs/ACT_CORRESPONDENCE.md` rows 18/22/36 resolved 2026-09-25.) Resolved issues (O10, O12, O14–O16, O18, O20–O24): `NOTES.md` "2026-09-22 — CLAUDE.md §8 ARCHIVE".
