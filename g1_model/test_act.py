@@ -632,11 +632,11 @@ def test_the_runner_takes_act_lr_from_act_not_from_bc():
         os.path.abspath(__file__))), "tools"))
     import importlib
     tb = importlib.import_module("train_bc")
-    gate = tb._model_config("act", 100, 8, gate=True)
+    gate = tb._model_config("act", 100, 12, 8, gate=True)
     assert isinstance(gate, ACTConfig)
     assert gate.lr == A.LR, "the runner must use ACT's own lr"
     assert gate.weight_decay == 0.0, "the gate is unregularised for every model"
-    full = tb._model_config("act", 100, 8, gate=False)
+    full = tb._model_config("act", 100, 12, 8, gate=False)
     assert full.weight_decay == A.WEIGHT_DECAY, "outside the gate: the reference's"
     tc = tb._train_config(gate, 12, 8, seed=0)
     assert (tc.lr, tc.weight_decay, tc.optimizer) == (A.LR, 0.0, "adamw")
@@ -653,8 +653,8 @@ def test_gate_metadata_states_the_dropout_the_model_actually_has():
         os.path.abspath(__file__))), "tools"))
     import importlib
     tb = importlib.import_module("train_bc")
-    act = tb._model_config("act", 4, 8, gate=True)
-    bc = tb._model_config("bc", 4, 8, gate=True)
+    act = tb._model_config("act", 4, 12, 8, gate=True)
+    bc = tb._model_config("bc", 4, 12, 8, gate=True)
     s_act, s_bc = tb.regularization_statement(act), tb.regularization_statement(bc)
     assert "dropout 0.1" in s_act and not s_act.startswith("NONE"), s_act
     assert s_bc.startswith("NONE: dropout 0,"), s_bc
