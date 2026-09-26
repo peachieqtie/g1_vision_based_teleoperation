@@ -44,6 +44,7 @@ sys.path.insert(0, ROOT)
 
 from g1_data import spec
 from g1_data.ledger import EpisodeLedger, seed_stream
+from g1_data.paths import repo_relpath
 from g1_data.recorder import (NS_COLLECTION, NS_SCRIPTED, SOURCE_SCRIPTED,
                              ScriptedRecorder, assert_namespace, label_of,
                              ledger_for)
