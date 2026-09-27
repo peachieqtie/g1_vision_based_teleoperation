@@ -104,6 +104,9 @@ D6, D7, **D12** and **D18** touch **objectives**, not just methods. D6/D7 are re
 
 Older entries are one line; detail is in `NOTES.md` under the same date. Retired entries (§14) keep a one-line pointer.
 
+- 2026-09-27 — **W_o = 12 pipeline passes its CODE TEST on the second (CPU) laptop — not a result (O34).** Overfit-10: BC 0.009280 /
+  0.016343 = 0.568 PASS, chunked BC 0.034796 / 0.055214 = 0.630 PASS. ACT: 300-step timing run only, **~2.0 s/step on CPU vs 73 ms on
+  the RTX 3050** (~28×; a 195k-step run ≈ 4.5 days) — ACT and ACT-LSTM training belongs on a CUDA GPU.
 - 2026-09-27 — **PIN THE MUJOCO VERSION once the partner's is known** (O34). `requirements.txt` says only `mujoco>=3.7.0`, and a second
   laptop at 3.14.0 does not reproduce the scripted episodes. Read the version from the partner's episode `mujoco_version`, pin it (and
   NumPy/torch if needed) in `requirements.txt`, re-record seeds 0–44, and require placement to match the measurement file before any
