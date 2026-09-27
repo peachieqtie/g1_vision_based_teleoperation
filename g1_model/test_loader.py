@@ -357,7 +357,9 @@ def test_tracking_policies_are_off_by_default_and_change_nothing_today():
     s = d.summary()
     assert s["degraded_ticks"] == 0
     assert s["excluded_samples"] == 0 and s["dropped_episodes"] == []
-    assert s["tracking_measured"] == 0, "all 40 are on the all-True default"
+    assert s["tracking_measured"] == 0, (
+        "scripted episodes must carry NO tracking_ok array (recorder "
+        "MEASURES_TRACKING); %d do - re-record them" % s["tracking_measured"])
 
 
 def test_chunk_exclusion_policy_fires_on_a_degraded_episode():

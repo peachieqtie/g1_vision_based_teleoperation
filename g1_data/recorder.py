@@ -178,14 +178,18 @@ class EpisodeBuffer:
     """
 
     def __init__(self, model, ix: Optional[ModelIndex] = None,
-                 sp: Optional[spec.SpecLayout] = None):
+                 sp: Optional[spec.SpecLayout] = None,
+                 measures_tracking: bool = False):
         self.ix = ix or ModelIndex.resolve(model)
         self.sp = sp or spec.SpecLayout.resolve(model, self.ix)
         self.states, self.actions, self.phases = [], [], []
         self.gait, self.qpos, self.qvel, self.ticks = [], [], [], []
         # O28. Per tick: was the arm command backed by a LIVE tracked frame?
         # An auxiliary array, not a state or action dim - the 47/22 layout and
-        # SPEC_VERSION are untouched (see `tracking_ok_of`).
+        # SPEC_VERSION are untouched (see `tracking_ok_of`). Written ONLY when
+        # the source has a tracking path: a stored array means MEASURED
+        # (`tracking_measured`), and the scripted demonstrator measures nothing.
+        self.measures_tracking = bool(measures_tracking)
         self.tracking = []
         self.t_wall0 = time.perf_counter()
 
@@ -229,8 +233,7 @@ class EpisodeBuffer:
         m.setdefault("mujoco_version", mujoco.__version__)
         m.setdefault("python_version", sys.version.split()[0])
         m.setdefault("n_ticks", len(self.states))
-        np.savez_compressed(
-            path,
+        arrays = dict(
             states=np.asarray(self.states, dtype=np.float32),
             actions=np.asarray(self.actions, dtype=np.float32),
             phase_labels=np.asarray(self.phases, dtype=np.int8),
@@ -238,8 +241,10 @@ class EpisodeBuffer:
             qpos=np.asarray(self.qpos, dtype=np.float32),
             qvel=np.asarray(self.qvel, dtype=np.float32),
             step_index=np.asarray(self.ticks, dtype=np.int64),
-            tracking_ok=np.asarray(self.tracking, dtype=np.uint8),
             meta=np.array(json.dumps(m)))
+        if self.measures_tracking:
+            arrays["tracking_ok"] = np.asarray(self.tracking, dtype=np.uint8)
+        np.savez_compressed(path, **arrays)
         return path
 
 
@@ -400,6 +405,9 @@ class ScriptedRecorder:
     rather than from anything passed in here.
     """
 
+    #: No camera, no tracking path: `tracking_ok` is not written (O28).
+    MEASURES_TRACKING = False
+
     def __init__(self):
         self.buf: Optional[EpisodeBuffer] = None
         self.reset_fingerprint = ""
@@ -445,7 +453,8 @@ class ScriptedRecorder:
     def _observe(self, m, d, L: dict) -> None:
         i, ix, weld = L["i"], L["ix"], L["weld"]
         if self.buf is None:
-            self.buf = EpisodeBuffer(m, ix)
+            self.buf = EpisodeBuffer(m, ix,
+                                     measures_tracking=self.MEASURES_TRACKING)
             # The model the episode actually ran on: the contact contract in the
             # metadata is read back from THIS model, never from a config flag.
             self.model = m
@@ -482,7 +491,8 @@ class ScriptedRecorder:
         loco = L["cfg"].loco
         # O28: `arm_stale` is a local of the TELEOP loop only. The scripted
         # demonstrator has no such local and no tracking path, so `.get` falls
-        # back to False and its ticks record as tracked, which is the truth.
+        # back to False; its buffer does not write the array at all
+        # (`MEASURES_TRACKING`), so the episode reads as NOT measured.
         self.buf.tick(m, d, act=act, cmd=float(L.get("cmd", 0.0)),
                       tracking_ok=not bool(L.get("arm_stale", False)),
                       phase_label=int(L["phase"]),
@@ -558,6 +568,8 @@ class TeleopRecorder(ScriptedRecorder):
     """
 
     FRAME = "main"
+    #: The teleop loop's `arm_stale` is a real measurement (O28).
+    MEASURES_TRACKING = True
 
     def __enter__(self) -> "TeleopRecorder":
         self._real_step = mujoco.mj_step
