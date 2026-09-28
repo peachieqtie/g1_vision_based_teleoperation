@@ -567,18 +567,274 @@ def test_checkpoint_round_trips_to_identical_predictions():
         shutil.rmtree(out, ignore_errors=True)
 
 
-# ═══ D8: no dead flag ════════════════════════════════════════════════════════
-def test_there_is_no_dead_use_lstm_flag():
-    """D8: a flag that does nothing is this repo's standing failure. ACT-LSTM
-    must live in the SAME class when it is built - not as an inert switch today."""
-    import inspect
-    src = inspect.getsource(A)
-    tree_names = {n.id for n in __import__("ast").walk(__import__("ast").parse(src))
-                  if isinstance(n, __import__("ast").Name)}
-    assert "use_lstm" not in tree_names
-    assert "use_lstm" not in {f for f in ACTConfig.__dataclass_fields__}
+# ═══ D8: ACT-LSTM is `use_lstm` on this class ════════════════════════════════
+# Replaces `test_there_is_no_dead_use_lstm_flag`, which forbade the flag until it
+# did something. What guards against a dead flag now is the pair of tests below:
+# False must be the old model to the bit, True must change the function.
+
+#: Recorded on the UNMODIFIED code (main @ e02776b, 2026-09-28) BEFORE the flag
+#: was added, by the same procedure as `_fingerprint` - not by the code under
+#: test (TR32: an equivalence claim runs the OLD code on one side). CPU,
+#: torch 2.14.0. `state_sha256` covers every parameter and buffer, by name.
+_GOLDEN_ACT = {
+    1: dict(n_tensors=120, n_params=300758,
+            state_sha256="edd0a9cd6b69b4e3b3179bdfb4b93c44cf11a824094bf30f8b71337b5cb74c06",
+            out_fsum=58.341043383814394, out_abs_fsum=265.98749425355345,
+            out_first=[-0.47477883100509644, 0.24893717467784882,
+                       1.0588117837905884, 0.03297777473926544]),
+    12: dict(n_tensors=120, n_params=366934,
+             state_sha256="78eb3cc8d8280963891ef3bd467b22ce3d32b2f88546d5402cb28e0eb1c39e42",
+             out_fsum=97.35705288313329, out_abs_fsum=266.3026452604681,
+             out_first=[1.2961876392364502, 1.087606430053711,
+                        -0.1536829173564911, -0.3238556385040283]),
+}
+
+
+def _fingerprint(W, **kw):
+    """The golden procedure: seed 0, the small test model, eval, a fixed input."""
+    import hashlib
+    import math
+    torch.manual_seed(0)
+    m = ACTPolicy(_cfg(K=8, W=W, **kw)).eval()
+    sd = m.state_dict()
+    h = hashlib.sha256()
+    for k in sorted(sd):
+        h.update(k.encode())
+        h.update(sd[k].detach().cpu().contiguous().numpy().tobytes())
+    g = torch.Generator().manual_seed(123)
+    obs = torch.randn(3, W, spec.STATE_DIM, generator=g)
+    with torch.no_grad():
+        out = m(obs)
+    return dict(n_tensors=len(sd), n_params=sum(p.numel() for p in m.parameters()),
+                state_sha256=h.hexdigest(),
+                out_fsum=math.fsum(out.double().flatten().tolist()),
+                out_abs_fsum=math.fsum(out.double().abs().flatten().tolist()),
+                out_first=[float(x) for x in out[0, 0, :4]])
+
+
+def test_use_lstm_false_is_act_exactly_as_it_was_before_the_flag():
+    """Same parameters (every tensor, by name, to the bit) and the same output as
+    the code before `use_lstm` existed, at W_o = 1 and at the shared W_o = 12.
+    Also checked once, outside the suite, on the W_o = 12 ACT checkpoint in
+    runs/20260927-133342_act_overfit10_K100_W12: loads strict, output
+    bit-identical (max diff 0.0).
+
+    The parameters are compared EXACTLY. The output is compared to 1e-6: it is
+    bit-identical on the machine that recorded it, but a different BLAS build
+    may differ in the last bits of a matmul with the same weights."""
+    for W, want in _GOLDEN_ACT.items():
+        for got in (_fingerprint(W), _fingerprint(W, use_lstm=False)):
+            for k in ("n_tensors", "n_params", "state_sha256"):
+                assert got[k] == want[k], (W, k, got[k], want[k])
+            for k in ("out_fsum", "out_abs_fsum"):
+                assert abs(got[k] - want[k]) < 1e-6 * max(1.0, abs(want[k])), \
+                    (W, k, got[k], want[k])
+            assert np.allclose(got["out_first"], want["out_first"], rtol=0, atol=1e-6), \
+                (W, got["out_first"], want["out_first"])
+    assert ACTConfig.__dataclass_fields__["use_lstm"].default is False
     assert not any(isinstance(mod, (torch.nn.LSTM, torch.nn.GRU, torch.nn.RNN))
-                   for mod in _model().modules())
+                   for mod in _model(W=12).modules()), "ACT must contain no RNN"
+
+
+def test_act_lstm_is_act_plus_the_lstm_modules_and_nothing_else():
+    """Same seed: every ACT parameter and buffer starts BIT-IDENTICAL in ACT-LSTM
+    (the LSTM is built last), and the only extra tensors are the LSTM's."""
+    act, lstm = _model(W=12), _model(W=12, use_lstm=True)
+    sa, sl = act.state_dict(), lstm.state_dict()
+    for k, v in sa.items():
+        assert k in sl and torch.equal(v, sl[k]), "ACT tensor %s differs" % k
+    extra = set(sl) - set(sa)
+    assert extra and all(k.split(".")[0] in ("lstm", "lstm_proj", "lstm_pos_embed")
+                         for k in extra), sorted(extra)
+    assert type(act) is type(lstm) is ACTPolicy, "ONE class (D8)"
+    # the declarations the deployment guard reads are unchanged: the LSTM reads
+    # the observation, never the target, and z enters where it did
+    assert "lstm" not in " ".join(ACTPolicy.TARGET_READING_MODULES)
+    assert ACTPolicy.PRIOR_LATENT_MODULES == ("latent_out_proj",)
+
+
+def test_lstm_hyperparameters_are_the_decided_values():
+    """CLAUDE.md §8 2026-09-25: 2 layers, hidden 256, dropout 0.3 - built, not
+    just configured. The dropout is nn.LSTM's, between layers only (§8 2026-09-28)."""
+    assert (A.LSTM_LAYERS, A.LSTM_HIDDEN, A.LSTM_DROPOUT) == (2, 256, 0.3)
+    m = _model(W=12, use_lstm=True)
+    assert isinstance(m.lstm, torch.nn.LSTM)
+    assert (m.lstm.num_layers, m.lstm.hidden_size, m.lstm.dropout) == (2, 256, 0.3)
+    assert m.lstm.input_size == spec.STATE_DIM and m.lstm.batch_first
+    assert not m.lstm.bidirectional, "a bidirectional LSTM would read the window backwards too"
+    assert m.lstm_proj.in_features == 256 and m.lstm_proj.out_features == m.cfg.hidden_dim
+    assert m.lstm_pos_embed.weight.shape == (1, m.cfg.hidden_dim)
+    assert m.additional_pos_embed.weight.shape == (2, m.cfg.hidden_dim), \
+        "the reference's (2, h) embedding must stay as it is"
+    for bad in (dict(lstm_dropout=1.0), dict(lstm_dropout=-0.1), dict(lstm_layers=0),
+                dict(lstm_hidden=0), dict(use_lstm=1)):
+        _raises(ValueError, _cfg, W=12, **bad)
+
+
+def test_use_lstm_true_changes_the_function():
+    """A flag that builds modules nothing reads would pass the tests above. Same
+    seed, same shared weights, same input: the output must differ, the encoder
+    must see a THIRD token, and gradient must reach the LSTM."""
+    act, lstm = _model(W=12), _model(W=12, use_lstm=True)
+    obs = torch.randn(3, 12, spec.STATE_DIM)
+    with torch.no_grad():
+        d = float((act(obs) - lstm(obs)).abs().max())
+    assert d > 1e-4, "use_lstm=True gives ACT's output (max diff %.3e)" % d
+
+    seen = {}
+    real = lstm.t_encoder.forward
+    lstm.t_encoder.forward = lambda src, **k: seen.update(shape=tuple(src.shape)) or real(src, **k)
+    with torch.no_grad():
+        lstm(obs)
+    assert seen["shape"] == (3, 3, lstm.cfg.hidden_dim), seen   # [latent, proprio, lstm]
+    del lstm.t_encoder.forward
+
+    lstm.zero_grad()
+    lstm(obs).sum().backward()
+    for name in ("lstm.weight_ih_l0", "lstm.weight_hh_l1", "lstm_proj.weight",
+                 "lstm_pos_embed.weight"):
+        g = dict(lstm.named_parameters())[name].grad
+        assert g is not None and float(g.abs().sum()) > 0.0, "no gradient reaches %s" % name
+
+    # and the token carries information: perturbing ONLY the LSTM moves the output
+    with torch.no_grad():
+        before = lstm(obs).clone()
+        lstm.lstm.weight_ih_l0.add_(0.05)
+        assert float((lstm(obs) - before).abs().max()) > 1e-5
+
+
+def test_lstm_reads_every_step_of_the_window_in_order():
+    """The token must depend on the OLDEST step (it reads all W_o, not the last)
+    and on the ORDER (it recurs; a set summary would not)."""
+    m = _model(W=12, use_lstm=True)
+    obs = torch.randn(2, 12, spec.STATE_DIM)
+    oldest = obs.clone(); oldest[:, 0] += 1.0
+    with torch.no_grad():
+        t = m._lstm_token(obs)
+        assert float((m._lstm_token(oldest) - t).abs().max()) > 1e-5
+        assert float((m._lstm_token(obs.flip(1)) - t).abs().max()) > 1e-5
+
+
+def test_lstm_starts_from_fresh_memory_every_call():
+    """Option B, the property the gate relies on (TR31): no (h, c) goes in, none
+    is kept. Scoring B after A equals scoring B alone, the LSTM is never handed
+    a state, and the model holds no tensor outside its parameters and buffers."""
+    m = _model(W=12, use_lstm=True)
+    a, b = torch.randn(2, 12, spec.STATE_DIM), torch.randn(2, 12, spec.STATE_DIM)
+    with torch.no_grad():
+        alone = m(b).clone()
+        m(a)
+        after = m(b)
+    assert torch.equal(alone, after), "state crossed calls"
+
+    calls = []
+    real = m.lstm.forward
+    m.lstm.forward = lambda x, hx=None: calls.append(hx) or real(x, hx)
+    with torch.no_grad():
+        m(a)
+    assert calls == [None], "the LSTM was handed a state: %r" % (calls,)
+    del m.lstm.forward
+    assert T.hidden_state(m) == [], T.hidden_state(m)
+
+
+def test_act_lstm_passes_the_deployment_guard():
+    """`score_deployment` refuses carried state, RNG use and weight changes; ACT-LSTM
+    must be scoreable through it unchanged (the guard was built BEFORE it)."""
+    from g1_model.test_train import _tiny
+    tmp = _tiny(n_eps=2, n_ticks=30)
+    if tmp is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, _ = tmp
+    try:
+        st, ac = (spec.NormStats.identity("state"), spec.NormStats.identity("action"))
+        ds = ChunkDataset.from_directory(
+            tmp, LoaderConfig(chunk_size=6, obs_window=4, tracking=TrackingPolicy()),
+            st, ac, None)
+        m = _model(K=6, W=4, use_lstm=True)
+        q1 = T.score_deployment(m, ds)
+        q2 = T.score_deployment(m, ds)
+        assert q1.value == q2.value, (q1.value, q2.value)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_act_and_act_lstm_configs_differ_only_in_use_lstm():
+    """PLAN.md Phase 4 exit check, on the configs the RUNNER builds - the ones
+    that are actually trained - at the gate and outside it."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "tools"))
+    import dataclasses
+    import importlib
+    tb = importlib.import_module("train_bc")
+    for gate in (True, False):
+        act = tb._model_config("act", 100, 12, 8, gate=gate)
+        lstm = tb._model_config("act_lstm", 100, 12, 8, gate=gate)
+        da, dl = dataclasses.asdict(act), dataclasses.asdict(lstm)
+        assert set(da) == set(dl)
+        diff = {k for k in da if da[k] != dl[k]}
+        assert diff == {"use_lstm"}, diff
+        assert (act.use_lstm, lstm.use_lstm) == (False, True)
+        assert act.obs_window == lstm.obs_window == 12
+        assert act.optimizer_config() == lstm.optimizer_config()
+
+
+def test_runner_states_the_lstm_dropout():
+    """The regularization statement is checked against the BUILT model; an
+    ACT-LSTM's 0.3 must be in it, and a config that hides it must be refused."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "tools"))
+    import dataclasses
+    import importlib
+    tb = importlib.import_module("train_bc")
+    gate = tb._model_config("act_lstm", 4, 12, 8, gate=True)
+    s = tb.regularization_statement(gate)
+    assert "dropout 0.1" in s and "LSTM dropout 0.3 between stacked layers only" in s, s
+    assert "LSTM" not in tb.regularization_statement(tb._model_config("act", 4, 12, 8, True))
+    small = ACTConfig(obs_window=12, chunk_size=4, lr=gate.lr, weight_decay=0.0,
+                      hidden_dim=64, dim_feedforward=128, nheads=4, enc_layers=1,
+                      use_lstm=True)
+    m = build_act(cfg=small)
+    assert tb.observed_dropout(m) == [0.1, 0.3]
+    tb.assert_regularization_matches(m, small)                 # consistent: no raise
+    _raises(SystemExit, tb.assert_regularization_matches, m,
+            dataclasses.replace(small, lstm_dropout=0.0))
+
+
+def test_act_lstm_trains_and_round_trips_through_the_unchanged_loop():
+    """ACT-LSTM plugs into the same loop and checkpointing as ACT; `train.py`
+    needs no change, and a checkpoint rebuilds the LSTM from its config alone."""
+    from g1_model.test_train import _tiny
+    tmp = _tiny(n_eps=2, n_ticks=40)
+    if tmp is None:
+        print("      (skipped: nothing staged in data/synthetic)")
+        return
+    tmp, _ = tmp
+    out = tempfile.mkdtemp()
+    try:
+        st, ac = (spec.NormStats.identity("state"), spec.NormStats.identity("action"))
+        ds = ChunkDataset.from_directory(
+            tmp, LoaderConfig(chunk_size=6, obs_window=4, tracking=TrackingPolicy()),
+            st, ac, None)
+        mcfg = _cfg(K=6, W=4, use_lstm=True)
+        cfg = T.TrainConfig(epochs=3, batch_size=8, seed=0, **mcfg.optimizer_config(),
+                            run_name="actlstm", log_every=0)
+        m = T.seeded_build(cfg, build_act, cfg=mcfg)
+        r = T.train(m, ds, cfg, run_dir=out)
+        assert r["history"][-1]["train_loss"] < r["history"][0]["train_loss"]
+        assert r["history"][0]["train_kl"] > 0.0
+        obs = torch.stack([ds[i]["obs"] for i in range(4)])
+        m = m.cpu().eval()
+        with torch.no_grad():
+            before = m(obs).clone()
+        back, ck = T.load_checkpoint(os.path.join(out, "last.pt"), build_act)
+        assert back.cfg.use_lstm is True and isinstance(back.lstm, torch.nn.LSTM)
+        with torch.no_grad():
+            assert torch.equal(before, back(obs))
+        assert ck["model_cls"] == "ACTPolicy"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(out, ignore_errors=True)
 
 
 # ═══ TR28: ACT states its own optimizer config, and a borrowed one RAISES ═══════

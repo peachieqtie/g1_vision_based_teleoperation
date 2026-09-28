@@ -43,6 +43,14 @@ would make this repo depend on an untracked directory. The layers below mirror
 attention QUERY and KEY but never to the VALUE (`transformer.py:171-173`,
 `:236-244`), and the decoder returns every layer's output so the head can select
 one (`transformer.py:129-141`).
+
+ACT-LSTM IS THIS CLASS WITH `use_lstm=True`
+------------------------------------------
+Not a second implementation: two would let incidental differences sit inside the
+measured effect of recurrence (D8). The flag adds an LSTM over the observation
+window whose final hidden state becomes ONE extra token for the policy
+transformer, and changes nothing else (CLAUDE.md §8 2026-09-25, Option B). The
+reference has no recurrence anywhere (correspondence row 54, ADDITION).
 """
 from __future__ import annotations
 
@@ -129,6 +137,19 @@ OPTIMIZER: str = "adamw"
 #: would be a deeper, different model, and an RQ2/RQ3 result obtained with it could
 #: not be attributed to ACT's design.
 DECODER_LAYER_READ: int = 0
+
+# ─── ACT-LSTM constants (OURS: the reference has no recurrence, row 54) ───────
+#: The proposal's value, "2 stacked" (PLAN.md Phase 4; CLAUDE.md §8 2026-09-25).
+LSTM_LAYERS: int = 2
+#: OURS, CLAUDE.md §8 2026-09-25. Not from the proposal, not tuned.
+LSTM_HIDDEN: int = 256
+#: The proposal's value (PLAN.md Phase 4; CLAUDE.md §8 2026-09-25). Applied as
+#: `nn.LSTM(dropout=...)` does it: BETWEEN stacked layers only, so with two
+#: layers it acts on layer 1's outputs
+#: and never on the final hidden state that becomes the token. DISCLOSED
+#: (CLAUDE.md §8 2026-09-28, correspondence row 54), not "fixed" with an extra
+#: nn.Dropout: that would be a second design choice the proposal did not state.
+LSTM_DROPOUT: float = 0.3
 
 
 def _get_activation_fn(activation: str):
@@ -370,6 +391,16 @@ class ACTConfig:
     state_dim: int = spec.STATE_DIM
     action_dim: int = spec.ACTION_DIM
 
+    #: ACT-LSTM (D8). False is ACT, bit-identical to the model before the flag
+    #: existed (test_act.py golden fingerprint). The three `lstm_*` fields below
+    #: are carried by ACT's config too and are INERT there - accepted
+    #: (CLAUDE.md §8 2026-09-28) so that the ACT and ACT-LSTM configs differ in
+    #: `use_lstm` ALONE, which is PLAN.md Phase 4's exit check.
+    use_lstm: bool = False
+    lstm_layers: int = LSTM_LAYERS
+    lstm_hidden: int = LSTM_HIDDEN
+    lstm_dropout: float = LSTM_DROPOUT
+
     def __post_init__(self):
         if int(self.obs_window) < 1:
             raise ValueError("obs_window must be >= 1, got %r" % (self.obs_window,))
@@ -378,6 +409,14 @@ class ACTConfig:
         if self.hidden_dim % self.nheads:
             raise ValueError("hidden_dim %d must be divisible by nheads %d"
                              % (self.hidden_dim, self.nheads))
+        if not isinstance(self.use_lstm, bool):
+            raise ValueError("use_lstm must be a bool, got %r" % (self.use_lstm,))
+        if int(self.lstm_layers) < 1 or int(self.lstm_hidden) < 1:
+            raise ValueError("lstm_layers and lstm_hidden must be >= 1, got %r, %r"
+                             % (self.lstm_layers, self.lstm_hidden))
+        if not 0.0 <= float(self.lstm_dropout) < 1.0:
+            raise ValueError("lstm_dropout must be in [0, 1), got %r"
+                             % (self.lstm_dropout,))
 
     def optimizer_config(self) -> dict:
         """The optimizer settings ACT declares for itself (TR28).
@@ -396,6 +435,10 @@ class ACTConfig:
                  decoder_layer_read=DECODER_LAYER_READ,
                  reference_lr=LR, reference_weight_decay=WEIGHT_DECAY,
                  reference_grad_clip="none (reference/act/detr/main.py:20 '# not used')")
+        if self.use_lstm:
+            d.update(lstm_dropout_placement=(
+                "between stacked LSTM layers only (nn.LSTM semantics); not applied "
+                "to the final hidden state that becomes the token"))
         return d
 
 
@@ -414,12 +457,23 @@ class ACTPolicy(nn.Module):
     `is_training = actions is not None`), so a caller cannot accidentally run the
     CVAE encoder at inference — it has nothing to run it on.
 
-    WHERE THE LSTM WILL ATTACH (not built, D8): between the observation
-    projection (`input_proj_robot_state`, in `_decode`) and the transformer, as a
-    third token or as a transform of `proprio_input`, so that
-    the CVAE encoder, the decoder, the queries and the head are untouched and the
-    only difference between ACT and ACT-LSTM is that one carries state across
-    ticks. See the session report.
+    ACT-LSTM, `use_lstm=True` (D8; CLAUDE.md §8 2026-09-25, Option B): an LSTM
+    reads the SAME (B, W_o, 47) window, oldest step first, starting from zero
+    memory on EVERY call; its last layer's final hidden state is projected to
+    `hidden_dim` and appended as a THIRD token, [latent, proprio, lstm], with its
+    own one-entry position embedding. Nothing else moves: the CVAE encoder does
+    not see it, `proprio` is still the flattened window, and the queries,
+    decoder and head are shared. No (h, c) is passed in or kept, so no state
+    crosses calls and `train._DeploymentGuard`'s carried-state check applies
+    unchanged (TR31). Rejected, Option A: hidden state carried across the
+    episode, which needs a sequential sampler ACT does not use.
+
+    The LSTM modules are built AFTER every ACT module and after
+    `_reset_parameters`, so construction consumes the RNG identically up to that
+    point: ACT-LSTM from a seed starts with every ACT parameter bit-identical to
+    ACT from the same seed, and `use_lstm=False` builds exactly the old model.
+    The LSTM keeps PyTorch's default init; xavier is the reference's, and the
+    reference applies it to its transformer only.
     """
 
     #: The modules that read the TARGET action chunk: exactly the CVAE encoder,
@@ -496,6 +550,16 @@ class ACTPolicy(nn.Module):
 
         self._reset_parameters()
 
+        # ---- ACT-LSTM (D8): LAST, after the init above - see the class doc ----
+        if cfg.use_lstm:
+            self.lstm = nn.LSTM(cfg.state_dim, cfg.lstm_hidden,
+                                num_layers=cfg.lstm_layers, batch_first=True,
+                                dropout=cfg.lstm_dropout)
+            self.lstm_proj = nn.Linear(cfg.lstm_hidden, h)
+            # position of the third token; `additional_pos_embed` stays the
+            # reference's (2, h) for [latent, proprio]
+            self.lstm_pos_embed = nn.Embedding(1, h)
+
     def optimizer_config(self) -> dict:
         """Hook read by `train.make_optimizer`. See `ACTConfig.optimizer_config`."""
         return self.cfg.optimizer_config()
@@ -553,6 +617,16 @@ class ACTPolicy(nn.Module):
         return mu, logvar
 
     # ---- the policy --------------------------------------------------------
+    def _lstm_token(self, obs: torch.Tensor) -> torch.Tensor:
+        """(B, W_o, 47) -> (B, h): the LSTM's summary of the window.
+
+        NO (h0, c0) is passed, so every call starts from zero memory, and none is
+        returned or stored: nothing crosses calls (Option B). `h_n[-1]` is the
+        LAST layer's hidden state after the NEWEST step of the window.
+        """
+        _, (h_n, _) = self.lstm(obs)                                # (L, B, H)
+        return self.lstm_proj(h_n[-1])                              # (B, h)
+
     def _decode(self, obs: torch.Tensor, latent_input: torch.Tensor) -> torch.Tensor:
         """The two-token transformer encoder and the K-query decoder.
 
@@ -560,11 +634,17 @@ class ACTPolicy(nn.Module):
         `transformer.py:62` stacks [latent, proprio] and `:63` concatenates the
         image tokens after them; with no images the stack IS the sequence, and
         `:59-60` reduces to `additional_pos_embed` alone.
+
+        With `use_lstm` the LSTM token is appended third: [latent, proprio, lstm].
         """
         B = obs.shape[0]
         proprio = self.input_proj_robot_state(obs.reshape(B, -1))   # (B, h)
         src = torch.stack([latent_input, proprio], dim=0)           # (2, B, h)
         pos = self.additional_pos_embed.weight.unsqueeze(1).repeat(1, B, 1)
+        if self.cfg.use_lstm:
+            src = torch.cat([src, self._lstm_token(obs).unsqueeze(0)], dim=0)
+            pos = torch.cat([pos, self.lstm_pos_embed.weight.unsqueeze(1)
+                             .repeat(1, B, 1)], dim=0)              # (3, B, h)
         query = self.query_embed.weight.unsqueeze(1).repeat(1, B, 1)  # (K, B, h)
         tgt = torch.zeros_like(query)                               # transformer.py:72
 

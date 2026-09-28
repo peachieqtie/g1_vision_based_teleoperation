@@ -97,29 +97,45 @@ def _model_config(kind, K, W, batch, gate):
     if kind == "bc":
         return BCConfig(obs_window=int(W), chunk_size=K, batch_size=int(batch),
                         **(dict(dropout=0.0, weight_decay=0.0) if gate else {}))
-    if kind == "act":
+    if kind in ("act", "act_lstm"):
         from g1_model.act import LR as ACT_LR, WEIGHT_DECAY as ACT_WD
         # lr is ACT's published 1e-5 (README.md:77). weight_decay is the
         # reference's 1e-4 (main.py:17) EXCEPT at the gate, which is unregularised
         # for every model. Dropout stays at ACT's 0.1 (main.py:43): it is part of
         # the architecture and was 0.1 in the lr-1e-3 run too, so changing it
         # would change a second variable.
+        # ACT-LSTM is the SAME branch with `use_lstm` set, so the two configs
+        # can differ in nothing else (PLAN.md Phase 4 exit check). Its LSTM
+        # dropout 0.3 is architecture too, and is kept at the gate for the same
+        # reason ACT's 0.1 is.
         return ACTConfig(obs_window=int(W), chunk_size=K, lr=ACT_LR,
-                         weight_decay=0.0 if gate else ACT_WD)
-    raise SystemExit("unknown --model %r (bc|act)" % kind)
+                         weight_decay=0.0 if gate else ACT_WD,
+                         use_lstm=(kind == "act_lstm"))
+    raise SystemExit("unknown --model %r (bc|act|act_lstm)" % kind)
 
 
 def observed_dropout(model) -> list:
     """Every dropout probability the BUILT model contains - `nn.Dropout` modules
     and the attention-internal dropout of `nn.MultiheadAttention` - read from the
-    module tree itself, not from a config or a comment."""
+    module tree itself, not from a config or a comment. An `nn.LSTM`'s dropout
+    counts only when it has a layer boundary to act on (num_layers > 1)."""
     ps = set()
     for m in model.modules():
         if isinstance(m, torch.nn.Dropout):
             ps.add(float(m.p))
         elif isinstance(m, torch.nn.MultiheadAttention):
             ps.add(float(m.dropout))
+        elif isinstance(m, torch.nn.LSTM) and m.num_layers > 1:
+            ps.add(float(m.dropout))
     return sorted(ps)
+
+
+def _declared_dropout(mcfg) -> list:
+    """Every dropout the config says the built model contains."""
+    ps = {float(mcfg.dropout)}
+    if getattr(mcfg, "use_lstm", False) and int(mcfg.lstm_layers) > 1:
+        ps.add(float(mcfg.lstm_dropout))
+    return sorted(p for p in ps if p > 0.0)
 
 
 def regularization_statement(mcfg) -> str:
@@ -130,19 +146,23 @@ def regularization_statement(mcfg) -> str:
     dropout of 0.1 at the gate (docs/ACT_AUDIT_REPORT.md T2). The gate SCORES eval
     mode, where dropout is off; training is where it acts."""
     d, wd = float(mcfg.dropout), float(mcfg.weight_decay)
-    if d == 0.0 and wd == 0.0:
+    lstm = (getattr(mcfg, "use_lstm", False) and int(mcfg.lstm_layers) > 1
+            and float(mcfg.lstm_dropout) > 0.0)
+    if d == 0.0 and wd == 0.0 and not lstm:
         return "NONE: dropout 0, weight_decay 0, no augmentation"
-    return ("dropout %g (active in TRAINING; the gate scores eval mode, where it is "
-            "off), weight_decay %g, no augmentation" % (d, wd))
+    return ("dropout %g%s (active in TRAINING; the gate scores eval mode, where it "
+            "is off), weight_decay %g, no augmentation"
+            % (d, (", LSTM dropout %g between stacked layers only"
+                   % float(mcfg.lstm_dropout)) if lstm else "", wd))
 
 
 def assert_regularization_matches(model, mcfg) -> None:
     """Refuse to start a run whose metadata would misstate the model's dropout."""
     got = [p for p in observed_dropout(model) if p > 0.0]
-    want = [float(mcfg.dropout)] if float(mcfg.dropout) > 0.0 else []
+    want = _declared_dropout(mcfg)
     if got != want:
         raise SystemExit("regularization statement says dropout %r but the built "
-                         "model contains dropout %r" % (mcfg.dropout, got))
+                         "model contains dropout %r" % (want, got))
 
 
 def _train_config(mcfg, epochs, batch, **kw):
@@ -322,6 +342,7 @@ def cmd_overfit10(a):
     st, ac, meta = DS.load_norm_stats()
     ds = _load(seeds, mcfg, meta, norm_fit_seeds=tr)
     name = ("ACT (K=%d)" % K if a.model == "act"
+            else "ACT-LSTM (K=%d)" % K if a.model == "act_lstm"
             else "BC" if K == 1 else "CHUNKED BC (K=%d)" % K)
     _banner(ds, "OVERFIT-10 GATE: %s on %d episodes, seeds %s"
             % (name, len(seeds), seeds))
@@ -357,7 +378,7 @@ def cmd_overfit10(a):
                            "balance needs beta'=14.70. beta=10 is used here because the "
                            "overfit-10 gate cannot discriminate between them; the choice "
                            "is DEFERRED to a validation signal. NOT rescaled silently."),
-                   ) if a.model == "act" else {}),
+                   ) if a.model in ("act", "act_lstm") else {}),
                    criterion="train error < neighbour-ambiguity reference for "
                              "this loader configuration (NOTES.md 2026-09-21)",
                    ambiguity_reference=ref.as_metadata(),
@@ -640,7 +661,7 @@ def main():
         if name in ("overfit10", "full"):
             p.add_argument("--chunk", type=int, default=1,
                            help="K. 1 = BC, >1 = chunked BC (same class)")
-            p.add_argument("--model", default="bc", choices=("bc", "act"))
+            p.add_argument("--model", default="bc", choices=("bc", "act", "act_lstm"))
             p.add_argument("--obs-window", type=int, default=12,
                            help="W_o, shared by every model (CLAUDE.md §8 "
                                 "2026-09-27): 12 = 0.48 s at 25 Hz. 1 reproduces "

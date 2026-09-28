@@ -110,9 +110,10 @@ No dependency on Phase 1 or 3, only on the Phase-2 dimensions, which are frozen.
 
 **As built** (in `g1_model/`, not the `g1_policy/` / `g1_train/` paths below): one training loop, one masked-L1 loss and the
 neighbour-ambiguity gate (`train.py`, `ambiguity.py`); BC and chunked BC as ONE class (`models.py`); state-only ACT (`act.py`).
-All three PASS the overfit-10 gate on 10 scripted episodes (CLAUDE.md §8, 2026-09-22). **Remaining:** ACT-LSTM, the `use_lstm`
-flag on the same class. The task list below is the original plan; where the code differs (AdamW with step budgets and a stop
-rule, not cosine annealing and epoch early-stopping), the code and CLAUDE.md are authoritative.
+All three PASS the overfit-10 gate on 10 scripted episodes (CLAUDE.md §8, 2026-09-22), at W_o = 1. ACT-LSTM, the `use_lstm`
+flag on the same class, is built and tested but never trained (CLAUDE.md §8, 2026-09-28). **Remaining:** every model's gate
+at W_o = 12. The task list below is the original plan; where the code differs (AdamW with step budgets and a stop rule, not
+cosine annealing and epoch early-stopping), the code and CLAUDE.md are authoritative.
 
 **Decide before starting:** observation window `W_o`, action chunk size `K`, LSTM hidden size and layer count (proposal: 2
 stacked, dropout 0.3), transformer width/depth, KL weight β. The proposal defers all of these.
