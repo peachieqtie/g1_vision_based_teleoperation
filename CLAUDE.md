@@ -25,8 +25,8 @@ says why. **P1–P3 CLOSED.** P3's open-loop replay reproduces the manipulation 
 cannot be replayed open loop by any recorder (`NOTES.md` 2026-09-16). **P4 in progress:** BC, chunked BC and state-only ACT all pass the
 overfit-10 gate (§8 2026-09-22), and an independent audit found ACT **is** ACT but not trained as the reference trains it (§8 2026-09-23).
 **ACT-LSTM is BUILT** (`use_lstm` on the same class, `g1_model/act.py`, §8 2026-09-28) and passes its tests; it has **never been
-trained**. **Next: the overfit-10 gate for BC, chunked BC, ACT and ACT-LSTM, all at W_o = 12, on a CUDA GPU** (O34: ~2 s/step on
-CPU). All three existing gate PASSES were at W_o = 1 and must be re-run at 12. **Every model result so far
+trained**. **Next: the overfit-10 gate for BC, chunked BC, ACT and ACT-LSTM, all at W_o = 12, on the NVIDIA laptop** (O34 Option B:
+results come from that machine only). All three existing gate PASSES were at W_o = 1 and must be re-run at 12. **Every model result so far
 is on SCRIPTED data — no piloted episode exists** (`data/raw/` is empty), so O31 and O32 stay open until P5.
 
 **P5 pilot has not started.** It must settle D12: the grasp worked free-based on 2026-09-15, so D12 may bind only the scripted demonstrator
@@ -105,6 +105,10 @@ D6, D7, **D12** and **D18** touch **objectives**, not just methods. D6/D7 are re
 
 Older entries are one line; detail is in `NOTES.md` under the same date. Retired entries (§14) keep a one-line pointer.
 
+- 2026-09-28 — **O34 OPTION B: every result comes from ONE machine, the NVIDIA laptop** — training, collection and evaluation data
+  alike. The CPU laptop is for code and tests only; nothing it records or trains is a result. Pinned versions do not make machines
+  interchangeable (O34: 14/40 seeds still diverge, up to 10.6 mm). `requirements.txt` pinned to the partner's build: Python 3.10.11,
+  mujoco==3.6.0, numpy==1.26.4, torch==2.11.0 (cu126 there), opencv < 4.12 (4.12+ needs NumPy 2). Old `mujoco>=3.7.0` excluded 3.6.0.
 - 2026-09-28 — **ACT-LSTM BUILT as `ACTConfig.use_lstm`; tests only, NOT trained.** A 2-layer LSTM (47→256, dropout 0.3) reads the
   W_o window from zero memory on every call; `h_n[-1]` → Linear(256→512) is a THIRD token [latent, proprio, lstm] with its own
   `lstm_pos_embed` (`additional_pos_embed` stays the reference's (2, h)). The CVAE encoder does not see it. Built LAST, so ACT-LSTM from
@@ -116,10 +120,8 @@ Older entries are one line; detail is in `NOTES.md` under the same date. Retired
 - 2026-09-27 — **W_o = 12 pipeline passes its CODE TEST on the second (CPU) laptop — not a result (O34).** Overfit-10: BC 0.009280 /
   0.016343 = 0.568 PASS, chunked BC 0.034796 / 0.055214 = 0.630 PASS. ACT: 300-step timing run only, **~2.0 s/step on CPU vs 73 ms on
   the RTX 3050** (~28×; a 195k-step run ≈ 4.5 days) — ACT and ACT-LSTM training belongs on a CUDA GPU.
-- 2026-09-27 — **PIN THE MUJOCO VERSION once the partner's is known** (O34). `requirements.txt` says only `mujoco>=3.7.0`, and a second
-  laptop at 3.14.0 does not reproduce the scripted episodes. Read the version from the partner's episode `mujoco_version`, pin it (and
-  NumPy/torch if needed) in `requirements.txt`, re-record seeds 0–44, and require placement to match the measurement file before any
-  data from a new machine counts.
+- 2026-09-27 — **PIN THE MUJOCO VERSION once the partner's is known** (O34). DONE 2026-09-28: pinned, seeds 0–44 re-recorded; the
+  "must match the measurement file" test failed on 14/40 seeds, so it was replaced by Option B (next entry up).
 - 2026-09-27 — **ALL MODELS AT W_o = 12: BC, chunked BC, ACT and ACT-LSTM share one observation window; D8 still pending adviser
   approval.** Replaces "BC stays at W_o = 1 on purpose" (2026-09-25). Reason: with one window every rung of the ladder changes ONE thing
   (BC → chunked BC chunking, → ACT the CVAE, → ACT-LSTM recurrence), so every comparison is fair. `tools/train_bc.py --obs-window`
@@ -332,11 +334,12 @@ Older entries are one line; detail is in `NOTES.md` under the same date. Retired
   On the scripted train split 4 STATE dims fall below 1e-2 — 9 base z (0.0087), 43 right wrist (0.0020), 44–45 waist (0.0030, 0.0069),
   all pinned — so their jitter is z-scored up to **4.9×** harder than the reference would; no action dim is affected. RECORDED, NOT FIXED:
   normalization is regenerated from piloted data, and this **must be decided BEFORE norm stats are fitted on real episodes** (D14's hazard).
-- **O34. NEW — the simulation does NOT reproduce across library versions.** Seeds 0–44 re-recorded 2026-09-27 on a second laptop
-  (MuJoCo 3.14.0, NumPy 2.4, torch 2.14 CPU): 0 of 39 shared seeds match the partner's placement
-  (`docs/measurements/bprime_gates_adopted_pred_40.json`), 11 are 20–55 mm worse, and seeds 38 and 44 FAIL placement > 0.10 m
-  (partner: 40/40, all ≤ 52 mm). Cause presumed library versions — the partner's are in their episodes' `mujoco_version`, NOT verified.
-  **Data from that laptop is code-test only, never a result.** Collection and evaluation must share one physics build (D18's logic).
+- **O34. RESOLVED BY POLICY, NOT BY PHYSICS — the simulation does not reproduce bit-for-bit across machines.** Against the partner's
+  `docs/measurements/bprime_gates_adopted_pred_40.json` (seeds 0–39): the CPU laptop at MuJoCo 3.14.0 / NumPy 2.4 matched 0/40 (to
+  74.8 mm; seeds 38, 44 fail placement). With the partner's versions pinned (env `g1_match`, 2026-09-28): **26/40 agree to ≤ 0.0003 mm,
+  14 diverge 0.04–10.6 mm** (seeds 0 2 4 9 11 20 24 26 30–33 36 38), nothing between — a residual last-bit difference that some episodes
+  amplify; 45/45 pass every recorder check. Suspected residual (UNVERIFIED): CPU (AMD here), torch thread count, NumPy source. Same
+  scene/`motion.pt` (tracked, unchanged since 51fc1d7) and identical `reset_fingerprint`. **Decision (§8 2026-09-28): Option B.**
 - **O6.** Dead code: `gating.py`, `GatingConfig`, `TorsoYawConfig`, `IKConfig.neutral_weight`/`.target_deadzone`, `set_waist_yaw`,
   `ZEDConfig.camera_fps` (O29); `RejectReason` survives for `NAN`. **O7.** Stale docs: README claims torso-yaw following and active gating;
   `config.py` says locomotion is "not yet built"; `test/*.py` is stale. (`docs/ACT_CORRESPONDENCE.md` rows 18/22/36 resolved 2026-09-25.) Resolved issues (O10, O12, O14–O16, O18, O20–O24): `NOTES.md` "2026-09-22 — CLAUDE.md §8 ARCHIVE".
